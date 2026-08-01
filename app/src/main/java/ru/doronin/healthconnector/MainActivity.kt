@@ -83,8 +83,10 @@ class MainActivity : AppCompatActivity() {
             val payload = readPayload(days)
             binding.status.text = "Отправляю данные…"
             postJson(endpoint, token, payload)
-        }.onSuccess {
-            binding.status.text = "Синхронизация завершена"
+            payload
+        }.onSuccess { payload ->
+            val sourceCount = payload.optJSONArray("sources")?.length() ?: 0
+            binding.status.text = "Синхронизация завершена. Источников: $sourceCount"
         }.onFailure {
             binding.status.text = "Ошибка: ${it.message}"
         }
@@ -103,17 +105,44 @@ class MainActivity : AppCompatActivity() {
         val oxygen = readAll<OxygenSaturationRecord>(start, end)
         val workouts = readAll<ExerciseSessionRecord>(start, end)
 
+        val allSources = (steps.map { it.sourcePackage() } +
+            sleeps.map { it.sourcePackage() } +
+            heart.map { it.sourcePackage() } +
+            oxygen.map { it.sourcePackage() } +
+            workouts.map { it.sourcePackage() })
+            .filter { it.isNotBlank() }
+            .distinct()
+            .sortedBy { sourcePriority(it) }
+
         val dayArray = JSONArray()
         repeat(days) { offset ->
             val date = startDate.plusDays(offset.toLong())
             val dayStart = date.atStartOfDay(zone).toInstant()
             val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant()
-            val daySteps = steps.filter { it.startTime < dayEnd && it.endTime > dayStart }.sumOf { it.count }
-            val daySleep = sleeps.filter { it.endTime.atZone(zone).toLocalDate() == date }
-            val sleepMinutes = daySleep.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
-            val heartSamples = heart.flatMap { it.samples }.filter { it.time >= dayStart && it.time < dayEnd }
-            val oxygenSamples = oxygen.filter { it.time >= dayStart && it.time < dayEnd }
-            val dayWorkouts = workouts.filter { it.startTime >= dayStart && it.startTime < dayEnd }
+
+            val dayStepRecords = preferBestSource(
+                steps.filter { it.startTime < dayEnd && it.endTime > dayStart }
+            )
+            val daySleepRecords = preferBestSource(
+                sleeps.filter { it.endTime.atZone(zone).toLocalDate() == date }
+            )
+            val dayHeartRecords = preferBestSource(
+                heart.filter { record -> record.samples.any { it.time >= dayStart && it.time < dayEnd } }
+            )
+            val dayOxygenRecords = preferBestSource(
+                oxygen.filter { it.time >= dayStart && it.time < dayEnd }
+            )
+            val dayWorkoutRecords = preferBestSource(
+                workouts.filter { it.startTime >= dayStart && it.startTime < dayEnd }
+            ).distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
+
+            val daySteps = dayStepRecords.sumOf { it.count }
+            val sleepMinutes = daySleepRecords.sumOf {
+                Duration.between(it.startTime, it.endTime).toMinutes()
+            }
+            val heartSamples = dayHeartRecords.flatMap { it.samples }
+                .filter { it.time >= dayStart && it.time < dayEnd }
+            val oxygenSamples = dayOxygenRecords.filter { it.time >= dayStart && it.time < dayEnd }
 
             dayArray.put(JSONObject().apply {
                 put("date", date.toString())
@@ -123,13 +152,26 @@ class MainActivity : AppCompatActivity() {
                 put("minimumHeartRate", heartSamples.minOfOrNull { it.beatsPerMinute })
                 put("maximumHeartRate", heartSamples.maxOfOrNull { it.beatsPerMinute })
                 put("averageSpO2", oxygenSamples.map { it.percentage.value }.averageOrNull())
-                put("workoutCount", dayWorkouts.size)
-                put("workoutMinutes", dayWorkouts.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() })
+                put("workoutCount", dayWorkoutRecords.size)
+                put("workoutMinutes", dayWorkoutRecords.sumOf {
+                    Duration.between(it.startTime, it.endTime).toMinutes()
+                })
+                put("stepsSource", dayStepRecords.firstOrNull()?.sourcePackage().orEmpty())
+                put("sleepSource", daySleepRecords.firstOrNull()?.sourcePackage().orEmpty())
+                put("heartSource", dayHeartRecords.firstOrNull()?.sourcePackage().orEmpty())
+                put("spo2Source", dayOxygenRecords.firstOrNull()?.sourcePackage().orEmpty())
+                put("workoutSource", dayWorkoutRecords.firstOrNull()?.sourcePackage().orEmpty())
             })
         }
 
+        val preferredWorkouts = workouts
+            .groupBy { it.startTime.atZone(zone).toLocalDate() }
+            .values
+            .flatMap { preferBestSource(it) }
+            .distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
+
         val workoutArray = JSONArray()
-        workouts.forEach { record ->
+        preferredWorkouts.forEach { record ->
             workoutArray.put(JSONObject().apply {
                 put("id", record.metadata.id)
                 put("start", record.startTime.toString())
@@ -137,16 +179,65 @@ class MainActivity : AppCompatActivity() {
                 put("exerciseType", record.exerciseType)
                 put("title", record.title ?: "")
                 put("durationMinutes", Duration.between(record.startTime, record.endTime).toMinutes())
-                put("sourcePackage", record.metadata.dataOrigin.packageName)
+                put("sourcePackage", record.sourcePackage())
+                put("sourceName", sourceName(record.sourcePackage()))
             })
         }
 
         return JSONObject().apply {
             put("syncedAt", Instant.now().toString())
+            put("deviceId", android.os.Build.MODEL ?: "Android")
             put("rangeStart", startDate.toString())
             put("rangeEnd", endDate.minusDays(1).toString())
             put("days", dayArray)
             put("workouts", workoutArray)
+            put("sources", JSONArray().apply {
+                allSources.forEach { pkg ->
+                    put(JSONObject().apply {
+                        put("packageName", pkg)
+                        put("name", sourceName(pkg))
+                        put("priority", sourcePriority(pkg))
+                    })
+                }
+            })
+        }
+    }
+
+    /**
+     * Источник выбирается отдельно для каждого дня и типа данных:
+     * 1) Mi Fitness / Xiaomi;
+     * 2) Google Fit;
+     * 3) другие приложения Health Connect.
+     * Так Google Fit заполняет пропуски, но не удваивает показатели Xiaomi.
+     */
+    private fun <T : Record> preferBestSource(records: List<T>): List<T> {
+        if (records.isEmpty()) return emptyList()
+        val packages = records.map { it.sourcePackage() }.distinct()
+        val bestPackage = packages.minByOrNull { sourcePriority(it) } ?: return records
+        return records.filter { it.sourcePackage() == bestPackage }
+    }
+
+    private fun Record.sourcePackage(): String = metadata.dataOrigin.packageName
+
+    private fun sourcePriority(packageName: String): Int {
+        val value = packageName.lowercase()
+        return when {
+            value.contains("xiaomi") ||
+                value.contains("mifitness") ||
+                value.contains("mi.health") ||
+                value.contains("wearable") -> 0
+            value == "com.google.android.apps.fitness" || value.contains("google") && value.contains("fitness") -> 1
+            else -> 2
+        }
+    }
+
+    private fun sourceName(packageName: String): String {
+        val value = packageName.lowercase()
+        return when {
+            value.contains("xiaomi") || value.contains("mifitness") || value.contains("wearable") -> "Mi Fitness"
+            value == "com.google.android.apps.fitness" || value.contains("google") && value.contains("fitness") -> "Google Fit"
+            packageName.isBlank() -> "Неизвестный источник"
+            else -> packageName
         }
     }
 
@@ -175,13 +266,25 @@ class MainActivity : AppCompatActivity() {
         connection.connectTimeout = 20_000
         connection.readTimeout = 30_000
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-        val body = JSONObject().put("token", token).put("payload", payload).toString()
+
+        // Apps Script ожидает days/workouts в корне запроса, а не внутри payload.
+        val body = JSONObject().apply {
+            put("token", token)
+            payload.keys().forEach { key -> put(key, payload.get(key)) }
+        }.toString()
+
         connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
         val code = connection.responseCode
         val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
             ?.bufferedReader()?.use { it.readText() }.orEmpty()
         connection.disconnect()
         if (code !in 200..299) error("HTTP $code: $response")
+        if (response.isNotBlank()) {
+            val json = runCatching { JSONObject(response) }.getOrNull()
+            if (json?.optBoolean("ok", true) == false) {
+                error(json.optString("message", response))
+            }
+        }
     }
 
     private fun List<Double>.averageOrNull(): Double? = if (isEmpty()) null else average()
