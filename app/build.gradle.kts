@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "ru.doronin.healthconnector"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "ru.doronin.healthconnector"
