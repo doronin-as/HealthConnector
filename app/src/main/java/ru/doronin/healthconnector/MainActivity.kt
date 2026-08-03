@@ -1,6 +1,9 @@
 package ru.doronin.healthconnector
 
+import android.database.Cursor
+import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.health.connect.client.HealthConnectClient
@@ -31,6 +34,8 @@ import java.time.ZoneId
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val client by lazy { HealthConnectClient.getOrCreate(this) }
+    private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
+
     private val permissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
         HealthPermission.getReadPermission(SleepSessionRecord::class),
@@ -49,22 +54,148 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val exportConfigLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) exportConfig(uri)
+    }
+
+    private val importConfigLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) importConfig(uri)
+    }
+
+    private val importCsvLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) importFatSecretCsv(uri)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         binding.endpoint.setText(prefs.getString("endpoint", ""))
         binding.token.setText(prefs.getString("token", ""))
+        binding.days.setText(prefs.getInt("days", 7).toString())
 
+        binding.exportConfig.setOnClickListener {
+            saveSettingsFromForm()
+            exportConfigLauncher.launch("healthconnector-config.json")
+        }
+        binding.importConfig.setOnClickListener {
+            importConfigLauncher.launch(arrayOf("application/json", "text/json", "text/plain"))
+        }
+        binding.importCsv.setOnClickListener {
+            saveSettingsFromForm()
+            importCsvLauncher.launch(arrayOf("text/csv", "text/comma-separated-values", "text/plain", "application/csv"))
+        }
         binding.permissions.setOnClickListener { permissionLauncher.launch(permissions) }
         binding.sync.setOnClickListener {
-            val endpoint = binding.endpoint.text.toString().trim()
-            val token = binding.token.text.toString().trim()
-            val days = binding.days.text.toString().toIntOrNull()?.coerceIn(1, 30) ?: 7
-            prefs.edit().putString("endpoint", endpoint).putString("token", token).apply()
-            lifecycleScope.launch { sync(endpoint, token, days) }
+            val settings = saveSettingsFromForm()
+            lifecycleScope.launch { sync(settings.endpoint, settings.token, settings.days) }
+        }
+    }
+
+    private fun saveSettingsFromForm(): Settings {
+        val endpoint = binding.endpoint.text.toString().trim()
+        val token = binding.token.text.toString().trim()
+        val days = binding.days.text.toString().toIntOrNull()?.coerceIn(1, 30) ?: 7
+        prefs.edit()
+            .putString("endpoint", endpoint)
+            .putString("token", token)
+            .putInt("days", days)
+            .apply()
+        return Settings(endpoint, token, days)
+    }
+
+    private fun exportConfig(uri: Uri) {
+        runCatching {
+            val settings = saveSettingsFromForm()
+            val json = JSONObject().apply {
+                put("format", "HealthConnectorConfig")
+                put("version", 1)
+                put("endpoint", settings.endpoint)
+                put("token", settings.token)
+                put("days", settings.days)
+                put("exportedAt", Instant.now().toString())
+            }.toString(2)
+            contentResolver.openOutputStream(uri, "wt")?.bufferedWriter()?.use { it.write(json) }
+                ?: error("Не удалось открыть файл для записи")
+        }.onSuccess {
+            binding.status.text = "Настройки сохранены в файл"
+        }.onFailure {
+            binding.status.text = "Ошибка сохранения настроек: ${it.message}"
+        }
+    }
+
+    private fun importConfig(uri: Uri) {
+        runCatching {
+            val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                ?: error("Не удалось прочитать файл")
+            val json = JSONObject(text)
+            require(json.optString("format") == "HealthConnectorConfig") {
+                "Это не файл настроек HealthConnector"
+            }
+            val endpoint = json.optString("endpoint")
+            val token = json.optString("token")
+            val days = json.optInt("days", 7).coerceIn(1, 30)
+            require(endpoint.isNotBlank() && token.isNotBlank()) { "В файле нет URL или токена" }
+            binding.endpoint.setText(endpoint)
+            binding.token.setText(token)
+            binding.days.setText(days.toString())
+            prefs.edit().putString("endpoint", endpoint).putString("token", token).putInt("days", days).apply()
+        }.onSuccess {
+            binding.status.text = "Настройки восстановлены"
+        }.onFailure {
+            binding.status.text = "Ошибка импорта настроек: ${it.message}"
+        }
+    }
+
+    private fun importFatSecretCsv(uri: Uri) {
+        val settings = saveSettingsFromForm()
+        if (settings.endpoint.isBlank() || settings.token.isBlank()) {
+            binding.status.text = "Сначала укажи URL Apps Script и токен"
+            return
+        }
+        lifecycleScope.launch {
+            binding.status.text = "Читаю CSV FatSecret…"
+            runCatching {
+                val fileName = queryFileName(uri) ?: "fatsecret.csv"
+                val csvText = withContext(Dispatchers.IO) {
+                    contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        ?: error("Не удалось прочитать CSV")
+                }
+                require(csvText.isNotBlank()) { "CSV пустой" }
+                require(csvText.length <= 5_000_000) { "CSV слишком большой: максимум 5 МБ" }
+                binding.status.text = "Отправляю CSV в Google Таблицу…"
+                val body = JSONObject().apply {
+                    put("token", settings.token)
+                    put("action", "fatsecretCsv")
+                    put("fileName", fileName)
+                    put("csvText", csvText)
+                    put("uploadedAt", Instant.now().toString())
+                }
+                postBody(settings.endpoint, body)
+            }.onSuccess { response ->
+                val days = response?.optInt("days", 0) ?: 0
+                val meals = response?.optInt("meals", 0) ?: 0
+                binding.status.text = "CSV импортирован: дней $days, приёмов пищи $meals"
+            }.onFailure {
+                binding.status.text = "Ошибка импорта CSV: ${it.message}"
+            }
+        }
+    }
+
+    private fun queryFileName(uri: Uri): String? {
+        var cursor: Cursor? = null
+        return try {
+            cursor = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            if (cursor != null && cursor.moveToFirst()) cursor.getString(0) else null
+        } finally {
+            cursor?.close()
         }
     }
 
@@ -82,7 +213,12 @@ class MainActivity : AppCompatActivity() {
         runCatching {
             val payload = readPayload(days)
             binding.status.text = "Отправляю данные…"
-            postJson(endpoint, token, payload)
+            val body = JSONObject().apply {
+                put("token", token)
+                put("action", "healthSync")
+                payload.keys().forEach { key -> put(key, payload.get(key)) }
+            }
+            postBody(endpoint, body)
             payload
         }.onSuccess { payload ->
             val sourceCount = payload.optJSONArray("sources")?.length() ?: 0
@@ -105,57 +241,33 @@ class MainActivity : AppCompatActivity() {
         val oxygen = readAll<OxygenSaturationRecord>(start, end)
         val workouts = readAll<ExerciseSessionRecord>(start, end)
 
-        val allSources = (steps.map { it.sourcePackage() } +
-            sleeps.map { it.sourcePackage() } +
-            heart.map { it.sourcePackage() } +
-            oxygen.map { it.sourcePackage() } +
-            workouts.map { it.sourcePackage() })
-            .filter { it.isNotBlank() }
-            .distinct()
-            .sortedBy { sourcePriority(it) }
+        val allSources = (steps.map { it.sourcePackage() } + sleeps.map { it.sourcePackage() } +
+            heart.map { it.sourcePackage() } + oxygen.map { it.sourcePackage() } +
+            workouts.map { it.sourcePackage() }).filter { it.isNotBlank() }.distinct().sortedBy { sourcePriority(it) }
 
         val dayArray = JSONArray()
         repeat(days) { offset ->
             val date = startDate.plusDays(offset.toLong())
             val dayStart = date.atStartOfDay(zone).toInstant()
             val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant()
-
-            val dayStepRecords = preferBestSource(
-                steps.filter { it.startTime < dayEnd && it.endTime > dayStart }
-            )
-            val daySleepRecords = preferBestSource(
-                sleeps.filter { it.endTime.atZone(zone).toLocalDate() == date }
-            )
-            val dayHeartRecords = preferBestSource(
-                heart.filter { record -> record.samples.any { it.time >= dayStart && it.time < dayEnd } }
-            )
-            val dayOxygenRecords = preferBestSource(
-                oxygen.filter { it.time >= dayStart && it.time < dayEnd }
-            )
-            val dayWorkoutRecords = preferBestSource(
-                workouts.filter { it.startTime >= dayStart && it.startTime < dayEnd }
-            ).distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
-
-            val daySteps = dayStepRecords.sumOf { it.count }
-            val sleepMinutes = daySleepRecords.sumOf {
-                Duration.between(it.startTime, it.endTime).toMinutes()
-            }
-            val heartSamples = dayHeartRecords.flatMap { it.samples }
-                .filter { it.time >= dayStart && it.time < dayEnd }
-            val oxygenSamples = dayOxygenRecords.filter { it.time >= dayStart && it.time < dayEnd }
+            val dayStepRecords = preferBestSource(steps.filter { it.startTime < dayEnd && it.endTime > dayStart })
+            val daySleepRecords = preferBestSource(sleeps.filter { it.endTime.atZone(zone).toLocalDate() == date })
+            val dayHeartRecords = preferBestSource(heart.filter { record -> record.samples.any { it.time >= dayStart && it.time < dayEnd } })
+            val dayOxygenRecords = preferBestSource(oxygen.filter { it.time >= dayStart && it.time < dayEnd })
+            val dayWorkoutRecords = preferBestSource(workouts.filter { it.startTime >= dayStart && it.startTime < dayEnd })
+                .distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
+            val heartSamples = dayHeartRecords.flatMap { it.samples }.filter { it.time >= dayStart && it.time < dayEnd }
 
             dayArray.put(JSONObject().apply {
                 put("date", date.toString())
-                put("steps", daySteps)
-                put("sleepHours", sleepMinutes / 60.0)
+                put("steps", dayStepRecords.sumOf { it.count })
+                put("sleepHours", daySleepRecords.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() } / 60.0)
                 put("averageHeartRate", heartSamples.map { it.beatsPerMinute.toDouble() }.averageOrNull())
                 put("minimumHeartRate", heartSamples.minOfOrNull { it.beatsPerMinute })
                 put("maximumHeartRate", heartSamples.maxOfOrNull { it.beatsPerMinute })
-                put("averageSpO2", oxygenSamples.map { it.percentage.value }.averageOrNull())
+                put("averageSpO2", dayOxygenRecords.map { it.percentage.value }.averageOrNull())
                 put("workoutCount", dayWorkoutRecords.size)
-                put("workoutMinutes", dayWorkoutRecords.sumOf {
-                    Duration.between(it.startTime, it.endTime).toMinutes()
-                })
+                put("workoutMinutes", dayWorkoutRecords.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() })
                 put("stepsSource", dayStepRecords.firstOrNull()?.sourcePackage().orEmpty())
                 put("sleepSource", daySleepRecords.firstOrNull()?.sourcePackage().orEmpty())
                 put("heartSource", dayHeartRecords.firstOrNull()?.sourcePackage().orEmpty())
@@ -164,12 +276,8 @@ class MainActivity : AppCompatActivity() {
             })
         }
 
-        val preferredWorkouts = workouts
-            .groupBy { it.startTime.atZone(zone).toLocalDate() }
-            .values
-            .flatMap { preferBestSource(it) }
-            .distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
-
+        val preferredWorkouts = workouts.groupBy { it.startTime.atZone(zone).toLocalDate() }
+            .values.flatMap { preferBestSource(it) }.distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
         val workoutArray = JSONArray()
         preferredWorkouts.forEach { record ->
             workoutArray.put(JSONObject().apply {
@@ -192,28 +300,19 @@ class MainActivity : AppCompatActivity() {
             put("days", dayArray)
             put("workouts", workoutArray)
             put("sources", JSONArray().apply {
-                allSources.forEach { pkg ->
-                    put(JSONObject().apply {
-                        put("packageName", pkg)
-                        put("name", sourceName(pkg))
-                        put("priority", sourcePriority(pkg))
-                    })
-                }
+                allSources.forEach { pkg -> put(JSONObject().apply {
+                    put("packageName", pkg)
+                    put("name", sourceName(pkg))
+                    put("priority", sourcePriority(pkg))
+                }) }
             })
         }
     }
 
-    /**
-     * Источник выбирается отдельно для каждого дня и типа данных:
-     * 1) Mi Fitness / Xiaomi;
-     * 2) Google Fit;
-     * 3) другие приложения Health Connect.
-     * Так Google Fit заполняет пропуски, но не удваивает показатели Xiaomi.
-     */
     private fun <T : Record> preferBestSource(records: List<T>): List<T> {
         if (records.isEmpty()) return emptyList()
-        val packages = records.map { it.sourcePackage() }.distinct()
-        val bestPackage = packages.minByOrNull { sourcePriority(it) } ?: return records
+        val bestPackage = records.map { it.sourcePackage() }.distinct().minByOrNull { sourcePriority(it) }
+            ?: return records
         return records.filter { it.sourcePackage() == bestPackage }
     }
 
@@ -222,10 +321,7 @@ class MainActivity : AppCompatActivity() {
     private fun sourcePriority(packageName: String): Int {
         val value = packageName.lowercase()
         return when {
-            value.contains("xiaomi") ||
-                value.contains("mifitness") ||
-                value.contains("mi.health") ||
-                value.contains("wearable") -> 0
+            value.contains("xiaomi") || value.contains("mifitness") || value.contains("mi.health") || value.contains("wearable") -> 0
             value == "com.google.android.apps.fitness" || value.contains("google") && value.contains("fitness") -> 1
             else -> 2
         }
@@ -245,47 +341,38 @@ class MainActivity : AppCompatActivity() {
         val all = mutableListOf<T>()
         var pageToken: String? = null
         do {
-            val response = client.readRecords(
-                ReadRecordsRequest(
-                    recordType = T::class,
-                    timeRangeFilter = TimeRangeFilter.between(start, end),
-                    pageSize = 1000,
-                    pageToken = pageToken
-                )
-            )
+            val response = client.readRecords(ReadRecordsRequest(
+                recordType = T::class,
+                timeRangeFilter = TimeRangeFilter.between(start, end),
+                pageSize = 1000,
+                pageToken = pageToken
+            ))
             all += response.records
             pageToken = response.pageToken
         } while (pageToken != null)
         return all
     }
 
-    private suspend fun postJson(endpoint: String, token: String, payload: JSONObject) = withContext(Dispatchers.IO) {
+    private suspend fun postBody(endpoint: String, body: JSONObject): JSONObject? = withContext(Dispatchers.IO) {
         val connection = URL(endpoint).openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
         connection.doOutput = true
         connection.connectTimeout = 20_000
-        connection.readTimeout = 30_000
+        connection.readTimeout = 60_000
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-
-        // Apps Script ожидает days/workouts в корне запроса, а не внутри payload.
-        val body = JSONObject().apply {
-            put("token", token)
-            payload.keys().forEach { key -> put(key, payload.get(key)) }
-        }.toString()
-
-        connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
         val code = connection.responseCode
         val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
             ?.bufferedReader()?.use { it.readText() }.orEmpty()
         connection.disconnect()
         if (code !in 200..299) error("HTTP $code: $response")
-        if (response.isNotBlank()) {
-            val json = runCatching { JSONObject(response) }.getOrNull()
-            if (json?.optBoolean("ok", true) == false) {
-                error(json.optString("message", response))
-            }
-        }
+        if (response.isBlank()) return@withContext null
+        val json = runCatching { JSONObject(response) }.getOrNull()
+        if (json?.optBoolean("ok", true) == false) error(json.optString("message", response))
+        json
     }
 
     private fun List<Double>.averageOrNull(): Double? = if (isEmpty()) null else average()
+
+    private data class Settings(val endpoint: String, val token: String, val days: Int)
 }
