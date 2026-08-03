@@ -1,0 +1,1 @@
+Build trigger for HealthConnector 1.2.0
