@@ -16,6 +16,13 @@
             android:textSize="28sp"
             android:textStyle="bold" />
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Health Connect + Google Fit + импорт питания FatSecret"
+            android:textSize="14sp" />
+
         <EditText
             android:id="@+id/endpoint"
             android:layout_width="match_parent"
@@ -40,17 +47,44 @@
             android:text="7" />
 
         <Button
+            android:id="@+id/exportConfig"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Сохранить настройки в файл" />
+
+        <Button
+            android:id="@+id/importConfig"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Восстановить настройки из файла" />
+
+        <Button
             android:id="@+id/permissions"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Выдать разрешения" />
+            android:text="Выдать разрешения Health Connect" />
 
         <Button
             android:id="@+id/sync"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Синхронизировать" />
+            android:text="Синхронизировать браслет" />
+
+        <Button
+            android:id="@+id/importCsv"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Выбрать CSV FatSecret и отправить" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Файл настроек содержит секретный токен. Храни его в закрытой папке."
+            android:textSize="12sp" />
 
         <TextView
             android:id="@+id/status"
