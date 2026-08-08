@@ -222,7 +222,19 @@ class MainActivity : AppCompatActivity() {
             payload
         }.onSuccess { payload ->
             val sourceCount = payload.optJSONArray("sources")?.length() ?: 0
-            binding.status.text = "Синхронизация завершена. Источников: $sourceCount"
+            val suspiciousDates = mutableListOf<String>()
+            val dayArray = payload.optJSONArray("days")
+            if (dayArray != null) {
+                for (i in 0 until dayArray.length()) {
+                    val day = dayArray.optJSONObject(i) ?: continue
+                    if (day.optBoolean("sleepSuspicious", false)) suspiciousDates += day.optString("date")
+                }
+            }
+            binding.status.text = if (suspiciousDates.isEmpty()) {
+                "Синхронизация завершена. Источников: $sourceCount"
+            } else {
+                "Синхронизация завершена. Сон не записан как недостоверный: ${suspiciousDates.joinToString()}"
+            }
         }.onFailure {
             binding.status.text = "Ошибка: ${it.message}"
         }
@@ -251,7 +263,8 @@ class MainActivity : AppCompatActivity() {
             val dayStart = date.atStartOfDay(zone).toInstant()
             val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant()
             val dayStepRecords = preferBestSource(steps.filter { it.startTime < dayEnd && it.endTime > dayStart })
-            val daySleepRecords = preferBestSource(sleeps.filter { it.endTime.atZone(zone).toLocalDate() == date })
+            val daySleepRecords = preferBestSource(sleeps.filter { it.startTime < dayEnd && it.endTime > dayStart })
+            val sleep = aggregateSleep(daySleepRecords, dayStart, dayEnd)
             val dayHeartRecords = preferBestSource(heart.filter { record -> record.samples.any { it.time >= dayStart && it.time < dayEnd } })
             val dayOxygenRecords = preferBestSource(oxygen.filter { it.time >= dayStart && it.time < dayEnd })
             val dayWorkoutRecords = preferBestSource(workouts.filter { it.startTime >= dayStart && it.startTime < dayEnd })
@@ -261,7 +274,11 @@ class MainActivity : AppCompatActivity() {
             dayArray.put(JSONObject().apply {
                 put("date", date.toString())
                 put("steps", dayStepRecords.sumOf { it.count })
-                put("sleepHours", daySleepRecords.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() } / 60.0)
+                put("sleepHours", sleep.hours ?: JSONObject.NULL)
+                put("sleepSuspicious", sleep.suspicious)
+                put("sleepRawHours", sleep.rawHours)
+                put("sleepSessionCount", sleep.sessionCount)
+                put("sleepMergedIntervalCount", sleep.mergedIntervalCount)
                 put("averageHeartRate", heartSamples.map { it.beatsPerMinute.toDouble() }.averageOrNull())
                 put("minimumHeartRate", heartSamples.minOfOrNull { it.beatsPerMinute })
                 put("maximumHeartRate", heartSamples.maxOfOrNull { it.beatsPerMinute })
@@ -307,6 +324,53 @@ class MainActivity : AppCompatActivity() {
                 }) }
             })
         }
+    }
+
+    private fun aggregateSleep(records: List<SleepSessionRecord>, dayStart: Instant, dayEnd: Instant): SleepAggregation {
+        val intervals = records.mapNotNull { record ->
+            val clippedStart = if (record.startTime < dayStart) dayStart else record.startTime
+            val clippedEnd = if (record.endTime > dayEnd) dayEnd else record.endTime
+            if (clippedStart < clippedEnd) SleepInterval(clippedStart, clippedEnd) else null
+        }.sortedBy { it.start }
+
+        if (intervals.isEmpty()) {
+            return SleepAggregation(
+                hours = null,
+                suspicious = false,
+                rawHours = 0.0,
+                sessionCount = records.size,
+                mergedIntervalCount = 0
+            )
+        }
+
+        val rawMillis = intervals.sumOf { Duration.between(it.start, it.end).toMillis() }
+        val merged = mutableListOf<SleepInterval>()
+        var currentStart = intervals.first().start
+        var currentEnd = intervals.first().end
+
+        for (interval in intervals.drop(1)) {
+            if (!interval.start.isAfter(currentEnd)) {
+                if (interval.end > currentEnd) currentEnd = interval.end
+            } else {
+                merged += SleepInterval(currentStart, currentEnd)
+                currentStart = interval.start
+                currentEnd = interval.end
+            }
+        }
+        merged += SleepInterval(currentStart, currentEnd)
+
+        val uniqueMillis = merged.sumOf { Duration.between(it.start, it.end).toMillis() }
+        val uniqueHours = uniqueMillis / 3_600_000.0
+        val rawHours = rawMillis / 3_600_000.0
+        val suspicious = uniqueHours > MAX_SLEEP_HOURS_PER_DAY
+
+        return SleepAggregation(
+            hours = if (suspicious) null else uniqueHours,
+            suspicious = suspicious,
+            rawHours = rawHours,
+            sessionCount = records.size,
+            mergedIntervalCount = merged.size
+        )
     }
 
     private fun <T : Record> preferBestSource(records: List<T>): List<T> {
@@ -374,5 +438,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun List<Double>.averageOrNull(): Double? = if (isEmpty()) null else average()
 
+    private data class SleepInterval(val start: Instant, val end: Instant)
+    private data class SleepAggregation(
+        val hours: Double?,
+        val suspicious: Boolean,
+        val rawHours: Double,
+        val sessionCount: Int,
+        val mergedIntervalCount: Int
+    )
     private data class Settings(val endpoint: String, val token: String, val days: Int)
+
+    companion object {
+        private const val MAX_SLEEP_HOURS_PER_DAY = 16.0
+    }
 }
