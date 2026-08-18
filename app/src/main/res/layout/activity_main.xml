@@ -27,7 +27,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Работает с источниками, которые передают данные в Health Connect: Mi Fitness, Samsung Health, Garmin Connect, Fitbit/Google Health, Zepp и другими совместимыми приложениями."
+            android:text="Работает с источниками, которые передают данные в Health Connect: Mi Fitness, Samsung Health, Garmin Connect, Google Health и другими совместимыми приложениями."
             android:textSize="12sp" />
 
         <EditText
