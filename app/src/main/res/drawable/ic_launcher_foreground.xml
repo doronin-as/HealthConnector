@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- blue lower-left connector -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#1677FF"
+        android:strokeWidth="8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M34,67 C24,76 26,88 37,91 C47,94 54,87 61,80" />
+
+    <!-- green upper-right connector -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#36D36A"
+        android:strokeWidth="8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M74,41 C84,32 82,20 71,17 C61,14 54,21 47,28" />
+
+    <!-- heart -->
+    <path
+        android:fillColor="#08A9D7"
+        android:pathData="M54,80 C49,75 29,62 29,45 C29,34 37,28 46,30 C50,31 53,34 54,39 C55,34 58,31 62,30 C71,28 79,34 79,45 C79,62 59,75 54,80 Z" />
+
+    <!-- subtle inner heart highlight -->
+    <path
+        android:fillColor="#4EDFD0"
+        android:fillAlpha="0.45"
+        android:pathData="M46,34 C38,32 33,38 33,45 C33,53 39,60 45,65 C43,57 44,45 50,36 C49,35 48,34 46,34 Z" />
+
+    <!-- pulse -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M35,54 L45,54 L49,47 L54,65 L59,42 L64,58 L68,54 L74,54" />
+</vector>
