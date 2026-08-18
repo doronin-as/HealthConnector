@@ -25,7 +25,7 @@ class ShareCsvActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         statusView = TextView(this).apply {
-            text = "Получаю CSV FatSecret…"
+            text = "Получаю экспорт FatSecret…"
             textSize = 18f
             setPadding(48, 64, 48, 64)
         }
@@ -33,7 +33,7 @@ class ShareCsvActivity : AppCompatActivity() {
 
         val uri = extractSharedUri(intent)
         if (uri == null) {
-            failAndOpenMain("Не удалось получить CSV-файл")
+            failAndOpenMain("Не удалось получить файл из меню «Поделиться»")
             return
         }
 
@@ -47,20 +47,26 @@ class ShareCsvActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             runCatching {
-                statusView.text = "Читаю CSV FatSecret…"
+                statusView.text = "Проверяю экспорт FatSecret…"
+                val fileName = queryFileName(uri) ?: "fatsecret.csv"
+                val mimeType = contentResolver.getType(uri).orEmpty()
                 val csvText = withContext(Dispatchers.IO) {
                     contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
                         ?: error("Не удалось прочитать файл")
                 }
-                require(csvText.isNotBlank()) { "CSV пустой" }
-                require(csvText.length <= 5_000_000) { "CSV слишком большой: максимум 5 МБ" }
 
-                val fileName = queryFileName(uri) ?: "fatsecret.csv"
-                statusView.text = "Отправляю в dashboard…"
+                require(csvText.isNotBlank()) { "Файл пустой" }
+                require(csvText.length <= 5_000_000) { "Файл слишком большой: максимум 5 МБ" }
+                require(isLikelyFatSecretCsv(fileName, mimeType, csvText)) {
+                    "Это не похоже на CSV-экспорт FatSecret"
+                }
+
+                statusView.text = "Отправляю питание в Health Connector…"
                 val body = JSONObject().apply {
                     put("token", token)
                     put("action", "fatsecretCsv")
                     put("fileName", fileName)
+                    put("mimeType", mimeType)
                     put("csvText", csvText)
                     put("uploadedAt", Instant.now().toString())
                 }
@@ -68,12 +74,12 @@ class ShareCsvActivity : AppCompatActivity() {
             }.onSuccess { response ->
                 val days = response?.optInt("days", 0) ?: 0
                 val meals = response?.optInt("meals", 0) ?: 0
-                val message = "Готово: дней $days, приёмов пищи $meals"
+                val message = "Питание импортировано: дней $days, приёмов пищи $meals"
                 statusView.text = message
                 Toast.makeText(this@ShareCsvActivity, message, Toast.LENGTH_LONG).show()
                 statusView.postDelayed({ finish() }, 1600)
             }.onFailure { error ->
-                failAndOpenMain("Ошибка импорта CSV: ${error.message}")
+                failAndOpenMain("Ошибка импорта: ${error.message}")
             }
         }
     }
@@ -99,6 +105,19 @@ class ShareCsvActivity : AppCompatActivity() {
         return cursor?.use {
             if (it.moveToFirst()) it.getString(0) else null
         }
+    }
+
+    private fun isLikelyFatSecretCsv(fileName: String, mimeType: String, csvText: String): Boolean {
+        val lowerName = fileName.lowercase()
+        val lowerMime = mimeType.lowercase()
+        val hasCsvName = lowerName.endsWith(".csv")
+        val hasCsvMime = lowerMime.contains("csv") ||
+            lowerMime == "application/vnd.ms-excel" ||
+            lowerMime == "application/octet-stream" ||
+            lowerMime == "text/plain"
+        val hasFatSecretStructure = csvText.contains("# Report Details", ignoreCase = true) ||
+            csvText.contains("FatSecret", ignoreCase = true)
+        return (hasCsvName || hasCsvMime) && hasFatSecretStructure
     }
 
     private fun failAndOpenMain(message: String) {
