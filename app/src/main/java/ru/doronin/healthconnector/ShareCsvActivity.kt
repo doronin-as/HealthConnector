@@ -32,8 +32,9 @@ class ShareCsvActivity : AppCompatActivity() {
         setContentView(statusView)
 
         val uri = extractSharedUri(intent)
-        if (uri == null) {
-            failAndOpenMain("Не удалось получить файл из меню «Поделиться»")
+        val inlineText = extractSharedText(intent)
+        if (uri == null && inlineText.isNullOrBlank()) {
+            failAndOpenMain("Не удалось получить вложение из экспорта FatSecret")
             return
         }
 
@@ -48,17 +49,21 @@ class ShareCsvActivity : AppCompatActivity() {
         lifecycleScope.launch {
             runCatching {
                 statusView.text = "Проверяю экспорт FatSecret…"
-                val fileName = queryFileName(uri) ?: "fatsecret.csv"
-                val mimeType = contentResolver.getType(uri).orEmpty()
-                val csvText = withContext(Dispatchers.IO) {
-                    contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
-                        ?: error("Не удалось прочитать файл")
+                val fileName = uri?.let { queryFileName(it) } ?: "fatsecret.csv"
+                val mimeType = uri?.let { contentResolver.getType(it) }.orEmpty().ifBlank { intent?.type.orEmpty() }
+                val csvText = if (uri != null) {
+                    withContext(Dispatchers.IO) {
+                        contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                            ?: error("Не удалось прочитать вложение")
+                    }
+                } else {
+                    inlineText.orEmpty()
                 }
 
                 require(csvText.isNotBlank()) { "Файл пустой" }
                 require(csvText.length <= 5_000_000) { "Файл слишком большой: максимум 5 МБ" }
                 require(isLikelyFatSecretCsv(fileName, mimeType, csvText)) {
-                    "Это не похоже на CSV-экспорт FatSecret"
+                    "Полученный файл не похож на CSV-экспорт FatSecret"
                 }
 
                 statusView.text = "Отправляю питание в Health Connector…"
@@ -86,17 +91,46 @@ class ShareCsvActivity : AppCompatActivity() {
 
     private fun extractSharedUri(intent: Intent?): Uri? {
         intent ?: return null
-        return when (intent.action) {
-            Intent.ACTION_SEND -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
-                }
+
+        getSingleStream(intent)?.let { return it }
+        getMultipleStreams(intent).firstOrNull()?.let { return it }
+
+        val clip = intent.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) {
+                clip.getItemAt(i).uri?.let { return it }
             }
-            Intent.ACTION_VIEW -> intent.data
-            else -> intent.data
+        }
+
+        if (intent.action == Intent.ACTION_VIEW) return intent.data
+
+        // Some apps use ACTION_SENDTO mailto: but still attach a content URI in extras/ClipData.
+        // The mailto: URI itself is not treated as a file.
+        return null
+    }
+
+    private fun getSingleStream(intent: Intent): Uri? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+        }
+    }
+
+    private fun getMultipleStreams(intent: Intent): List<Uri> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
+        } else {
+            @Suppress("DEPRECATION")
+            (intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM) ?: arrayListOf())
+        }
+    }
+
+    private fun extractSharedText(intent: Intent?): String? {
+        intent ?: return null
+        return intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.takeIf {
+            it.contains("# Report Details", ignoreCase = true) || it.contains("FatSecret", ignoreCase = true)
         }
     }
 
@@ -114,10 +148,11 @@ class ShareCsvActivity : AppCompatActivity() {
         val hasCsvMime = lowerMime.contains("csv") ||
             lowerMime == "application/vnd.ms-excel" ||
             lowerMime == "application/octet-stream" ||
-            lowerMime == "text/plain"
+            lowerMime == "text/plain" ||
+            lowerMime == "message/rfc822"
         val hasFatSecretStructure = csvText.contains("# Report Details", ignoreCase = true) ||
             csvText.contains("FatSecret", ignoreCase = true)
-        return (hasCsvName || hasCsvMime) && hasFatSecretStructure
+        return (hasCsvName || hasCsvMime || lowerMime.isBlank()) && hasFatSecretStructure
     }
 
     private fun failAndOpenMain(message: String) {
