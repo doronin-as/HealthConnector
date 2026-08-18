@@ -1,17 +1,14 @@
 package ru.doronin.healthconnector
 
-import android.app.Activity
+import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.health.connect.client.ExperimentalMatchmakingApi
 import androidx.health.connect.client.HealthConnectClient
-import androidx.health.connect.client.HealthConnectFeatures
 import androidx.health.connect.client.PermissionController
-import androidx.health.connect.client.matchmaking.MatchmakingRequest
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
 import androidx.health.connect.client.records.DistanceRecord
@@ -42,7 +39,6 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 
-@OptIn(ExperimentalMatchmakingApi::class)
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val client by lazy { HealthConnectClient.getOrCreate(this) }
@@ -68,16 +64,6 @@ class MainActivity : AppCompatActivity() {
             "Разрешения Health Connect выданы"
         } else {
             "Выданы не все разрешения. Для полной синхронизации разреши все запрошенные типы данных."
-        }
-    }
-
-    private val matchmakingLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        binding.status.text = if (result.resultCode == Activity.RESULT_OK) {
-            "Источник данных подключён. Теперь можно синхронизировать."
-        } else {
-            "Подключение источника завершено без изменений."
         }
     }
 
@@ -120,50 +106,24 @@ class MainActivity : AppCompatActivity() {
             importCsvLauncher.launch(arrayOf("text/csv", "text/comma-separated-values", "text/plain", "application/csv"))
         }
         binding.permissions.setOnClickListener { permissionLauncher.launch(permissions) }
-        binding.connectWearable.setOnClickListener {
-            lifecycleScope.launch { launchWearableMatchmaking() }
-        }
+        binding.connectWearable.setOnClickListener { openHealthConnectSettings() }
         binding.sync.setOnClickListener {
             val settings = saveSettingsFromForm()
             lifecycleScope.launch { sync(settings.endpoint, settings.token, settings.days) }
         }
     }
 
-    private suspend fun launchWearableMatchmaking() {
+    private fun openHealthConnectSettings() {
         if (HealthConnectClient.getSdkStatus(this) != HealthConnectClient.SDK_AVAILABLE) {
             binding.status.text = "Health Connect недоступен"
             return
         }
-
-        val granted = client.permissionController.getGrantedPermissions()
-        if (!granted.containsAll(permissions)) {
-            binding.status.text = "Сначала выдай разрешения Health Connect, затем повтори подключение."
-            return
-        }
-
-        if (
-            client.features.getFeatureStatus(HealthConnectFeatures.FEATURE_MATCHMAKING) !=
-            HealthConnectFeatures.FEATURE_STATUS_AVAILABLE
-        ) {
-            binding.status.text =
-                "Автопоиск источников пока недоступен на этом устройстве. Подключи приложение часов к Health Connect вручную."
-            return
-        }
-
-        binding.status.text = "Ищу совместимые приложения и устройства…"
         runCatching {
-            val request = MatchmakingRequest(recordTypes = emptySet())
-            val response = client.checkIfMatchmakingIsPossible(request)
-            if (!response.isMatchmakingPossible) null else client.createMatchmakingIntent(request)
-        }.onSuccess { intent ->
-            if (intent == null) {
-                binding.status.text =
-                    "Новых совместимых источников не найдено. Уже подключённые источники будут использованы автоматически."
-            } else {
-                matchmakingLauncher.launch(intent)
-            }
+            startActivity(Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS))
+        }.onSuccess {
+            binding.status.text = "В Health Connect выбери приложение часов или браслета и разреши ему запись данных."
         }.onFailure {
-            binding.status.text = "Не удалось открыть подключение источника: ${it.message}"
+            binding.status.text = "Не удалось открыть Health Connect: ${it.message}"
         }
     }
 
