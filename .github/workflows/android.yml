@@ -20,11 +20,10 @@ jobs:
           gradle-version: '8.11.1'
       - name: Restore stable development signing key
         run: |
-          mkdir -p "$HOME/.android"
-          base64 --decode .github/signing/healthconnector-dev.keystore.b64 > "$HOME/.android/debug.keystore"
-          chmod 600 "$HOME/.android/debug.keystore"
+          base64 --decode .github/signing/healthconnector-dev.keystore.b64 > app/healthconnector-dev.keystore
+          chmod 600 app/healthconnector-dev.keystore
           keytool -list -v \
-            -keystore "$HOME/.android/debug.keystore" \
+            -keystore app/healthconnector-dev.keystore \
             -storepass android \
             -alias androiddebugkey | grep -F "31:9C:0E:19:44:72:7B:A1:12:8E:6A:83:40:BD:68:12:3B:9E:8B:2C:F3:28:B0:44:3E:1E:4A:03:87:A8:5A:80"
       - name: Build debug APK
