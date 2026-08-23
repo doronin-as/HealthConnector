@@ -27,7 +27,6 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.abs
-import kotlin.math.max
 import kotlin.math.min
 
 /**
@@ -103,7 +102,7 @@ class HealthSyncEngine(
                 buildList<Record> { addAll(daySteps); addAll(dayDistances) },
                 requiredKinds = 2
             ) { records ->
-                setOf(
+                listOf(
                     records.any { it is StepsRecord },
                     records.any { it is DistanceRecord }
                 ).count { it }
@@ -112,7 +111,7 @@ class HealthSyncEngine(
                 buildList<Record> { addAll(dayActiveCalories); addAll(dayTotalCalories) },
                 requiredKinds = 2
             ) { records ->
-                setOf(
+                listOf(
                     records.any { it is ActiveCaloriesBurnedRecord },
                     records.any { it is TotalCaloriesBurnedRecord }
                 ).count { it }
@@ -144,8 +143,7 @@ class HealthSyncEngine(
             val workoutResult = deduplicateWorkouts(dayWorkoutCandidates)
             val dayWarnings = mutableListOf<String>()
 
-            val aggregateSleepHours = aggregate.sleepHours
-            val sleepCandidate = aggregateSleepHours ?: sleep.hours
+            val sleepCandidate = aggregate.sleepHours ?: sleep.hours
             val suspiciousSleep = sleepCandidate != null && sleepCandidate > MAX_SLEEP_HOURS_PER_DAY
             val effectiveSleepHours = if (suspiciousSleep) {
                 dayWarnings += "Сон ${format1(sleepCandidate)} ч > $MAX_SLEEP_HOURS_PER_DAY ч — значение исключено"
@@ -211,9 +209,6 @@ class HealthSyncEngine(
                 put("workoutCount", workoutResult.records.size)
                 put("workoutMinutes", workoutMinutes)
                 put("sourcePackages", JSONArray(daySources))
-
-                // Source ownership is explicit. The server may ignore these today, but they make
-                // diagnostics deterministic and allow future source-aware storage.
                 put("activitySource", activitySource)
                 put("stepsSource", activitySource)
                 put("distanceSource", activitySource)
@@ -258,7 +253,7 @@ class HealthSyncEngine(
 
         return JSONObject().apply {
             put("schemaVersion", 2)
-            put("appVersion", BuildConfig.VERSION_NAME)
+            put("appVersion", appVersion())
             put("syncedAt", Instant.now().toString())
             put("deviceId", android.os.Build.MODEL ?: "Android")
             put("rangeStart", startDate.toString())
@@ -512,6 +507,10 @@ class HealthSyncEngine(
             .joinToString(" ")
         return name.ifBlank { deviceTypeName(device.type) }
     }
+
+    private fun appVersion(): String = runCatching {
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty()
+    }.getOrDefault("")
 
     private fun sourceName(packageName: String): String {
         if (packageName.isBlank()) return "Неизвестный источник"
