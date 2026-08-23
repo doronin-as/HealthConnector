@@ -33,8 +33,10 @@ const MEAL_ALIASES = Object.freeze({
   'Dinner':'Ужин', 'Snacks/Other':'Перекус/Другое'
 });
 const IMPORT_STATUS = 'FatSecret CSV';
-const KCAL_TOLERANCE = 2;
-const MACRO_TOLERANCE = 0.2;
+const KCAL_ABS_TOLERANCE = 3;
+const KCAL_REL_TOLERANCE = 0.005;
+const MACRO_ABS_TOLERANCE = 0.5;
+const MACRO_REL_TOLERANCE = 0.01;
 
 function setup() {
   const properties = PropertiesService.getScriptProperties();
@@ -67,7 +69,7 @@ function doPost(e) {
     const spreadsheet = getSpreadsheet_();
     const logSheet = ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS);
 
-    // Важно: CSV обрабатывается до health-валидации.
+    // CSV обрабатывается до health-валидации: у него нет days/workouts.
     if (payload.action === 'fatsecretCsv') return json_(importFatSecretCsv_(spreadsheet, logSheet, payload));
 
     validateHealthPayload_(payload);
@@ -89,6 +91,9 @@ function validateHealthPayload_(payload) {
   if (!Array.isArray(payload.workouts)) throw new Error('Поле workouts должно быть массивом');
   if (payload.days.length > 31) throw new Error('Слишком большой диапазон дней');
   if (payload.workouts.length > 5000) throw new Error('Слишком много тренировок');
+  payload.days.forEach((day, i) => {
+    if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(String(day.date || ''))) throw new Error(`Некорректная дата days[${i}]`);
+  });
 }
 
 function importHealthPayload_(spreadsheet, logSheet, payload) {
@@ -103,11 +108,35 @@ function importHealthPayload_(spreadsheet, logSheet, payload) {
     Array.isArray(d.sourcePackages) ? d.sourcePackages.join(', ') : '', syncedAt
   ]);
   const workoutRows = (payload.workouts || []).map(w => [w.id,w.start,w.end,w.exerciseType,nullable_(w.title),Number(w.durationMinutes || 0),nullable_(w.sourcePackage),syncedAt]);
+
   upsertByKey_(daysSheet, dayRows, 1);
   upsertByKey_(workoutsSheet, workoutRows, 1);
   syncDiary_(spreadsheet, payload.days || []);
-  logSheet.appendRow([new Date(),payload.deviceId || '',payload.rangeStart || '',payload.rangeEnd || '',dayRows.length,workoutRows.length,'OK','Синхронизация завершена']);
-  return {ok:true, message:`Записано дней: ${dayRows.length}; тренировок: ${workoutRows.length}`};
+
+  const quality = summarizeHealthQuality_(payload);
+  const status = quality.warningCount > 0 ? 'WARN' : 'OK';
+  const message = quality.warningCount > 0
+    ? `Синхронизация завершена; предупреждений качества: ${quality.warningCount}${quality.preview ? '; ' + quality.preview : ''}`
+    : 'Синхронизация завершена';
+  logSheet.appendRow([new Date(),payload.deviceId || '',payload.rangeStart || '',payload.rangeEnd || '',dayRows.length,workoutRows.length,status,message]);
+  return {ok:true, warnings:quality.warningCount, message:`Записано дней: ${dayRows.length}; тренировок: ${workoutRows.length}; предупреждений: ${quality.warningCount}`};
+}
+
+function summarizeHealthQuality_(payload) {
+  const warnings = [];
+  (payload.days || []).forEach(day => {
+    if (Array.isArray(day.warnings)) day.warnings.forEach(w => warnings.push(`${day.date}: ${w}`));
+    const active = Number(day.activeCaloriesKcal);
+    const total = Number(day.totalCaloriesKcal);
+    if (Number.isFinite(active) && Number.isFinite(total) && active > total * 1.05) warnings.push(`${day.date}: active calories > total calories`);
+    const sleep = Number(day.sleepHours);
+    if (Number.isFinite(sleep) && sleep > 16) warnings.push(`${day.date}: sleep > 16h`);
+    const workoutMinutes = Number(day.workoutMinutes);
+    if (Number.isFinite(workoutMinutes) && workoutMinutes > 960) warnings.push(`${day.date}: workout minutes > 960`);
+  });
+  const diagnostics = payload.diagnostics || {};
+  if (Array.isArray(diagnostics.warnings)) diagnostics.warnings.forEach(w => warnings.push(String(w)));
+  return {warningCount:warnings.length, preview:warnings.slice(0,3).join(' | ')};
 }
 
 function importFatSecretCsv_(spreadsheet, logSheet, payload) {
@@ -242,14 +271,19 @@ function validateFatSecretParsed_(parsed) {
     day.meals.forEach(meal => validateNutritionRange_(meal, `${prefix} ${meal.meal}`, errors));
     const sum = day.meals.reduce((a,m) => ({kcal:a.kcal+m.kcal,fat:a.fat+m.fat,carbs:a.carbs+m.carbs,protein:a.protein+m.protein}), {kcal:0,fat:0,carbs:0,protein:0});
     const parts = [];
-    if (Math.abs(sum.kcal-day.kcal)>KCAL_TOLERANCE) parts.push(`kcal meals=${round2_(sum.kcal)}, daily=${round2_(day.kcal)}`);
-    if (Math.abs(sum.fat-day.fat)>MACRO_TOLERANCE) parts.push(`fat meals=${round2_(sum.fat)}, daily=${round2_(day.fat)}`);
-    if (Math.abs(sum.carbs-day.carbs)>MACRO_TOLERANCE) parts.push(`carbs meals=${round2_(sum.carbs)}, daily=${round2_(day.carbs)}`);
-    if (Math.abs(sum.protein-day.protein)>MACRO_TOLERANCE) parts.push(`protein meals=${round2_(sum.protein)}, daily=${round2_(day.protein)}`);
+    if (outsideTolerance_(sum.kcal,day.kcal,KCAL_ABS_TOLERANCE,KCAL_REL_TOLERANCE)) parts.push(`kcal meals=${round2_(sum.kcal)}, daily=${round2_(day.kcal)}`);
+    if (outsideTolerance_(sum.fat,day.fat,MACRO_ABS_TOLERANCE,MACRO_REL_TOLERANCE)) parts.push(`fat meals=${round2_(sum.fat)}, daily=${round2_(day.fat)}`);
+    if (outsideTolerance_(sum.carbs,day.carbs,MACRO_ABS_TOLERANCE,MACRO_REL_TOLERANCE)) parts.push(`carbs meals=${round2_(sum.carbs)}, daily=${round2_(day.carbs)}`);
+    if (outsideTolerance_(sum.protein,day.protein,MACRO_ABS_TOLERANCE,MACRO_REL_TOLERANCE)) parts.push(`protein meals=${round2_(sum.protein)}, daily=${round2_(day.protein)}`);
     if (parts.length) errors.push(`${prefix}: ERROR — ${parts.join('; ')} — import rejected`);
     else okMessages.push(`${prefix}: OK — сумма приёмов ${round2_(sum.kcal)} kcal, суточный итог ${round2_(day.kcal)} kcal`);
   });
   return {ok:errors.length===0, errors, okMessages};
+}
+
+function outsideTolerance_(actual, expected, absoluteTolerance, relativeTolerance) {
+  const tolerance = Math.max(absoluteTolerance, Math.abs(Number(expected) || 0) * relativeTolerance);
+  return Math.abs(Number(actual) - Number(expected)) > tolerance;
 }
 
 function validateNutritionRange_(item, context, errors) {
@@ -284,10 +318,11 @@ function upsertFatSecretMeals_(sheet, parsed, fileName, spreadsheet) {
   const existing = new Map();
   const refreshedLast = sheet.getLastRow();
   if (refreshedLast >= 2) {
-    sheet.getRange(2,1,refreshedLast-1,2).getValues().forEach((row,idx) => {
+    sheet.getRange(2,1,refreshedLast-1,8).getValues().forEach((row,idx) => {
       const dateKey = normalizeDateWithTz_(row[0],tz);
       const meal = String(row[1] || '').trim();
-      if (dateKey && meal) existing.set(`${dateKey}|${meal}`, idx+2);
+      const status = String(row[7] || '').trim();
+      if (dateKey && meal && status === IMPORT_STATUS) existing.set(`${dateKey}|${meal}`, idx+2);
     });
   }
 
@@ -349,13 +384,44 @@ function ensureSheet_(spreadsheet,name,headers) {
   }
   return sheet;
 }
+
 function upsertByKey_(sheet,rows,keyColumnOneBased) {
   if (!rows.length) return;
-  const lastRow=sheet.getLastRow(), keyIndex=keyColumnOneBased-1, existing=new Map();
-  if (lastRow>=2) sheet.getRange(2,keyColumnOneBased,lastRow-1,1).getDisplayValues().forEach((row,index)=>{ const key=String(row[0]||'').trim(); if(key) existing.set(key,index+2); });
-  const appends=[];
-  rows.forEach(row=>{ const key=String(row[keyIndex]||'').trim(); if(!key)return; const r=existing.get(key); if(r)sheet.getRange(r,1,1,row.length).setValues([row]); else appends.push(row); });
-  if(appends.length) sheet.getRange(sheet.getLastRow()+1,1,appends.length,appends[0].length).setValues(appends);
+  const keyIndex = keyColumnOneBased - 1;
+
+  let lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    const displayed = sheet.getRange(2,keyColumnOneBased,lastRow-1,1).getDisplayValues();
+    const latest = new Map();
+    const rowsToDelete = [];
+    displayed.forEach((row,index) => {
+      const key = String(row[0] || '').trim();
+      if (!key) return;
+      const rowNumber = index + 2;
+      if (latest.has(key)) rowsToDelete.push(latest.get(key));
+      latest.set(key,rowNumber);
+    });
+    rowsToDelete.sort((a,b)=>b-a).forEach(r => sheet.deleteRow(r));
+  }
+
+  lastRow = sheet.getLastRow();
+  const existing = new Map();
+  if (lastRow >= 2) {
+    sheet.getRange(2,keyColumnOneBased,lastRow-1,1).getDisplayValues().forEach((row,index) => {
+      const key = String(row[0] || '').trim();
+      if (key) existing.set(key,index+2);
+    });
+  }
+
+  const appends = [];
+  rows.forEach(row => {
+    const key = String(row[keyIndex] || '').trim();
+    if (!key) return;
+    const targetRow = existing.get(key);
+    if (targetRow) sheet.getRange(targetRow,1,1,row.length).setValues([row]);
+    else appends.push(row);
+  });
+  if (appends.length) sheet.getRange(sheet.getLastRow()+1,1,appends.length,appends[0].length).setValues(appends);
 }
 
 function syncDiary_(spreadsheet,days) {
