@@ -20,8 +20,15 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Health Connect + Google Fit + импорт питания FatSecret"
+            android:text="Health Connect + совместимые часы и браслеты + импорт питания FatSecret"
             android:textSize="14sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Работает с источниками, которые передают данные в Health Connect: Mi Fitness, Samsung Health, Garmin Connect, Google Health и другими совместимыми приложениями."
+            android:textSize="12sp" />
 
         <EditText
             android:id="@+id/endpoint"
@@ -67,10 +74,16 @@
             android:text="Выдать разрешения Health Connect" />
 
         <Button
+            android:id="@+id/connectWearable"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Подключить часы или браслет" />
+
+        <Button
             android:id="@+id/sync"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Синхронизировать браслет" />
+            android:text="Синхронизировать данные" />
 
         <Button
             android:id="@+id/importCsv"

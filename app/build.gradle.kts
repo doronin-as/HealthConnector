@@ -7,12 +7,27 @@ android {
     namespace = "ru.doronin.healthconnector"
     compileSdk = 36
 
+    signingConfigs {
+        create("stableDebug") {
+            storeFile = file("healthconnector-dev.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     defaultConfig {
         applicationId = "ru.doronin.healthconnector"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.4.0"
+        versionCode = 10
+        versionName = "1.6.0"
+    }
+
+    buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("stableDebug")
+        }
     }
 
     compileOptions {
