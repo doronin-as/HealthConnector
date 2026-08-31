@@ -19,6 +19,7 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           p = Path('app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt')
           s = p.read_text()
@@ -36,14 +37,11 @@ jobs:
               '            hasStepRecords = records.isNotEmpty()\n            stepsTotal = records.sumOf { it.count }\n            for (r in records) emit("Steps", null, r.startTime, r.endTime, r.count, "steps", r)'
           )
 
-          old = '''    private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
-              return try {
-                  readAll(start, end)
-              } catch (_: Exception) {
-                  emptyList()
-              }
-          }'''
-          new = '''    private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
+          pattern = re.compile(
+              r'    private suspend inline fun <reified T : Record> safeReadAll\(start: Instant, end: Instant\): List<T> \{.*?\n    \}\n\n    private suspend inline fun <reified T : Record> readAll',
+              re.S
+          )
+          replacement = '''    private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
               var lastError: Exception? = null
               repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
                   try {
@@ -61,14 +59,15 @@ jobs:
                   "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
                   lastError
               )
-          }'''
-          if old not in s:
-              raise SystemExit('safeReadAll block not found; refusing unsafe patch')
-          s = s.replace(old, new)
+          }
 
-          marker = '''        // Make sure the final partial measurement batch is persisted before the day summary.
-          batcher.flush()'''
-          replacement = '''        if (!hasStepRecords) {
+          private suspend inline fun <reified T : Record> readAll'''
+          s, count = pattern.subn(replacement, s, count=1)
+          if count != 1:
+              raise SystemExit(f'safeReadAll structural patch count={count}; refusing unsafe patch')
+
+          marker = '        // Make sure the final partial measurement batch is persisted before the day summary.\n        batcher.flush()'
+          guarded = '''        if (!hasStepRecords) {
               onProgress("Health Connect не вернул шаги за $date — существующая сводка сохранена")
               batcher.flush()
               return DayResult(
@@ -82,21 +81,32 @@ jobs:
           batcher.flush()'''
           if marker not in s:
               raise SystemExit('summary marker not found; refusing unsafe patch')
-          s = s.replace(marker, replacement)
+          s = s.replace(marker, guarded, 1)
 
+          day_marker = '            allSources += result.sources\n        }'
+          if day_marker not in s:
+              raise SystemExit('day loop marker not found; refusing unsafe patch')
           s = s.replace(
-              '            allSources += result.sources\n        }',
+              day_marker,
               '            allSources += result.sources\n            if (offset + 1 < safeDays) delay(HEALTH_CONNECT_DAY_PAUSE_MS)\n        }',
               1
           )
+
+          constants = '        private const val HEALTH_CONNECT_PAGE_SIZE = 200\n        private const val MAX_MEASUREMENTS_PER_REQUEST = 2000'
+          if constants not in s:
+              raise SystemExit('constants marker not found; refusing unsafe patch')
           s = s.replace(
-              '        private const val HEALTH_CONNECT_PAGE_SIZE = 200\n        private const val MAX_MEASUREMENTS_PER_REQUEST = 2000',
-              '        private const val HEALTH_CONNECT_PAGE_SIZE = 200\n        private const val MAX_MEASUREMENTS_PER_REQUEST = 2000\n        private const val HEALTH_CONNECT_READ_RETRIES = 3\n        private const val HEALTH_CONNECT_RETRY_BASE_MS = 750L\n        private const val HEALTH_CONNECT_DAY_PAUSE_MS = 1000L'
+              constants,
+              constants + '\n        private const val HEALTH_CONNECT_READ_RETRIES = 3\n        private const val HEALTH_CONNECT_RETRY_BASE_MS = 750L\n        private const val HEALTH_CONNECT_DAY_PAUSE_MS = 1000L',
+              1
           )
           p.write_text(s)
 
           g = Path('app/build.gradle.kts')
-          b = g.read_text().replace('versionCode = 10', 'versionCode = 11').replace('versionName = "1.5.4"', 'versionName = "1.5.5"')
+          b = g.read_text()
+          if 'versionCode = 10' not in b or 'versionName = "1.5.4"' not in b:
+              raise SystemExit('unexpected version; refusing patch')
+          b = b.replace('versionCode = 10', 'versionCode = 11').replace('versionName = "1.5.4"', 'versionName = "1.5.5"')
           g.write_text(b)
           PY
       - name: Commit patch
