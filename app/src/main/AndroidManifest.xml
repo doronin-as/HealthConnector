@@ -16,6 +16,8 @@
     <uses-permission android:name="android.permission.health.READ_ELEVATION_GAINED" />
     <uses-permission android:name="android.permission.health.READ_FLOORS_CLIMBED" />
     <uses-permission android:name="android.permission.health.READ_SPEED" />
+    <uses-permission android:name="android.permission.health.READ_STEPS_CADENCE" />
+    <uses-permission android:name="android.permission.health.READ_CYCLING_PEDALING_CADENCE" />
     <uses-permission android:name="android.permission.health.READ_POWER" />
     <uses-permission android:name="android.permission.health.READ_VO2_MAX" />
     <uses-permission android:name="android.permission.health.READ_SKIN_TEMPERATURE" />
@@ -25,13 +27,17 @@
         android:label="Health Connector 2"
         android:theme="@style/Theme.HealthConnector">
         <activity
-            android:name=".MainActivity"
+            android:name=".StreamingMainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="false" />
 
         <activity
             android:name=".ShareCsvActivity"
@@ -62,7 +68,7 @@
             android:name="ViewPermissionUsageActivity"
             android:exported="true"
             android:permission="android.permission.START_VIEW_PERMISSION_USAGE"
-            android:targetActivity=".MainActivity">
+            android:targetActivity=".StreamingMainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW_PERMISSION_USAGE" />
                 <category android:name="android.intent.category.HEALTH_PERMISSIONS" />
