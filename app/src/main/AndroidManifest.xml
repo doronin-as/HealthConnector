@@ -22,7 +22,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Health Connector"
+        android:label="Health Connector 2"
         android:theme="@style/Theme.HealthConnector">
         <activity
             android:name=".MainActivity"
@@ -36,7 +36,7 @@
         <activity
             android:name=".ShareCsvActivity"
             android:exported="true"
-            android:label="Отправить в Health Connector">
+            android:label="Отправить в Health Connector 2">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
