@@ -20,79 +20,66 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           p = Path('app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt')
           s = p.read_text()
 
-          old = '''    private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
-    var lastError: Exception? = null
-    repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
-        try {
-            return readAll(start, end)
-        } catch (_: SecurityException) {
-            return emptyList()
-        } catch (error: Exception) {
-            lastError = error
-            if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
-                delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))
-            }
-        }
-    }
-    throw IllegalStateException(
-        "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
-        lastError
-    )
-}
+          pattern = re.compile(
+              r'    private suspend inline fun <reified T : Record> safeReadAll\(start: Instant, end: Instant\): List<T> \{.*?'
+              r'private suspend inline fun <reified T : Record> readAll\(start: Instant, end: Instant\): List<T> \{',
+              re.S,
+          )
 
-private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {'''
-
-          new = '''    private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
-        var lastError: Exception? = null
-        repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
-            try {
-                return readAll(start, end)
-            } catch (error: Exception) {
-                // Android 14+ may wrap SecurityException inside HealthConnectException.
-                // Missing permission for an optional metric must not abort the whole sync.
-                if (isPermissionFailure(error)) return emptyList()
-
-                lastError = error
-                if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
-                    delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))
-                }
-            }
-        }
-        throw IllegalStateException(
-            "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
-            lastError
-        )
-    }
-
-    private fun isPermissionFailure(error: Throwable): Boolean {
-        var current: Throwable? = error
-        repeat(8) {
-            val value = current ?: return false
-            if (value is SecurityException) return true
-
-            val message = value.message.orEmpty()
-            if (
-                message.contains("SecurityException", ignoreCase = true) ||
-                message.contains("does not have permission", ignoreCase = true) ||
-                message.contains("permission to read data", ignoreCase = true) ||
-                message.contains("permission denied", ignoreCase = true)
-            ) {
-                return true
-            }
-            current = value.cause
-        }
-        return false
-    }
-
-    private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {'''
-
-          if old not in s:
-              raise SystemExit('safeReadAll block not found; refusing unsafe patch')
-          s = s.replace(old, new, 1)
+          lines = [
+              '    private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {',
+              '        var lastError: Exception? = null',
+              '        repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->',
+              '            try {',
+              '                return readAll(start, end)',
+              '            } catch (error: Exception) {',
+              '                // Android may wrap SecurityException inside HealthConnectException.',
+              '                // Missing permission for an optional metric must not abort the whole sync.',
+              '                if (isPermissionFailure(error)) return emptyList()',
+              '',
+              '                lastError = error',
+              '                if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {',
+              '                    delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))',
+              '                }',
+              '            }',
+              '        }',
+              '        throw IllegalStateException(',
+              '            "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: \\"неизвестная ошибка\\"}",',
+              '            lastError',
+              '        )',
+              '    }',
+              '',
+              '    private fun isPermissionFailure(error: Throwable): Boolean {',
+              '        var current: Throwable? = error',
+              '        repeat(8) {',
+              '            val value = current ?: return false',
+              '            if (value is SecurityException) return true',
+              '',
+              '            val message = value.message.orEmpty()',
+              '            if (',
+              '                message.contains("SecurityException", ignoreCase = true) ||',
+              '                message.contains("does not have permission", ignoreCase = true) ||',
+              '                message.contains("permission to read data", ignoreCase = true) ||',
+              '                message.contains("permission denied", ignoreCase = true)',
+              '            ) {',
+              '                return true',
+              '            }',
+              '            current = value.cause',
+              '        }',
+              '        return false',
+              '    }',
+              '',
+              '    private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {',
+          ]
+          replacement = '\n'.join(lines)
+          s, count = pattern.subn(lambda _: replacement, s, count=1)
+          if count != 1:
+              raise SystemExit(f'Expected one safeReadAll block, found {count}; refusing unsafe patch')
           p.write_text(s)
 
           g = Path('app/build.gradle.kts')
