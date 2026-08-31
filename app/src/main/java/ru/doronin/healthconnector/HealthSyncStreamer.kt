@@ -779,7 +779,7 @@ batcher.flush()
             }
         }
         throw IllegalStateException(
-            "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: \"неизвестная ошибка\"}",
+            "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
             lastError
         )
     }
