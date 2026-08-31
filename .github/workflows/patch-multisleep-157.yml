@@ -1,0 +1,131 @@
+name: Patch multi-session sleep for 1.5.7
+
+on:
+  push:
+    paths:
+      - '.github/trigger-multisleep-157'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch sleep attribution and aggregation
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt')
+          s = p.read_text()
+
+          old_read = '''        run {
+            val records = preferBestSource(safeReadAll<SleepSessionRecord>(dayStart, dayEnd))
+            addSources(records, sources)
+            sleepSummary = aggregateSleep(records, dayStart, dayEnd)
+            for (r in records) {'''
+          new_read = '''        run {
+            // Attribute each complete sleep session to the day when the user wakes up.
+            // This keeps an overnight sleep intact and allows several sessions on the same day
+            // (main sleep, nap, additional sleep) without splitting them at midnight.
+            val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
+            val records = preferBestSource(safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd))
+                .filter { it.endTime.atZone(zone).toLocalDate() == date }
+                .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
+            addSources(records, sources)
+            sleepSummary = aggregateSleep(records)
+            for (r in records) {'''
+          if old_read not in s:
+              raise SystemExit('Sleep read block not found; refusing unsafe patch')
+          s = s.replace(old_read, new_read, 1)
+
+          pattern = re.compile(
+              r'''    private fun aggregateSleep\(\n        records: List<SleepSessionRecord>,\n        dayStart: Instant,\n        dayEnd: Instant\n    \): SleepAggregation \{.*?\n    \}\n\n    private fun stageTotals\(''',
+              re.S,
+          )
+          replacement = '''    private fun aggregateSleep(
+        records: List<SleepSessionRecord>
+    ): SleepAggregation {
+        val intervals = records
+            .filter { it.startTime < it.endTime }
+            .map { SleepInterval(it.startTime, it.endTime) }
+            .sortedBy { it.start }
+
+        val stageList = records.flatMap { it.stages }
+        if (intervals.isEmpty()) {
+            return SleepAggregation(
+                hours = null,
+                suspicious = false,
+                rawHours = 0.0,
+                sessionCount = records.size,
+                stageCount = stageList.size,
+                start = null,
+                end = null,
+                deepMinutes = 0,
+                lightMinutes = 0,
+                remMinutes = 0,
+                awakeMinutes = 0
+            )
+        }
+
+        val stageRangeStart = intervals.first().start
+        val stageRangeEnd = intervals.maxOf { it.end }
+        val stage = stageTotals(stageList, stageRangeStart, stageRangeEnd)
+        val rawMillis = intervals.sumOf { Duration.between(it.start, it.end).toMillis() }
+
+        // Union all sleep intervals so overlapping duplicate sessions cannot inflate total sleep.
+        val merged = mutableListOf<SleepInterval>()
+        var currentStart = intervals.first().start
+        var currentEnd = intervals.first().end
+        for (interval in intervals.drop(1)) {
+            if (!interval.start.isAfter(currentEnd)) {
+                if (interval.end > currentEnd) currentEnd = interval.end
+            } else {
+                merged += SleepInterval(currentStart, currentEnd)
+                currentStart = interval.start
+                currentEnd = interval.end
+            }
+        }
+        merged += SleepInterval(currentStart, currentEnd)
+
+        val uniqueMillis = merged.sumOf { Duration.between(it.start, it.end).toMillis() }
+        val uniqueHours = uniqueMillis / 3_600_000.0
+        val suspicious = uniqueHours > MAX_SLEEP_HOURS_PER_DAY
+
+        return SleepAggregation(
+            hours = if (suspicious) null else uniqueHours,
+            suspicious = suspicious,
+            rawHours = rawMillis / 3_600_000.0,
+            sessionCount = records.size,
+            stageCount = stageList.size,
+            start = merged.first().start,
+            end = merged.last().end,
+            deepMinutes = stage.deepMinutes,
+            lightMinutes = stage.lightMinutes,
+            remMinutes = stage.remMinutes,
+            awakeMinutes = stage.awakeMinutes
+        )
+    }
+
+    private fun stageTotals('''
+          s, count = pattern.subn(replacement, s, count=1)
+          if count != 1:
+              raise SystemExit(f'Expected one aggregateSleep block, found {count}; refusing unsafe patch')
+
+          p.write_text(s)
+          PY
+
+      - name: Commit multi-session sleep support
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+          git diff --cached --check
+          git commit -m 'Handle multiple sleep sessions by wake date'
+          git push origin HEAD:main
