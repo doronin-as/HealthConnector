@@ -1,0 +1,1 @@
+Validate HealthConnector 1.5.2 synchronization dashboard build.
