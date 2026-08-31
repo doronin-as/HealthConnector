@@ -189,9 +189,15 @@ class HealthSyncStreamer(
         }
 
         run {
-            val records = preferBestSource(safeReadAll<SleepSessionRecord>(dayStart, dayEnd))
+            // Attribute each complete sleep session to the day when the user wakes up.
+            // This keeps an overnight sleep intact and allows several sessions on the same day
+            // (main sleep, nap, additional sleep) without splitting them at midnight.
+            val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
+            val records = preferBestSource(safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd))
+                .filter { it.endTime.atZone(zone).toLocalDate() == date }
+                .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
             addSources(records, sources)
-            sleepSummary = aggregateSleep(records, dayStart, dayEnd)
+            sleepSummary = aggregateSleep(records)
             for (r in records) {
                 val stageTotals = stageTotals(r.stages, r.startTime, r.endTime)
                 sleepSessions.put(JSONObject().apply {
@@ -607,24 +613,14 @@ batcher.flush()
     }
 
     private fun aggregateSleep(
-        records: List<SleepSessionRecord>,
-        dayStart: Instant,
-        dayEnd: Instant
+        records: List<SleepSessionRecord>
     ): SleepAggregation {
-        val intervals = records.mapNotNull { record ->
-            val start = maxOf(record.startTime, dayStart)
-            val end = minOf(record.endTime, dayEnd)
-            if (start < end) SleepInterval(start, end) else null
-        }.sortedBy { it.start }
+        val intervals = records
+            .filter { it.startTime < it.endTime }
+            .map { SleepInterval(it.startTime, it.endTime) }
+            .sortedBy { it.start }
 
         val stageList = records.flatMap { it.stages }
-        val stage = stageTotals(stageList, dayStart, dayEnd)
-        val main = records.maxByOrNull { record ->
-            val start = maxOf(record.startTime, dayStart)
-            val end = minOf(record.endTime, dayEnd)
-            if (start < end) Duration.between(start, end).toMillis() else 0L
-        }
-
         if (intervals.isEmpty()) {
             return SleepAggregation(
                 hours = null,
@@ -634,14 +630,19 @@ batcher.flush()
                 stageCount = stageList.size,
                 start = null,
                 end = null,
-                deepMinutes = stage.deepMinutes,
-                lightMinutes = stage.lightMinutes,
-                remMinutes = stage.remMinutes,
-                awakeMinutes = stage.awakeMinutes
+                deepMinutes = 0,
+                lightMinutes = 0,
+                remMinutes = 0,
+                awakeMinutes = 0
             )
         }
 
+        val stageRangeStart = intervals.first().start
+        val stageRangeEnd = intervals.maxOf { it.end }
+        val stage = stageTotals(stageList, stageRangeStart, stageRangeEnd)
         val rawMillis = intervals.sumOf { Duration.between(it.start, it.end).toMillis() }
+
+        // Union all sleep intervals so overlapping duplicate sessions cannot inflate total sleep.
         val merged = mutableListOf<SleepInterval>()
         var currentStart = intervals.first().start
         var currentEnd = intervals.first().end
@@ -659,14 +660,15 @@ batcher.flush()
         val uniqueMillis = merged.sumOf { Duration.between(it.start, it.end).toMillis() }
         val uniqueHours = uniqueMillis / 3_600_000.0
         val suspicious = uniqueHours > MAX_SLEEP_HOURS_PER_DAY
+
         return SleepAggregation(
             hours = if (suspicious) null else uniqueHours,
             suspicious = suspicious,
             rawHours = rawMillis / 3_600_000.0,
             sessionCount = records.size,
             stageCount = stageList.size,
-            start = main?.startTime,
-            end = main?.endTime,
+            start = merged.first().start,
+            end = merged.last().end,
             deepMinutes = stage.deepMinutes,
             lightMinutes = stage.lightMinutes,
             remMinutes = stage.remMinutes,
