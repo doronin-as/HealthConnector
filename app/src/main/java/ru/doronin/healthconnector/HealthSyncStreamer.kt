@@ -26,6 +26,7 @@ import androidx.health.connect.client.records.WeightRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -71,6 +72,7 @@ class HealthSyncStreamer(
             totalWorkouts += result.workouts
             totalMeasurements += result.measurements
             allSources += result.sources
+            if (offset + 1 < safeDays) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
         }
 
         return SyncResult(
@@ -94,6 +96,7 @@ class HealthSyncStreamer(
         val sources = linkedSetOf<String>()
 
         var stepsTotal = 0L
+        var hasStepRecords = false
         var distanceKm = 0.0
         var activeCaloriesKcal = 0.0
         var totalCaloriesKcal = 0.0
@@ -162,6 +165,7 @@ class HealthSyncStreamer(
         run {
             val records = preferBestSource(safeReadAll<StepsRecord>(dayStart, dayEnd))
             addSources(records, sources)
+            hasStepRecords = records.isNotEmpty()
             stepsTotal = records.sumOf { it.count }
             for (r in records) emit("Steps", null, r.startTime, r.endTime, r.count, "steps", r)
         }
@@ -367,8 +371,18 @@ class HealthSyncStreamer(
             workouts.put(buildWorkoutJson(record, sources))
         }
 
-        // Make sure the final partial measurement batch is persisted before the day summary.
-        batcher.flush()
+        if (!hasStepRecords) {
+    onProgress("Health Connect не вернул шаги за $date — существующая сводка сохранена")
+    batcher.flush()
+    return DayResult(
+        workouts = workoutRecords.size,
+        measurements = batcher.totalCount,
+        sources = sources
+    )
+}
+
+// Make sure the final partial measurement batch is persisted before the day summary.
+batcher.flush()
 
         val dayObject = JSONObject().apply {
             put("date", date.toString())
@@ -749,14 +763,26 @@ class HealthSyncStreamer(
     }
 
     private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
-        return try {
-            readAll(start, end)
-        } catch (_: Exception) {
-            emptyList()
+    var lastError: Exception? = null
+    repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
+        try {
+            return readAll(start, end)
+        } catch (_: SecurityException) {
+            return emptyList()
+        } catch (error: Exception) {
+            lastError = error
+            if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
+                delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))
+            }
         }
     }
+    throw IllegalStateException(
+        "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
+        lastError
+    )
+}
 
-    private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {
+private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {
         val all = ArrayList<T>()
         var pageToken: String? = null
         do {
@@ -868,5 +894,8 @@ class HealthSyncStreamer(
         private const val MAX_SLEEP_HOURS_PER_DAY = 16.0
         private const val HEALTH_CONNECT_PAGE_SIZE = 200
         private const val MAX_MEASUREMENTS_PER_REQUEST = 2000
+        private const val HEALTH_CONNECT_READ_RETRIES = 3
+        private const val HEALTH_CONNECT_RETRY_BASE_MS = 750L
+        private const val HEALTH_CONNECT_DAY_PAUSE_MS = 1000L
     }
 }
