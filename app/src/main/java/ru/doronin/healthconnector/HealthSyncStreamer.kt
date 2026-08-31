@@ -763,26 +763,48 @@ batcher.flush()
     }
 
     private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
-    var lastError: Exception? = null
-    repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
-        try {
-            return readAll(start, end)
-        } catch (_: SecurityException) {
-            return emptyList()
-        } catch (error: Exception) {
-            lastError = error
-            if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
-                delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))
+        var lastError: Exception? = null
+        repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
+            try {
+                return readAll(start, end)
+            } catch (error: Exception) {
+                // Android may wrap SecurityException inside HealthConnectException.
+                // Missing permission for an optional metric must not abort the whole sync.
+                if (isPermissionFailure(error)) return emptyList()
+
+                lastError = error
+                if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
+                    delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))
+                }
             }
         }
+        throw IllegalStateException(
+            "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: \"неизвестная ошибка\"}",
+            lastError
+        )
     }
-    throw IllegalStateException(
-        "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
-        lastError
-    )
-}
 
-private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {
+    private fun isPermissionFailure(error: Throwable): Boolean {
+        var current: Throwable? = error
+        repeat(8) {
+            val value = current ?: return false
+            if (value is SecurityException) return true
+
+            val message = value.message.orEmpty()
+            if (
+                message.contains("SecurityException", ignoreCase = true) ||
+                message.contains("does not have permission", ignoreCase = true) ||
+                message.contains("permission to read data", ignoreCase = true) ||
+                message.contains("permission denied", ignoreCase = true)
+            ) {
+                return true
+            }
+            current = value.cause
+        }
+        return false
+    }
+
+    private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {
         val all = ArrayList<T>()
         var pageToken: String? = null
         do {
