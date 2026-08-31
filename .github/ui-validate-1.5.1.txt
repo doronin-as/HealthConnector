@@ -1,0 +1,1 @@
+Validate split-page UI build for HealthConnector 1.5.1.
