@@ -99,7 +99,7 @@ class SyncStatusTextView @JvmOverloads constructor(
 
     private fun consumeStatus(message: String) {
         val busy = message.startsWith("Читаю") || message.startsWith("Отправляю")
-        rootView.findViewById<LinearProgressIndicator?>(R.id.syncProgress)?.visibility =
+        rootView.findViewById<LinearProgressIndicator>(R.id.syncProgress)?.visibility =
             if (busy) View.VISIBLE else View.GONE
 
         val syncMatch = Regex(
@@ -140,7 +140,7 @@ class SyncStatusTextView @JvmOverloads constructor(
     }
 
     private fun refreshDashboard() {
-        val root = rootView ?: return
+        val root = rootView
         val lastSync = prefs.getLong(KEY_LAST_SYNC, 0L)
         val dateText = if (lastSync > 0L) {
             DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(lastSync))
@@ -148,16 +148,16 @@ class SyncStatusTextView @JvmOverloads constructor(
             "Ещё не было"
         }
 
-        root.findViewById<TextView?>(R.id.lastSyncValue)?.text = dateText
-        root.findViewById<TextView?>(R.id.syncDaysValue)?.text = prefs.getInt(KEY_LAST_DAYS, 0).toString()
-        root.findViewById<TextView?>(R.id.syncWorkoutsValue)?.text = prefs.getInt(KEY_LAST_WORKOUTS, 0).toString()
-        root.findViewById<TextView?>(R.id.syncMeasurementsValue)?.text = prefs.getInt(KEY_LAST_MEASUREMENTS, 0).toString()
-        root.findViewById<TextView?>(R.id.syncSourcesValue)?.text = prefs.getInt(KEY_LAST_SOURCES, 0).toString()
+        root.findViewById<TextView>(R.id.lastSyncValue)?.text = dateText
+        root.findViewById<TextView>(R.id.syncDaysValue)?.text = prefs.getInt(KEY_LAST_DAYS, 0).toString()
+        root.findViewById<TextView>(R.id.syncWorkoutsValue)?.text = prefs.getInt(KEY_LAST_WORKOUTS, 0).toString()
+        root.findViewById<TextView>(R.id.syncMeasurementsValue)?.text = prefs.getInt(KEY_LAST_MEASUREMENTS, 0).toString()
+        root.findViewById<TextView>(R.id.syncSourcesValue)?.text = prefs.getInt(KEY_LAST_SOURCES, 0).toString()
 
         val endpointConfigured = !prefs.getString("endpoint", "").isNullOrBlank()
         val tokenConfigured = !prefs.getString("token", "").isNullOrBlank()
         val sheetsOk = prefs.getBoolean(KEY_SHEETS_OK, false)
-        root.findViewById<TextView?>(R.id.sheetsStatus)?.text = when {
+        root.findViewById<TextView>(R.id.sheetsStatus)?.text = when {
             sheetsOk -> "✓ Google Sheets подключён"
             endpointConfigured && tokenConfigured -> "● Google Sheets настроен"
             else -> "! Google Sheets не настроен"
@@ -165,7 +165,7 @@ class SyncStatusTextView @JvmOverloads constructor(
 
         val granted = prefs.getInt(KEY_HC_GRANTED, -1)
         val total = prefs.getInt(KEY_HC_TOTAL, expectedPermissions.size)
-        root.findViewById<TextView?>(R.id.healthConnectStatus)?.text = when {
+        root.findViewById<TextView>(R.id.healthConnectStatus)?.text = when {
             HealthConnectClient.getSdkStatus(context) != HealthConnectClient.SDK_AVAILABLE -> "✕ Health Connect недоступен"
             granted == total && total > 0 -> "✓ Health Connect подключён"
             granted >= 0 -> "● Health Connect: $granted/$total разрешений"
