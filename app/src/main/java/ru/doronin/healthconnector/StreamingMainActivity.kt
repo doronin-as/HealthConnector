@@ -4,9 +4,12 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.HealthConnectFeatures
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
@@ -30,6 +33,8 @@ import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
 import androidx.health.connect.client.records.Vo2MaxRecord
 import androidx.health.connect.client.records.WeightRecord
 import androidx.lifecycle.lifecycleScope
+import com.google.android.material.card.MaterialCardView
+import com.google.android.material.switchmaterial.SwitchMaterial
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -37,14 +42,19 @@ import org.json.JSONObject
 import ru.doronin.healthconnector.databinding.ActivityMainBinding
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.DateFormat
 import java.time.Instant
+import java.util.Date
 
 class StreamingMainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val client by lazy { HealthConnectClient.getOrCreate(this) }
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
 
-    private val permissions = setOf(
+    private var backgroundInfo: TextView? = null
+    private var backgroundSwitch: SwitchMaterial? = null
+
+    private val recordPermissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
         HealthPermission.getReadPermission(DistanceRecord::class),
         HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class),
@@ -67,14 +77,37 @@ class StreamingMainActivity : AppCompatActivity() {
         HealthPermission.getReadPermission(WeightRecord::class)
     )
 
+    private fun backgroundReadAvailable(): Boolean =
+        HealthConnectClient.getSdkStatus(this) == HealthConnectClient.SDK_AVAILABLE &&
+            client.features.getFeatureStatus(
+                HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND
+            ) == HealthConnectFeatures.FEATURE_STATUS_AVAILABLE
+
+    private fun requestedPermissions(): Set<String> = buildSet {
+        addAll(recordPermissions)
+        if (backgroundReadAvailable()) {
+            add(HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND)
+        }
+    }
+
     private val permissionLauncher = registerForActivityResult(
         PermissionController.createRequestPermissionResultContract()
     ) { granted ->
-        binding.status.text = if (granted.containsAll(permissions)) {
+        val requested = requestedPermissions()
+        binding.status.text = if (granted.containsAll(requested)) {
             "Все доступные разрешения Health Connect выданы"
         } else {
-            "Выдано разрешений: ${granted.size}/${permissions.size}. Недоступные показатели останутся пустыми."
+            val recordsGranted = recordPermissions.count { it in granted }
+            val backgroundGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in granted
+            "Выдано разрешений: $recordsGranted/${recordPermissions.size}. " +
+                if (backgroundReadAvailable() && !backgroundGranted) {
+                    "Фоновое чтение не разрешено."
+                } else {
+                    "Недоступные показатели останутся пустыми."
+                }
         }
+        BackgroundSyncScheduler.apply(this)
+        refreshBackgroundInfo()
     }
 
     private val exportConfigLauncher = registerForActivityResult(
@@ -98,6 +131,9 @@ class StreamingMainActivity : AppCompatActivity() {
         binding.token.setText(prefs.getString("token", ""))
         binding.days.setText(prefs.getInt("days", 7).toString())
 
+        setupBackgroundSyncControls()
+        BackgroundSyncScheduler.apply(this)
+
         binding.exportConfig.setOnClickListener {
             saveSettingsFromForm()
             exportConfigLauncher.launch("healthconnector-config.json")
@@ -109,10 +145,105 @@ class StreamingMainActivity : AppCompatActivity() {
             saveSettingsFromForm()
             importCsvLauncher.launch(arrayOf("text/csv", "text/comma-separated-values", "text/plain", "application/csv"))
         }
-        binding.permissions.setOnClickListener { permissionLauncher.launch(permissions) }
+        binding.permissions.setOnClickListener { permissionLauncher.launch(requestedPermissions()) }
         binding.sync.setOnClickListener {
             val settings = saveSettingsFromForm()
             lifecycleScope.launch { synchronize(settings) }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshBackgroundInfo()
+    }
+
+    private fun setupBackgroundSyncControls() {
+        val settingsScroll = binding.settingsPage
+        val container = settingsScroll.getChildAt(0) as? LinearLayout ?: return
+
+        val card = MaterialCardView(this).apply {
+            radius = dp(20).toFloat()
+            strokeWidth = dp(1)
+            cardElevation = 0f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
+        }
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+        }
+
+        content.addView(TextView(this).apply {
+            text = "Фоновая синхронизация"
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+
+        content.addView(TextView(this).apply {
+            text = "Автоматически обновляет последние ${BackgroundSyncScheduler.BACKGROUND_DAYS} дня примерно каждые ${BackgroundSyncScheduler.INTERVAL_HOURS} часов. Это повторно захватывает ночной сон, досыпы и дневной сон."
+            textSize = 14f
+            alpha = 0.72f
+            setPadding(0, dp(6), 0, 0)
+        })
+
+        backgroundSwitch = SwitchMaterial(this).apply {
+            text = "Синхронизировать в фоне"
+            isChecked = prefs.getBoolean(BackgroundSyncScheduler.PREF_ENABLED, true)
+            setPadding(0, dp(12), 0, 0)
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean(BackgroundSyncScheduler.PREF_ENABLED, checked).apply()
+                BackgroundSyncScheduler.apply(this@StreamingMainActivity)
+                refreshBackgroundInfo()
+            }
+        }.also(content::addView)
+
+        backgroundInfo = TextView(this).apply {
+            textSize = 12f
+            alpha = 0.68f
+            setPadding(0, dp(8), 0, 0)
+        }.also(content::addView)
+
+        card.addView(content)
+        container.addView(card)
+        refreshBackgroundInfo()
+    }
+
+    private fun refreshBackgroundInfo() {
+        val info = backgroundInfo ?: return
+        val enabled = prefs.getBoolean(BackgroundSyncScheduler.PREF_ENABLED, true)
+        backgroundSwitch?.isChecked = enabled
+        if (!enabled) {
+            info.text = "Выключено"
+            return
+        }
+        if (!backgroundReadAvailable()) {
+            info.text = "На этой версии Health Connect фоновое чтение недоступно. Ручная синхронизация продолжит работать."
+            return
+        }
+
+        lifecycleScope.launch {
+            val backgroundGranted = runCatching {
+                HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in
+                    client.permissionController.getGrantedPermissions()
+            }.getOrDefault(false)
+
+            if (!backgroundGranted) {
+                info.text = "Нужно нажать «Управление разрешениями» и разрешить доступ к данным Health Connect в фоне."
+                return@launch
+            }
+
+            val lastRun = prefs.getLong(BackgroundSyncScheduler.PREF_LAST_RUN, 0L)
+            val lastStatus = prefs.getString(BackgroundSyncScheduler.PREF_LAST_STATUS, "Ожидает первого фонового запуска")
+                .orEmpty()
+            val whenText = if (lastRun > 0L) {
+                DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(lastRun))
+            } else {
+                "ещё не запускалась"
+            }
+            info.text = "Последний фоновый запуск: $whenText\n$lastStatus"
         }
     }
 
@@ -152,6 +283,7 @@ class StreamingMainActivity : AppCompatActivity() {
             .putString("token", token)
             .putInt("days", days)
             .apply()
+        BackgroundSyncScheduler.apply(this)
         return Settings(endpoint, token, days)
     }
 
@@ -160,10 +292,11 @@ class StreamingMainActivity : AppCompatActivity() {
             val settings = saveSettingsFromForm()
             val json = JSONObject().apply {
                 put("format", "HealthConnectorConfig")
-                put("version", 2)
+                put("version", 3)
                 put("endpoint", settings.endpoint)
                 put("token", settings.token)
                 put("days", settings.days)
+                put("backgroundSync", prefs.getBoolean(BackgroundSyncScheduler.PREF_ENABLED, true))
                 put("exportedAt", Instant.now().toString())
             }.toString(2)
             contentResolver.openOutputStream(uri, "wt")?.bufferedWriter()?.use { it.write(json) }
@@ -186,6 +319,7 @@ class StreamingMainActivity : AppCompatActivity() {
             val endpoint = json.optString("endpoint")
             val token = json.optString("token")
             val days = json.optInt("days", 7).coerceIn(1, 30)
+            val backgroundSync = json.optBoolean("backgroundSync", true)
             require(endpoint.isNotBlank() && token.isNotBlank()) { "В файле нет URL или токена" }
 
             binding.endpoint.setText(endpoint)
@@ -195,9 +329,13 @@ class StreamingMainActivity : AppCompatActivity() {
                 .putString("endpoint", endpoint)
                 .putString("token", token)
                 .putInt("days", days)
+                .putBoolean(BackgroundSyncScheduler.PREF_ENABLED, backgroundSync)
                 .apply()
+            backgroundSwitch?.isChecked = backgroundSync
+            BackgroundSyncScheduler.apply(this)
         }.onSuccess {
             binding.status.text = "Настройки восстановлены"
+            refreshBackgroundInfo()
         }.onFailure {
             binding.status.text = "Ошибка импорта настроек: ${it.message}"
         }
@@ -268,6 +406,8 @@ class StreamingMainActivity : AppCompatActivity() {
         if (json?.optBoolean("ok", true) == false) error(json.optString("message", response))
         json
     }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private data class Settings(
         val endpoint: String,
