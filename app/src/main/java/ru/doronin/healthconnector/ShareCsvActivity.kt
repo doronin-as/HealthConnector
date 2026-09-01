@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.math.BigDecimal
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Instant
@@ -20,6 +21,11 @@ import java.time.Instant
 class ShareCsvActivity : AppCompatActivity() {
 
     private lateinit var statusView: TextView
+
+    private data class MealBlock(
+        val header: MutableList<String>,
+        val body: MutableList<MutableList<String>>
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,7 +82,7 @@ class ShareCsvActivity : AppCompatActivity() {
                     ?: "fatsecret.csv"
 
                 statusView.text = if (normalizedMealLabels > 0) {
-                    "Исправляю категории FatSecret и отправляю…"
+                    "Объединяю дополнительные приёмы пищи…"
                 } else {
                     "Отправляю в dashboard…"
                 }
@@ -105,38 +111,110 @@ class ShareCsvActivity : AppCompatActivity() {
     }
 
     /**
-     * FatSecret has used slightly different localized names for the same snack bucket.
-     * The live Apps Script historically accepts "Перекус/Другое" and "Snacks/Other".
-     * Normalize only the first CSV field, preserving food names and nutrition values.
+     * The FatSecret diary can expose optional slots such as "До Завтрака",
+     * "После Завтрака", "До Обеда", "До Ужина" and "После Ужина".
+     * The live dashboard schema has one generic snack bucket, so all optional
+     * slots are folded into "Перекус/Другое". If more than one such slot (or
+     * the regular snack bucket) contains food on the same day, their nutrition
+     * totals and food rows are merged before the CSV reaches Apps Script.
      */
     private fun normalizeFatSecretCsvForServer(csvText: String): Pair<String, Int> {
-        var replacements = 0
-        val firstField = Regex("""^(\s*\"?)([^\",\r\n]+)(\"?\s*,)""")
+        val rows = parseCsvRows(csvText)
+        val reportStart = rows.indexOfFirst {
+            it.firstOrNull()?.trim() == "# Report Details"
+        }
+        if (reportStart < 0) return csvText to 0
 
-        val normalizedText = csvText
-            .replace("\r\n", "\n")
-            .replace('\r', '\n')
-            .split('\n')
-            .joinToString("\n") { line ->
-                val match = firstField.find(line) ?: return@joinToString line
-                val rawLabel = match.groupValues[2].trim()
-                val normalizedLabel = normalizeFatSecretMealLabel(rawLabel)
-                if (normalizedLabel == rawLabel) return@joinToString line
+        val output = mutableListOf<MutableList<String>>()
+        for (index in 0..reportStart) output.add(rows[index].toMutableList())
 
-                replacements++
-                buildString(line.length + 8) {
-                    append(line.substring(0, match.range.first))
-                    append(match.groupValues[1])
-                    append(normalizedLabel)
-                    append(match.groupValues[3])
-                    append(line.substring(match.range.last + 1))
+        var changes = 0
+        var dayHeader: MutableList<String>? = null
+        val dayExtras = mutableListOf<MutableList<String>>()
+        val dayMeals = linkedMapOf<String, MealBlock>()
+
+        fun flushDay() {
+            val header = dayHeader ?: return
+            output.add(header)
+            output.addAll(dayExtras.map { it.toMutableList() })
+            dayMeals.values.forEach { block ->
+                output.add(block.header)
+                output.addAll(block.body)
+            }
+            dayHeader = null
+            dayExtras.clear()
+            dayMeals.clear()
+        }
+
+        var i = reportStart + 1
+        while (i < rows.size) {
+            val row = rows[i]
+            val label = row.firstOrNull().orEmpty().trim()
+
+            if (isReportTotalLabel(label)) {
+                flushDay()
+                while (i < rows.size) {
+                    output.add(rows[i].toMutableList())
+                    i++
                 }
+                break
             }
 
-        return normalizedText to replacements
+            if (isFatSecretDateLabel(label)) {
+                flushDay()
+                dayHeader = row.toMutableList()
+                i++
+                continue
+            }
+
+            val canonicalMeal = if (dayHeader != null) canonicalMealLabel(label) else null
+            if (canonicalMeal != null) {
+                val header = row.toMutableList()
+                if (header.isEmpty()) header.add(canonicalMeal) else header[0] = canonicalMeal
+                if (canonicalMeal != label) changes++
+
+                val body = mutableListOf<MutableList<String>>()
+                i++
+                while (i < rows.size) {
+                    val nextRow = rows[i]
+                    val nextLabel = nextRow.firstOrNull().orEmpty().trim()
+                    if (
+                        isReportTotalLabel(nextLabel) ||
+                        isFatSecretDateLabel(nextLabel) ||
+                        canonicalMealLabel(nextLabel) != null
+                    ) {
+                        break
+                    }
+                    if (!isSubtotalLabel(nextLabel)) {
+                        body.add(nextRow.toMutableList())
+                    }
+                    i++
+                }
+
+                val existing = dayMeals[canonicalMeal]
+                if (existing == null) {
+                    dayMeals[canonicalMeal] = MealBlock(header, body)
+                } else {
+                    mergeMealHeaders(existing.header, header)
+                    existing.body.addAll(body)
+                    changes++
+                }
+                continue
+            }
+
+            if (dayHeader == null) {
+                output.add(row.toMutableList())
+            } else if (!isSubtotalLabel(label)) {
+                dayExtras.add(row.toMutableList())
+            }
+            i++
+        }
+
+        if (i >= rows.size) flushDay()
+        return serializeCsvRows(output) to changes
     }
 
-    private fun normalizeFatSecretMealLabel(label: String): String {
+    private fun canonicalMealLabel(label: String): String? {
         val compact = label
             .trim()
             .lowercase()
@@ -144,17 +222,128 @@ class ShareCsvActivity : AppCompatActivity() {
             .replace(Regex("""\s+"""), " ")
 
         return when (compact) {
-            "перекусы/другое",
-            "перекус/другое",
-            "закуски/другое",
-            "снэки/другое" -> "Перекус/Другое"
+            "завтрак", "breakfast" -> "Завтрак"
+            "обед", "lunch" -> "Обед"
+            "полдник", "afternoon snack" -> "Полдник"
+            "ужин", "dinner" -> "Ужин"
 
+            "перекус/другое",
+            "перекусы/другое",
+            "закуски/другое",
+            "снэки/другое",
             "snacks/other",
             "snack/other",
             "snacks & other",
-            "snack & other" -> "Snacks/Other"
+            "snack & other",
+            "до завтрака",
+            "после завтрака",
+            "до обеда",
+            "до ужина",
+            "после ужина",
+            "before breakfast",
+            "after breakfast",
+            "before lunch",
+            "before dinner",
+            "after dinner" -> "Перекус/Другое"
 
-            else -> label
+            else -> null
+        }
+    }
+
+    private fun mergeMealHeaders(target: MutableList<String>, incoming: List<String>) {
+        val nutritionColumns = intArrayOf(1, 2, 4, 7)
+        nutritionColumns.forEach { index ->
+            val incomingValue = incoming.getOrNull(index)?.let(::parseCsvNumber) ?: return@forEach
+            while (target.size <= index) target.add("")
+            val currentValue = parseCsvNumber(target[index]) ?: 0.0
+            target[index] = formatCsvNumber(currentValue + incomingValue)
+        }
+    }
+
+    private fun parseCsvNumber(value: String): Double? {
+        val normalized = value
+            .trim()
+            .replace("\u00A0", "")
+            .replace(" ", "")
+            .replace(',', '.')
+        if (normalized.isBlank()) return null
+        return normalized.toDoubleOrNull()
+    }
+
+    private fun formatCsvNumber(value: Double): String =
+        BigDecimal.valueOf(value).stripTrailingZeros().toPlainString()
+
+    private fun isFatSecretDateLabel(label: String): Boolean = FATSECRET_DATE_REGEX.containsMatchIn(label)
+
+    private fun isSubtotalLabel(label: String): Boolean {
+        val value = label.trim().lowercase()
+        return value == "итого" || value == "daily total"
+    }
+
+    private fun isReportTotalLabel(label: String): Boolean {
+        val value = label.trim().lowercase()
+        return value == "всего" || value == "total"
+    }
+
+    private fun parseCsvRows(text: String): MutableList<MutableList<String>> {
+        val source = text.removePrefix("\uFEFF")
+        val rows = mutableListOf<MutableList<String>>()
+        var row = mutableListOf<String>()
+        val field = StringBuilder()
+        var inQuotes = false
+        var i = 0
+
+        fun finishField() {
+            row.add(field.toString())
+            field.setLength(0)
+        }
+
+        fun finishRow() {
+            finishField()
+            rows.add(row)
+            row = mutableListOf()
+        }
+
+        while (i < source.length) {
+            val ch = source[i]
+            if (inQuotes) {
+                if (ch == '"') {
+                    if (i + 1 < source.length && source[i + 1] == '"') {
+                        field.append('"')
+                        i += 2
+                        continue
+                    }
+                    inQuotes = false
+                } else {
+                    field.append(ch)
+                }
+                i++
+                continue
+            }
+
+            when (ch) {
+                '"' -> inQuotes = true
+                ',' -> finishField()
+                '\r' -> {
+                    if (i + 1 < source.length && source[i + 1] == '\n') i++
+                    finishRow()
+                }
+                '\n' -> finishRow()
+                else -> field.append(ch)
+            }
+            i++
+        }
+
+        if (field.isNotEmpty() || row.isNotEmpty()) finishRow()
+        return rows
+    }
+
+    private fun serializeCsvRows(rows: List<List<String>>): String = rows.joinToString("\r\n") { row ->
+        row.joinToString(",") { field ->
+            val needsQuotes = field.contains(',') || field.contains('"') ||
+                field.contains('\r') || field.contains('\n') ||
+                field.startsWith(' ') || field.endsWith(' ')
+            if (needsQuotes) "\"${field.replace("\"", "\"\"")}\"" else field
         }
     }
 
@@ -247,5 +436,14 @@ class ShareCsvActivity : AppCompatActivity() {
             error(json.optString("message", json.optString("error", "Ошибка сервера")))
         }
         json
+    }
+
+    companion object {
+        private val FATSECRET_DATE_REGEX = Regex(
+            "(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря|" +
+                "january|february|march|april|may|june|july|august|september|october|november|december)" +
+                "\\s+\\d{1,2}\\s*,?\\s*\\d{4}",
+            RegexOption.IGNORE_CASE
+        )
     }
 }
