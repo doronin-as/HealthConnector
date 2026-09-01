@@ -39,11 +39,16 @@ class ShareCsvActivity : AppCompatActivity() {
 
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         val endpoint = prefs.getString("endpoint", "").orEmpty().trim()
-        val token = prefs.getString("token", "").orEmpty().trim()
+        val token = SecureTokenStore(this).getToken().trim()
         if (endpoint.isBlank() || token.isBlank()) {
             failAndOpenMain("Сначала настрой URL Apps Script и токен в Health Connector")
             return
         }
+        val safeEndpoint = runCatching { EndpointSecurity.requireHttps(endpoint) }
+            .getOrElse {
+                failAndOpenMain("Для Apps Script нужен HTTPS URL")
+                return
+            }
 
         lifecycleScope.launch {
             runCatching {
@@ -64,7 +69,7 @@ class ShareCsvActivity : AppCompatActivity() {
                     put("csvText", csvText)
                     put("uploadedAt", Instant.now().toString())
                 }
-                postBody(endpoint, body)
+                postBody(safeEndpoint, body)
             }.onSuccess { response ->
                 val days = response?.optInt("days", 0) ?: 0
                 val meals = response?.optInt("meals", 0) ?: 0
@@ -103,14 +108,15 @@ class ShareCsvActivity : AppCompatActivity() {
 
     private fun failAndOpenMain(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-        startActivity(Intent(this, MainActivity::class.java).apply {
+        startActivity(Intent(this, StreamingMainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         })
         finish()
     }
 
     private suspend fun postBody(endpoint: String, body: JSONObject): JSONObject? = withContext(Dispatchers.IO) {
-        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
+        val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
         connection.doOutput = true
         connection.connectTimeout = 20_000
@@ -121,11 +127,11 @@ class ShareCsvActivity : AppCompatActivity() {
         val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
             ?.bufferedReader()?.use { it.readText() }.orEmpty()
         connection.disconnect()
-        if (code !in 200..299) error("HTTP $code: $response")
+        if (code !in 200..299) error("HTTP $code")
         if (response.isBlank()) return@withContext null
         val json = runCatching { JSONObject(response) }.getOrNull()
         if (json?.optBoolean("ok", true) == false) {
-            error(json.optString("message", json.optString("error", response)))
+            error(json.optString("message", json.optString("error", "Ошибка сервера")))
         }
         json
     }
