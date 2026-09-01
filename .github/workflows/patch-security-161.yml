@@ -1,0 +1,33 @@
+name: Patch 1.6.1 security
+
+on:
+  push:
+    paths:
+      - '.github/trigger-security-161'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply security migration
+        run: python3 tools/patch_security_161.py
+      - name: Validate patch
+        run: |
+          git diff --check
+          grep -F 'SecureTokenStore(this)' app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+          grep -F 'put("tokenIncluded", false)' app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+          ! grep -F '.putString("token", token)' app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+          ! grep -F 'HTTP $code: $response' app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+          git commit -m 'Protect API token with Android Keystore'
+          git push origin HEAD:main
