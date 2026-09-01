@@ -42,22 +42,20 @@
         <activity
             android:name=".ShareCsvActivity"
             android:exported="true"
-            android:label="Отправить в Health Connector 2">
+            android:label="FatSecret → Health Connector 2">
+            <!-- FatSecret/Android vendors may expose the exported report using
+                 different MIME types. A wildcard share receiver guarantees that
+                 Android can offer Health Connector in the share sheet; the activity
+                 itself validates that the received payload is a usable text report. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/*" />
-                <data android:mimeType="application/csv" />
-                <data android:mimeType="application/vnd.ms-excel" />
-                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="*/*" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/*" />
-                <data android:mimeType="application/csv" />
-                <data android:mimeType="application/vnd.ms-excel" />
-                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="*/*" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
