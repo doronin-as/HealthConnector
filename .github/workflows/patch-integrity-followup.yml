@@ -1,0 +1,34 @@
+name: Patch 1.6.0 integrity follow-up
+
+on:
+  push:
+    paths:
+      - '.github/trigger-integrity-followup'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply follow-up
+        run: python3 tools/patch_integrity_followup.py
+      - name: Validate
+        run: |
+          git diff --check
+          grep -F 'ServerCompatibility.requireV3(endpoint)' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+          grep -F 'schemaVersion: 3' apps-script/Code.gs
+          grep -F "payload.action === 'healthSyncV3'" apps-script/Code.gs
+          grep -F "payload.action === 'healthChangesV3'" apps-script/Code.gs
+          ! grep -F 'syncDiary_(spreadsheet' apps-script/Code.gs || false
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt apps-script/Code.gs
+          git commit -m 'Finish 1.6.0 partial update server contract'
+          git push origin HEAD:main
