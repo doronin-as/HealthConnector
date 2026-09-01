@@ -659,7 +659,8 @@ batcher.flush()
     }
 
     private suspend fun postBody(endpoint: String, body: JSONObject): JSONObject? = withContext(Dispatchers.IO) {
-        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
+        val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
         connection.doOutput = true
         connection.connectTimeout = 20_000
@@ -672,7 +673,7 @@ batcher.flush()
         val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
             ?.bufferedReader()?.use { it.readText() }.orEmpty()
         connection.disconnect()
-        if (code !in 200..299) error("HTTP $code: $response")
+        if (code !in 200..299) error("HTTP $code")
         if (response.isBlank()) return@withContext null
         val json = runCatching { JSONObject(response) }.getOrNull()
         if (json?.optBoolean("ok", true) == false) error(json.optString("message", response))
