@@ -11,7 +11,8 @@ object ServerCompatibility {
     private const val REQUIRED_SCHEMA = 3
 
     suspend fun requireV3(endpoint: String) = withContext(Dispatchers.IO) {
-        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
+        val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
         try {
             connection.requestMethod = "GET"
             connection.connectTimeout = 15_000
