@@ -18,6 +18,15 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
+      - name: Validate Apps Script schema v3
+        run: |
+          cp apps-script/Code.gs /tmp/HealthConnectorCode.js
+          node --check /tmp/HealthConnectorCode.js
+          grep -F 'schemaVersion: 3' apps-script/Code.gs
+          grep -F "payload.action === 'healthSyncV3'" apps-script/Code.gs
+          grep -F "payload.action === 'healthChangesV3'" apps-script/Code.gs
+          ! grep -F 'syncDiary_(spreadsheet, payload.days || [])' apps-script/Code.gs
+          ! grep -F 'syncDiaryFoodSnack_(spreadsheet, parsed.days)' apps-script/Code.gs
       - name: Restore stable development signing key
         run: |
           base64 --decode .github/signing/healthconnector-dev.keystore.b64 > app/healthconnector-dev.keystore
