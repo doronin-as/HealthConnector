@@ -1,0 +1,30 @@
+name: Patch deletion safety 1.6.0
+
+on:
+  push:
+    paths:
+      - '.github/trigger-deletion-safety-160'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply deletion safety
+        run: python3 tools/patch_deletion_safety_160.py
+      - name: Validate
+        run: |
+          git diff --check
+          grep -F 'deletionSafetyDates' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+          git commit -m 'Guarantee recomputation after Health Connect deletions'
+          git push origin HEAD:main
