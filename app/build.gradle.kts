@@ -3,16 +3,25 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val stableSigningStoreFile = System.getenv("HC_SIGNING_STORE_FILE")
+    ?.takeIf { it.isNotBlank() }
+    ?.let { file(it) }
+
 android {
     namespace = "ru.doronin.healthconnector"
     compileSdk = 36
 
     signingConfigs {
-        create("stableDebug") {
-            storeFile = file("healthconnector-dev.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        if (stableSigningStoreFile?.exists() == true) {
+            create("stableDebug") {
+                storeFile = stableSigningStoreFile
+                storePassword = System.getenv("HC_SIGNING_STORE_PASSWORD")
+                    ?.takeIf { it.isNotBlank() } ?: "android"
+                keyAlias = System.getenv("HC_SIGNING_KEY_ALIAS")
+                    ?.takeIf { it.isNotBlank() } ?: "androiddebugkey"
+                keyPassword = System.getenv("HC_SIGNING_KEY_PASSWORD")
+                    ?.takeIf { it.isNotBlank() } ?: "android"
+            }
         }
     }
 
@@ -26,7 +35,7 @@ android {
 
     buildTypes {
         getByName("debug") {
-            signingConfig = signingConfigs.getByName("stableDebug")
+            signingConfigs.findByName("stableDebug")?.let { signingConfig = it }
         }
     }
 
