@@ -50,6 +50,7 @@ class StreamingMainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val client by lazy { HealthConnectClient.getOrCreate(this) }
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
+    private val secureTokenStore by lazy { SecureTokenStore(this) }
 
     private var backgroundInfo: TextView? = null
     private var backgroundSwitch: SwitchMaterial? = null
@@ -128,7 +129,7 @@ class StreamingMainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         binding.endpoint.setText(prefs.getString("endpoint", ""))
-        binding.token.setText(prefs.getString("token", ""))
+        binding.token.setText(secureTokenStore.getToken())
         binding.days.setText(prefs.getInt("days", 7).toString())
 
         setupBackgroundSyncControls()
@@ -280,9 +281,10 @@ class StreamingMainActivity : AppCompatActivity() {
         val days = binding.days.text.toString().toIntOrNull()?.coerceIn(1, 30) ?: 7
         prefs.edit()
             .putString("endpoint", endpoint)
-            .putString("token", token)
             .putInt("days", days)
+            .remove("token")
             .apply()
+        secureTokenStore.setToken(token)
         BackgroundSyncScheduler.apply(this)
         return Settings(endpoint, token, days)
     }
@@ -292,17 +294,17 @@ class StreamingMainActivity : AppCompatActivity() {
             val settings = saveSettingsFromForm()
             val json = JSONObject().apply {
                 put("format", "HealthConnectorConfig")
-                put("version", 3)
+                put("version", 4)
                 put("endpoint", settings.endpoint)
-                put("token", settings.token)
                 put("days", settings.days)
                 put("backgroundSync", prefs.getBoolean(BackgroundSyncScheduler.PREF_ENABLED, true))
+                put("tokenIncluded", false)
                 put("exportedAt", Instant.now().toString())
             }.toString(2)
             contentResolver.openOutputStream(uri, "wt")?.bufferedWriter()?.use { it.write(json) }
                 ?: error("Не удалось открыть файл для записи")
         }.onSuccess {
-            binding.status.text = "Настройки сохранены в файл"
+            binding.status.text = "Настройки сохранены без API-токена"
         }.onFailure {
             binding.status.text = "Ошибка сохранения настроек: ${it.message}"
         }
@@ -316,20 +318,25 @@ class StreamingMainActivity : AppCompatActivity() {
             require(json.optString("format") == "HealthConnectorConfig") {
                 "Это не файл настроек HealthConnector"
             }
-            val endpoint = json.optString("endpoint")
-            val token = json.optString("token")
+            val endpoint = json.optString("endpoint").trim()
+            val importedToken = json.optString("token").trim()
             val days = json.optInt("days", 7).coerceIn(1, 30)
             val backgroundSync = json.optBoolean("backgroundSync", true)
-            require(endpoint.isNotBlank() && token.isNotBlank()) { "В файле нет URL или токена" }
+            require(endpoint.isNotBlank()) { "В файле нет URL Apps Script" }
 
             binding.endpoint.setText(endpoint)
-            binding.token.setText(token)
+            if (importedToken.isNotBlank()) {
+                secureTokenStore.setToken(importedToken)
+                binding.token.setText(importedToken)
+            } else {
+                binding.token.setText(secureTokenStore.getToken())
+            }
             binding.days.setText(days.toString())
             prefs.edit()
                 .putString("endpoint", endpoint)
-                .putString("token", token)
                 .putInt("days", days)
                 .putBoolean(BackgroundSyncScheduler.PREF_ENABLED, backgroundSync)
+                .remove("token")
                 .apply()
             backgroundSwitch?.isChecked = backgroundSync
             BackgroundSyncScheduler.apply(this)
@@ -389,7 +396,8 @@ class StreamingMainActivity : AppCompatActivity() {
     }
 
     private suspend fun postBody(endpoint: String, body: JSONObject): JSONObject? = withContext(Dispatchers.IO) {
-        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
+        val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
         connection.doOutput = true
         connection.connectTimeout = 20_000
@@ -400,7 +408,7 @@ class StreamingMainActivity : AppCompatActivity() {
         val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
             ?.bufferedReader()?.use { it.readText() }.orEmpty()
         connection.disconnect()
-        if (code !in 200..299) error("HTTP $code: $response")
+        if (code !in 200..299) error("HTTP $code")
         if (response.isBlank()) return@withContext null
         val json = runCatching { JSONObject(response) }.getOrNull()
         if (json?.optBoolean("ok", true) == false) error(json.optString("message", response))
