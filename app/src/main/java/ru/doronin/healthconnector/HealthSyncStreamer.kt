@@ -73,12 +73,21 @@ class HealthSyncStreamer(
         } else {
             emptySet()
         }
+        // A DeletionChange contains only recordId, not its timestamp. Usually the server can
+        // recover the affected date from the raw row. To guarantee correctness even when that row
+        // was never exported by an older app version, any deletion triggers a rare 30-day rebuild.
+        val deletionSafetyDates = if (changes.deletedRecordIds.isNotEmpty()) {
+            (0L..29L).map { today.minusDays(it) }
+        } else {
+            emptyList()
+        }
 
         val oldestReadable = today.minusDays(29)
         val dates = linkedSetOf<LocalDate>().apply {
             addAll(requestedDates)
             addAll(changes.affectedDates)
             addAll(deletionDates)
+            addAll(deletionSafetyDates)
         }.filter { !it.isBefore(oldestReadable) && !it.isAfter(today) }
             .distinct()
             .sorted()
@@ -188,22 +197,22 @@ class HealthSyncStreamer(
 
         // Interval totals: one type is loaded, summarized, emitted and then becomes collectible.
         run {
-            val records = preferBestSource(safeReadAll<StepsRecord>(dayStart, dayEnd))
+            val records = safeReadAll<StepsRecord>(dayStart, dayEnd)
             addSources(records, sources)
             for (r in records) emit("Steps", null, r.startTime, r.endTime, r.count, "steps", r)
         }
         run {
-            val records = preferBestSource(safeReadAll<DistanceRecord>(dayStart, dayEnd))
+            val records = safeReadAll<DistanceRecord>(dayStart, dayEnd)
             addSources(records, sources)
             for (r in records) emit("Distance", null, r.startTime, r.endTime, r.distance.inKilometers, "km", r)
         }
         run {
-            val records = preferBestSource(safeReadAll<ActiveCaloriesBurnedRecord>(dayStart, dayEnd))
+            val records = safeReadAll<ActiveCaloriesBurnedRecord>(dayStart, dayEnd)
             addSources(records, sources)
             for (r in records) emit("ActiveCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
         run {
-            val records = preferBestSource(safeReadAll<TotalCaloriesBurnedRecord>(dayStart, dayEnd))
+            val records = safeReadAll<TotalCaloriesBurnedRecord>(dayStart, dayEnd)
             addSources(records, sources)
             for (r in records) emit("TotalCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
@@ -320,12 +329,12 @@ class HealthSyncStreamer(
             }
         }
         run {
-            val records = preferBestSource(safeReadAll<ElevationGainedRecord>(dayStart, dayEnd))
+            val records = safeReadAll<ElevationGainedRecord>(dayStart, dayEnd)
             addSources(records, sources)
             for (r in records) emit("ElevationGained", null, r.startTime, r.endTime, r.elevation.inMeters, "m", r)
         }
         run {
-            val records = preferBestSource(safeReadAll<FloorsClimbedRecord>(dayStart, dayEnd))
+            val records = safeReadAll<FloorsClimbedRecord>(dayStart, dayEnd)
             addSources(records, sources)
             for (r in records) emit("FloorsClimbed", null, r.startTime, r.endTime, r.floors, "floors", r)
         }
