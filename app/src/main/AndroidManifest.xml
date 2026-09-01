@@ -25,6 +25,7 @@
 
     <application
         android:allowBackup="false"
+        android:usesCleartextTraffic="false"
         android:label="Health Connector 2"
         android:theme="@style/Theme.HealthConnector">
         <activity
@@ -35,10 +36,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <activity
-            android:name=".MainActivity"
-            android:exported="false" />
 
         <activity
             android:name=".ShareCsvActivity"
