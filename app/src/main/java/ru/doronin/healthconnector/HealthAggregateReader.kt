@@ -1,0 +1,103 @@
+package ru.doronin.healthconnector
+
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.aggregate.AggregateMetric
+import androidx.health.connect.client.datatypes.units.Energy
+import androidx.health.connect.client.datatypes.units.Length
+import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
+import androidx.health.connect.client.records.DistanceRecord
+import androidx.health.connect.client.records.ElevationGainedRecord
+import androidx.health.connect.client.records.FloorsClimbedRecord
+import androidx.health.connect.client.records.StepsRecord
+import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
+import androidx.health.connect.client.request.AggregateRequest
+import androidx.health.connect.client.time.TimeRangeFilter
+import kotlinx.coroutines.delay
+import java.time.Instant
+
+/**
+ * Reads cumulative daily values through Health Connect's Aggregate API.
+ *
+ * Raw records are still exported for diagnostics/archive, but they must never be summed to produce
+ * dashboard totals: multiple data origins may overlap. Aggregate API applies Health Connect's own
+ * deduplication and user data-origin priorities.
+ */
+class HealthAggregateReader(
+    private val client: HealthConnectClient
+) {
+    suspend fun readDay(start: Instant, end: Instant): DayAggregates = DayAggregates(
+        steps = read(StepsRecord.COUNT_TOTAL, start, end),
+        distance = read(DistanceRecord.DISTANCE_TOTAL, start, end),
+        activeCalories = read(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL, start, end),
+        totalCalories = read(TotalCaloriesBurnedRecord.ENERGY_TOTAL, start, end),
+        elevation = read(ElevationGainedRecord.ELEVATION_GAINED_TOTAL, start, end),
+        floors = read(FloorsClimbedRecord.FLOORS_CLIMBED_TOTAL, start, end)
+    )
+
+    private suspend fun <T : Any> read(
+        metric: AggregateMetric<T>,
+        start: Instant,
+        end: Instant
+    ): MetricRead<T> {
+        var lastError: Throwable? = null
+        repeat(3) { attempt ->
+            try {
+                val result = client.aggregate(
+                    AggregateRequest(
+                        metrics = setOf(metric),
+                        timeRangeFilter = TimeRangeFilter.between(start, end)
+                    )
+                )
+                return MetricRead.Available(
+                    value = result[metric],
+                    sourcePackages = result.dataOrigins.map { it.packageName }.toSet()
+                )
+            } catch (error: Throwable) {
+                if (isPermissionFailure(error)) {
+                    return MetricRead.PermissionDenied(error.message.orEmpty())
+                }
+                lastError = error
+                if (attempt < 2) delay(300L * (attempt + 1L))
+            }
+        }
+        throw IllegalStateException(
+            "Health Connect aggregate failed: ${lastError?.message ?: "unknown error"}",
+            lastError
+        )
+    }
+
+    private fun isPermissionFailure(error: Throwable): Boolean {
+        var current: Throwable? = error
+        repeat(8) {
+            val value = current ?: return false
+            if (value is SecurityException) return true
+            val message = value.message.orEmpty()
+            if (
+                message.contains("SecurityException", ignoreCase = true) ||
+                message.contains("does not have permission", ignoreCase = true) ||
+                message.contains("permission to read data", ignoreCase = true) ||
+                message.contains("permission denied", ignoreCase = true)
+            ) return true
+            current = value.cause
+        }
+        return false
+    }
+
+    data class DayAggregates(
+        val steps: MetricRead<Long>,
+        val distance: MetricRead<Length>,
+        val activeCalories: MetricRead<Energy>,
+        val totalCalories: MetricRead<Energy>,
+        val elevation: MetricRead<Length>,
+        val floors: MetricRead<Double>
+    )
+}
+
+sealed interface MetricRead<out T> {
+    data class Available<T>(
+        val value: T?,
+        val sourcePackages: Set<String> = emptySet()
+    ) : MetricRead<T>
+
+    data class PermissionDenied(val reason: String) : MetricRead<Nothing>
+}
