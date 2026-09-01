@@ -79,7 +79,7 @@ class HealthChangesTracker(
             }
 
             try {
-                var nextToken = token
+                var nextToken: String = token
                 var keepReading: Boolean
                 do {
                     val response = client.getChanges(nextToken)
@@ -94,8 +94,12 @@ class HealthChangesTracker(
                             is DeletionChange -> deletedIds += change.recordId
                         }
                     }
-                    nextToken = response.nextChangesToken
                     keepReading = response.hasMore
+                    val responseToken = response.nextChangesToken
+                    if (keepReading && responseToken.isNullOrBlank()) {
+                        throw IllegalStateException("Health Connect returned hasMore without a continuation token")
+                    }
+                    if (!responseToken.isNullOrBlank()) nextToken = responseToken
                     if (!keepReading) prefs.edit().putString(key, nextToken).apply()
                 } while (keepReading)
             } catch (error: Throwable) {
