@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       HC_SIGNING_KEY_B64: ${{ secrets.HC_SIGNING_KEY_B64 }}
-      HC_SIGNING_STORE_FILE: ${{ runner.temp }}/healthconnector-dev.keystore
+      HC_SIGNING_STORE_FILE: /tmp/healthconnector-dev.keystore
       HC_SIGNING_STORE_PASSWORD: ${{ secrets.HC_SIGNING_STORE_PASSWORD }}
       HC_SIGNING_KEY_ALIAS: ${{ secrets.HC_SIGNING_KEY_ALIAS }}
       HC_SIGNING_KEY_PASSWORD: ${{ secrets.HC_SIGNING_KEY_PASSWORD }}
