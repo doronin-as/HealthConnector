@@ -32,9 +32,9 @@ class ShareCsvActivity : AppCompatActivity() {
         setContentView(statusView)
 
         val sharedUri = extractSharedUri(intent)
-        val sharedText = intent?.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
+        val sharedText = extractSharedText(intent)
         if (sharedUri == null && sharedText == null) {
-            failAndOpenMain("Не удалось получить CSV-отчёт FatSecret")
+            failAndOpenMain("Не удалось получить отчёт FatSecret")
             return
         }
 
@@ -53,19 +53,19 @@ class ShareCsvActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             runCatching {
-                statusView.text = "Читаю CSV FatSecret…"
+                statusView.text = "Читаю отчёт FatSecret…"
                 val csvText = withContext(Dispatchers.IO) {
                     when {
                         sharedUri != null -> contentResolver.openInputStream(sharedUri)
                             ?.bufferedReader(Charsets.UTF_8)
                             ?.use { it.readText() }
-                            ?: error("Не удалось прочитать файл")
+                            ?: error("Не удалось прочитать переданный файл")
                         sharedText != null -> sharedText
                         else -> error("Отчёт не найден")
                     }
                 }
-                require(csvText.isNotBlank()) { "CSV пустой" }
-                require(csvText.length <= 5_000_000) { "CSV слишком большой: максимум 5 МБ" }
+                require(csvText.isNotBlank()) { "Отчёт пустой" }
+                require(csvText.length <= 5_000_000) { "Отчёт слишком большой: максимум 5 МБ" }
 
                 val fileName = sharedUri?.let(::queryFileName)
                     ?: intent?.getStringExtra(Intent.EXTRA_TITLE)?.takeIf { it.isNotBlank() }
@@ -78,6 +78,7 @@ class ShareCsvActivity : AppCompatActivity() {
                     put("fileName", fileName)
                     put("csvText", csvText)
                     put("uploadedAt", Instant.now().toString())
+                    put("sourceMimeType", intent?.type.orEmpty())
                 }
                 postBody(safeEndpoint, body)
             }.onSuccess { response ->
@@ -88,9 +89,31 @@ class ShareCsvActivity : AppCompatActivity() {
                 Toast.makeText(this@ShareCsvActivity, message, Toast.LENGTH_LONG).show()
                 statusView.postDelayed({ finish() }, 1600)
             }.onFailure { error ->
-                failAndOpenMain("Ошибка импорта CSV: ${error.message}")
+                failAndOpenMain("Ошибка импорта FatSecret: ${error.message}")
             }
         }
+    }
+
+    private fun extractSharedText(intent: Intent?): String? {
+        intent ?: return null
+
+        intent.getStringExtra(Intent.EXTRA_TEXT)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        intent.getStringExtra(Intent.EXTRA_HTML_TEXT)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        intent.clipData?.let { clips ->
+            for (index in 0 until clips.itemCount) {
+                val item = clips.getItemAt(index)
+                item.text?.toString()?.takeIf { it.isNotBlank() }?.let { return it }
+                item.htmlText?.takeIf { it.isNotBlank() }?.let { return it }
+            }
+        }
+
+        return null
     }
 
     private fun extractSharedUri(intent: Intent?): Uri? {
