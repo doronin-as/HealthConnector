@@ -1,0 +1,31 @@
+name: Patch HealthSyncStreamer security 1.6.1
+
+on:
+  push:
+    paths:
+      - '.github/trigger-streamer-security-161'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply patch
+        run: python3 tools/patch_streamer_security_161.py
+      - name: Validate
+        run: |
+          git diff --check
+          grep -F 'EndpointSecurity.requireHttps(endpoint)' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+          ! grep -F 'HTTP $code: $response' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+          git commit -m 'Harden sync transport error handling'
+          git push origin HEAD:main
