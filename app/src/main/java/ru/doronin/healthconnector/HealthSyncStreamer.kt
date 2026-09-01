@@ -49,6 +49,9 @@ class HealthSyncStreamer(
     private val context: Context,
     private val client: HealthConnectClient
 ) {
+    private val aggregateReader = HealthAggregateReader(client)
+    private val changesTracker = HealthChangesTracker(context, client)
+    private val permissionDeniedTypes = linkedSetOf<String>()
 
     suspend fun sync(
         endpoint: String,
@@ -58,25 +61,41 @@ class HealthSyncStreamer(
     ): SyncResult {
         val safeDays = days.coerceIn(1, 30)
         val zone = ZoneId.systemDefault()
-        val endDate = LocalDate.now(zone).plusDays(1)
-        val startDate = endDate.minusDays(safeDays.toLong())
+        val today = LocalDate.now(zone)
+        val requestedDates = (safeDays - 1 downTo 0).map { today.minusDays(it.toLong()) }
+
+        onProgress("Проверяю изменения Health Connect…")
+        val changes = changesTracker.collect(zone)
+        val deletionDates = if (changes.deletedRecordIds.isNotEmpty()) {
+            postDeletedRecordIds(endpoint, token, changes.deletedRecordIds)
+        } else {
+            emptySet()
+        }
+
+        val oldestReadable = today.minusDays(29)
+        val dates = linkedSetOf<LocalDate>().apply {
+            addAll(requestedDates)
+            addAll(changes.affectedDates)
+            addAll(deletionDates)
+        }.filter { !it.isBefore(oldestReadable) && !it.isAfter(today) }
+            .distinct()
+            .sorted()
 
         var totalWorkouts = 0
         var totalMeasurements = 0
         val allSources = linkedSetOf<String>()
 
-        repeat(safeDays) { offset ->
-            val date = startDate.plusDays(offset.toLong())
-            onProgress("Читаю день ${offset + 1}/$safeDays: $date…")
+        dates.forEachIndexed { index, date ->
+            onProgress("Читаю день ${index + 1}/${dates.size}: $date…")
             val result = syncDay(endpoint, token, date, zone, onProgress)
             totalWorkouts += result.workouts
             totalMeasurements += result.measurements
             allSources += result.sources
-            if (offset + 1 < safeDays) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
+            if (index + 1 < dates.size) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
         }
 
         return SyncResult(
-            days = safeDays,
+            days = dates.size,
             workouts = totalWorkouts,
             measurements = totalMeasurements,
             sources = allSources.size
@@ -90,21 +109,15 @@ class HealthSyncStreamer(
         zone: ZoneId,
         onProgress: (String) -> Unit
     ): DayResult {
+        permissionDeniedTypes.clear()
         val dayStart = date.atStartOfDay(zone).toInstant()
         val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant()
         val syncedAt = Instant.now().toString()
         val sources = linkedSetOf<String>()
 
-        var stepsTotal = 0L
-        var hasStepRecords = false
-        var distanceKm = 0.0
-        var activeCaloriesKcal = 0.0
-        var totalCaloriesKcal = 0.0
         var restingHeartRate: Double? = null
         var vo2Max: Double? = null
         var skinTempBaselineC: Double? = null
-        var elevationGainedM = 0.0
-        var floorsClimbed = 0.0
         var weightKg: Double? = null
 
         val heartStats = Stats()
@@ -161,30 +174,35 @@ class HealthSyncStreamer(
             })
         }
 
+        // Cumulative dashboard totals use Health Connect Aggregate API so overlapping origins
+        // are deduplicated according to the user's Health Connect data priority.
+        val aggregates = aggregateReader.readDay(dayStart, dayEnd)
+        val stepsTotal = metricValue(aggregates.steps, sources)
+        val distanceKm = metricValue(aggregates.distance, sources)?.inKilometers
+        val activeCaloriesKcal = metricValue(aggregates.activeCalories, sources)?.inKilocalories
+        val totalCaloriesKcal = metricValue(aggregates.totalCalories, sources)?.inKilocalories
+        val elevationGainedM = metricValue(aggregates.elevation, sources)?.inMeters
+        val floorsClimbed = metricValue(aggregates.floors, sources)
+
         // Interval totals: one type is loaded, summarized, emitted and then becomes collectible.
         run {
             val records = preferBestSource(safeReadAll<StepsRecord>(dayStart, dayEnd))
             addSources(records, sources)
-            hasStepRecords = records.isNotEmpty()
-            stepsTotal = records.sumOf { it.count }
             for (r in records) emit("Steps", null, r.startTime, r.endTime, r.count, "steps", r)
         }
         run {
             val records = preferBestSource(safeReadAll<DistanceRecord>(dayStart, dayEnd))
             addSources(records, sources)
-            distanceKm = records.sumOf { it.distance.inKilometers }
             for (r in records) emit("Distance", null, r.startTime, r.endTime, r.distance.inKilometers, "km", r)
         }
         run {
             val records = preferBestSource(safeReadAll<ActiveCaloriesBurnedRecord>(dayStart, dayEnd))
             addSources(records, sources)
-            activeCaloriesKcal = records.sumOf { it.energy.inKilocalories }
             for (r in records) emit("ActiveCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
         run {
             val records = preferBestSource(safeReadAll<TotalCaloriesBurnedRecord>(dayStart, dayEnd))
             addSources(records, sources)
-            totalCaloriesKcal = records.sumOf { it.energy.inKilocalories }
             for (r in records) emit("TotalCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
 
@@ -193,7 +211,7 @@ class HealthSyncStreamer(
             // This keeps an overnight sleep intact and allows several sessions on the same day
             // (main sleep, nap, additional sleep) without splitting them at midnight.
             val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
-            val records = preferBestSource(safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd))
+            val records = safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd)
                 .filter { it.endTime.atZone(zone).toLocalDate() == date }
                 .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
             addSources(records, sources)
@@ -302,13 +320,11 @@ class HealthSyncStreamer(
         run {
             val records = preferBestSource(safeReadAll<ElevationGainedRecord>(dayStart, dayEnd))
             addSources(records, sources)
-            elevationGainedM = records.sumOf { it.elevation.inMeters }
             for (r in records) emit("ElevationGained", null, r.startTime, r.endTime, r.elevation.inMeters, "m", r)
         }
         run {
             val records = preferBestSource(safeReadAll<FloorsClimbedRecord>(dayStart, dayEnd))
             addSources(records, sources)
-            floorsClimbed = records.sumOf { it.floors }
             for (r in records) emit("FloorsClimbed", null, r.startTime, r.endTime, r.floors, "floors", r)
         }
         run {
@@ -377,74 +393,93 @@ class HealthSyncStreamer(
             workouts.put(buildWorkoutJson(record, sources))
         }
 
-        if (!hasStepRecords) {
-    onProgress("Health Connect не вернул шаги за $date — существующая сводка сохранена")
-    batcher.flush()
-    return DayResult(
-        workouts = workoutRecords.size,
-        measurements = batcher.totalCount,
-        sources = sources
-    )
-}
-
-// Make sure the final partial measurement batch is persisted before the day summary.
+        // Make sure the final partial measurement batch is persisted before the day summary.
 batcher.flush()
 
-        val dayObject = JSONObject().apply {
-            put("date", date.toString())
-            put("steps", stepsTotal)
-            put("distanceKm", distanceKm)
-            put("activeCaloriesKcal", activeCaloriesKcal)
-            put("totalCaloriesKcal", totalCaloriesKcal)
-            putNullable("sleepHours", sleepSummary.hours)
-            put("deepSleepMinutes", sleepSummary.deepMinutes)
-            put("lightSleepMinutes", sleepSummary.lightMinutes)
-            put("remSleepMinutes", sleepSummary.remMinutes)
-            put("awakeMinutes", sleepSummary.awakeMinutes)
-            putNullable("sleepStart", sleepSummary.start?.toString())
-            putNullable("sleepEnd", sleepSummary.end?.toString())
-            put("sleepSessionCount", sleepSummary.sessionCount)
-            put("sleepStageCount", sleepSummary.stageCount)
-            put("sleepSuspicious", sleepSummary.suspicious)
-            put("sleepRawHours", sleepSummary.rawHours)
-            putNullable("averageHeartRate", heartStats.average())
-            putNullable("minimumHeartRate", heartStats.min)
-            putNullable("maximumHeartRate", heartStats.max)
-            put("heartRateSamples", heartStats.count)
-            putNullable("restingHeartRate", restingHeartRate)
-            putNullable("averageSpO2", spo2Stats.average())
-            putNullable("minimumSpO2", spo2Stats.min)
-            putNullable("maximumSpO2", spo2Stats.max)
-            put("spO2Samples", spo2Stats.count)
-            putNullable("averageHrvRmssdMs", hrvStats.average())
-            putNullable("minimumHrvRmssdMs", hrvStats.min)
-            putNullable("maximumHrvRmssdMs", hrvStats.max)
-            put("hrvSamples", hrvStats.count)
-            putNullable("averageRespiratoryRate", respiratoryStats.average())
-            putNullable("minimumRespiratoryRate", respiratoryStats.min)
-            putNullable("maximumRespiratoryRate", respiratoryStats.max)
-            put("respiratorySamples", respiratoryStats.count)
-            putNullable("vo2Max", vo2Max)
-            putNullable("skinTempBaselineC", skinTempBaselineC)
-            putNullable("averageSkinTempDeltaC", skinDeltaStats.average())
-            putNullable("minimumSkinTempDeltaC", skinDeltaStats.min)
-            putNullable("maximumSkinTempDeltaC", skinDeltaStats.max)
-            put("skinTempSamples", skinDeltaStats.count)
-            put("elevationGainedM", elevationGainedM)
-            put("floorsClimbed", floorsClimbed)
-            putNullable("averageSpeedKmh", speedStats.average())
-            putNullable("maximumSpeedKmh", speedStats.max)
-            putNullable("averageStepCadence", stepCadenceStats.average())
-            putNullable("maximumStepCadence", stepCadenceStats.max)
-            putNullable("averageCyclingCadence", cyclingCadenceStats.average())
-            putNullable("maximumCyclingCadence", cyclingCadenceStats.max)
-            putNullable("averagePowerW", powerStats.average())
-            putNullable("maximumPowerW", powerStats.max)
-            putNullable("weightKg", weightKg)
-            put("workoutCount", workoutRecords.size)
-            put("workoutMinutes", workoutRecords.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() })
-            put("sourcePackages", jsonStringArray(sources))
+        val dayObject = JSONObject().apply { put("date", date.toString()) }
+        val availableFields = linkedSetOf<String>()
+        fun putField(key: String, value: Any?) {
+            dayObject.put(key, value ?: JSONObject.NULL)
+            availableFields += key
         }
+
+        if (aggregates.steps is MetricRead.Available) putField("steps", stepsTotal)
+        if (aggregates.distance is MetricRead.Available) putField("distanceKm", distanceKm)
+        if (aggregates.activeCalories is MetricRead.Available) putField("activeCaloriesKcal", activeCaloriesKcal)
+        if (aggregates.totalCalories is MetricRead.Available) putField("totalCaloriesKcal", totalCaloriesKcal)
+        if (aggregates.elevation is MetricRead.Available) putField("elevationGainedM", elevationGainedM)
+        if (aggregates.floors is MetricRead.Available) putField("floorsClimbed", floorsClimbed)
+
+        if (isTypeReadable<SleepSessionRecord>()) {
+            putField("sleepHours", sleepSummary.hours)
+            putField("deepSleepMinutes", sleepSummary.deepMinutes)
+            putField("lightSleepMinutes", sleepSummary.lightMinutes)
+            putField("remSleepMinutes", sleepSummary.remMinutes)
+            putField("awakeMinutes", sleepSummary.awakeMinutes)
+            putField("sleepStart", sleepSummary.start?.toString())
+            putField("sleepEnd", sleepSummary.end?.toString())
+            putField("sleepSessionCount", sleepSummary.sessionCount)
+            putField("sleepStageCount", sleepSummary.stageCount)
+            putField("mainSleepHours", sleepSummary.mainHours)
+            putField("napCount", sleepSummary.napCount)
+            putField("napMinutes", sleepSummary.napMinutes)
+        }
+        if (isTypeReadable<HeartRateRecord>()) {
+            putField("averageHeartRate", heartStats.average())
+            putField("minimumHeartRate", heartStats.min)
+            putField("maximumHeartRate", heartStats.max)
+            putField("heartRateSamples", heartStats.count)
+        }
+        if (isTypeReadable<RestingHeartRateRecord>()) putField("restingHeartRate", restingHeartRate)
+        if (isTypeReadable<OxygenSaturationRecord>()) {
+            putField("averageSpO2", spo2Stats.average())
+            putField("minimumSpO2", spo2Stats.min)
+            putField("maximumSpO2", spo2Stats.max)
+            putField("spO2Samples", spo2Stats.count)
+        }
+        if (isTypeReadable<HeartRateVariabilityRmssdRecord>()) {
+            putField("averageHrvRmssdMs", hrvStats.average())
+            putField("minimumHrvRmssdMs", hrvStats.min)
+            putField("maximumHrvRmssdMs", hrvStats.max)
+            putField("hrvSamples", hrvStats.count)
+        }
+        if (isTypeReadable<RespiratoryRateRecord>()) {
+            putField("averageRespiratoryRate", respiratoryStats.average())
+            putField("minimumRespiratoryRate", respiratoryStats.min)
+            putField("maximumRespiratoryRate", respiratoryStats.max)
+            putField("respiratorySamples", respiratoryStats.count)
+        }
+        if (isTypeReadable<Vo2MaxRecord>()) putField("vo2Max", vo2Max)
+        if (isTypeReadable<SkinTemperatureRecord>()) {
+            putField("skinTempBaselineC", skinTempBaselineC)
+            putField("averageSkinTempDeltaC", skinDeltaStats.average())
+            putField("minimumSkinTempDeltaC", skinDeltaStats.min)
+            putField("maximumSkinTempDeltaC", skinDeltaStats.max)
+            putField("skinTempSamples", skinDeltaStats.count)
+        }
+        if (isTypeReadable<SpeedRecord>()) {
+            putField("averageSpeedKmh", speedStats.average())
+            putField("maximumSpeedKmh", speedStats.max)
+        }
+        if (isTypeReadable<StepsCadenceRecord>()) {
+            putField("averageStepCadence", stepCadenceStats.average())
+            putField("maximumStepCadence", stepCadenceStats.max)
+        }
+        if (isTypeReadable<CyclingPedalingCadenceRecord>()) {
+            putField("averageCyclingCadence", cyclingCadenceStats.average())
+            putField("maximumCyclingCadence", cyclingCadenceStats.max)
+        }
+        if (isTypeReadable<PowerRecord>()) {
+            putField("averagePowerW", powerStats.average())
+            putField("maximumPowerW", powerStats.max)
+        }
+        if (isTypeReadable<WeightRecord>()) putField("weightKg", weightKg)
+        if (isTypeReadable<ExerciseSessionRecord>()) {
+            putField("workoutCount", workoutRecords.size)
+            putField("workoutMinutes", workoutRecords.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() })
+        }
+        putField("sourcePackages", jsonStringArray(sources))
+        dayObject.put("availableFields", JSONArray(availableFields.toList()))
 
         onProgress("Отправляю сводку за $date…")
         postHealthPayload(
@@ -555,6 +590,27 @@ batcher.flush()
         }
     }
 
+    private suspend fun postDeletedRecordIds(
+        endpoint: String,
+        token: String,
+        recordIds: Set<String>
+    ): Set<LocalDate> {
+        if (recordIds.isEmpty()) return emptySet()
+        val body = JSONObject().apply {
+            put("token", token)
+            put("action", "healthChangesV3")
+            put("schemaVersion", 3)
+            put("deletedRecordIds", JSONArray(recordIds.toList()))
+        }
+        val response = postBody(endpoint, body) ?: return emptySet()
+        val result = linkedSetOf<LocalDate>()
+        val dates = response.optJSONArray("affectedDates") ?: return result
+        for (i in 0 until dates.length()) {
+            runCatching { LocalDate.parse(dates.getString(i)) }.getOrNull()?.let(result::add)
+        }
+        return result
+    }
+
     private suspend fun postHealthPayload(
         endpoint: String,
         token: String,
@@ -568,8 +624,8 @@ batcher.flush()
     ): JSONObject? {
         val body = JSONObject().apply {
             put("token", token)
-            put("action", "healthSyncV2")
-            put("schemaVersion", 2)
+            put("action", "healthSyncV3")
+            put("schemaVersion", 3)
             put("syncedAt", syncedAt)
             put("deviceId", android.os.Build.MODEL ?: "Android")
             put("rangeStart", rangeDate.toString())
@@ -630,6 +686,9 @@ batcher.flush()
                 stageCount = stageList.size,
                 start = null,
                 end = null,
+                mainHours = null,
+                napCount = 0,
+                napMinutes = 0,
                 deepMinutes = 0,
                 lightMinutes = 0,
                 remMinutes = 0,
@@ -637,9 +696,7 @@ batcher.flush()
             )
         }
 
-        val stageRangeStart = intervals.first().start
-        val stageRangeEnd = intervals.maxOf { it.end }
-        val stage = stageTotals(stageList, stageRangeStart, stageRangeEnd)
+        val stage = deduplicatedStageTotals(records)
         val rawMillis = intervals.sumOf { Duration.between(it.start, it.end).toMillis() }
 
         // Union all sleep intervals so overlapping duplicate sessions cannot inflate total sleep.
@@ -661,19 +718,69 @@ batcher.flush()
         val uniqueHours = uniqueMillis / 3_600_000.0
         val suspicious = uniqueHours > MAX_SLEEP_HOURS_PER_DAY
 
+        val main = merged.maxByOrNull { Duration.between(it.start, it.end).toMillis() }
+        val naps = merged.filter { it != main }
+        val mainHours = main?.let { Duration.between(it.start, it.end).toMillis() / 3_600_000.0 }
+        val napMinutes = naps.sumOf { Duration.between(it.start, it.end).toMinutes() }
+
         return SleepAggregation(
             hours = if (suspicious) null else uniqueHours,
             suspicious = suspicious,
             rawHours = rawMillis / 3_600_000.0,
             sessionCount = records.size,
             stageCount = stageList.size,
-            start = merged.first().start,
-            end = merged.last().end,
+            start = main?.start,
+            end = main?.end,
+            mainHours = mainHours,
+            napCount = naps.size,
+            napMinutes = napMinutes,
             deepMinutes = stage.deepMinutes,
             lightMinutes = stage.lightMinutes,
             remMinutes = stage.remMinutes,
             awakeMinutes = stage.awakeMinutes
         )
+    }
+
+    private fun deduplicatedStageTotals(records: List<SleepSessionRecord>): StageTotals {
+        data class Segment(
+            val start: Instant,
+            val end: Instant,
+            val type: Int,
+            val priority: Int,
+            val source: String
+        )
+        val segments = records.flatMap { record ->
+            val source = record.sourcePackage()
+            record.stages.map { stage ->
+                Segment(stage.startTime, stage.endTime, stage.stage, sourcePriority(source), source)
+            }
+        }.filter { it.start < it.end }
+        if (segments.isEmpty()) return StageTotals(0, 0, 0, 0)
+
+        val boundaries = segments.flatMap { listOf(it.start, it.end) }.distinct().sorted()
+        var deep = 0L
+        var light = 0L
+        var rem = 0L
+        var awake = 0L
+        for (index in 0 until boundaries.lastIndex) {
+            val start = boundaries[index]
+            val end = boundaries[index + 1]
+            if (start >= end) continue
+            val chosen = segments.asSequence()
+                .filter { it.start < end && it.end > start }
+                .minWithOrNull(compareBy<Segment> { it.priority }.thenBy { it.source })
+                ?: continue
+            val minutes = Duration.between(start, end).toMinutes()
+            when (chosen.type) {
+                SleepSessionRecord.STAGE_TYPE_DEEP -> deep += minutes
+                SleepSessionRecord.STAGE_TYPE_LIGHT -> light += minutes
+                SleepSessionRecord.STAGE_TYPE_REM -> rem += minutes
+                SleepSessionRecord.STAGE_TYPE_AWAKE,
+                SleepSessionRecord.STAGE_TYPE_AWAKE_IN_BED,
+                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awake += minutes
+            }
+        }
+        return StageTotals(deep, light, rem, awake)
     }
 
     private fun stageTotals(
@@ -772,7 +879,10 @@ batcher.flush()
             } catch (error: Exception) {
                 // Android may wrap SecurityException inside HealthConnectException.
                 // Missing permission for an optional metric must not abort the whole sync.
-                if (isPermissionFailure(error)) return emptyList()
+                if (isPermissionFailure(error)) {
+                    permissionDeniedTypes += typeKey<T>()
+                    return emptyList()
+                }
 
                 lastError = error
                 if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
@@ -784,6 +894,20 @@ batcher.flush()
             "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
             lastError
         )
+    }
+
+    private inline fun <reified T : Record> typeKey(): String =
+        T::class.qualifiedName ?: T::class.simpleName ?: "unknown"
+
+    private inline fun <reified T : Record> isTypeReadable(): Boolean =
+        typeKey<T>() !in permissionDeniedTypes
+
+    private fun <T> metricValue(read: MetricRead<T>, sources: MutableSet<String>): T? = when (read) {
+        is MetricRead.Available -> {
+            sources += read.sourcePackages
+            read.value
+        }
+        is MetricRead.PermissionDenied -> null
     }
 
     private fun isPermissionFailure(error: Throwable): Boolean {
@@ -904,13 +1028,16 @@ batcher.flush()
         val stageCount: Int,
         val start: Instant?,
         val end: Instant?,
+        val mainHours: Double?,
+        val napCount: Int,
+        val napMinutes: Long,
         val deepMinutes: Long,
         val lightMinutes: Long,
         val remMinutes: Long,
         val awakeMinutes: Long
     ) {
         companion object {
-            fun empty() = SleepAggregation(null, false, 0.0, 0, 0, null, null, 0, 0, 0, 0)
+            fun empty() = SleepAggregation(null, false, 0.0, 0, 0, null, null, null, 0, 0, 0, 0, 0, 0)
         }
     }
 
