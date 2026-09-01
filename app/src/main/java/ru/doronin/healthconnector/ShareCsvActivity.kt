@@ -25,15 +25,16 @@ class ShareCsvActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         statusView = TextView(this).apply {
-            text = "Получаю CSV FatSecret…"
+            text = "Получаю отчёт FatSecret…"
             textSize = 18f
             setPadding(48, 64, 48, 64)
         }
         setContentView(statusView)
 
-        val uri = extractSharedUri(intent)
-        if (uri == null) {
-            failAndOpenMain("Не удалось получить CSV-файл")
+        val sharedUri = extractSharedUri(intent)
+        val sharedText = intent?.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
+        if (sharedUri == null && sharedText == null) {
+            failAndOpenMain("Не удалось получить CSV-отчёт FatSecret")
             return
         }
 
@@ -54,13 +55,22 @@ class ShareCsvActivity : AppCompatActivity() {
             runCatching {
                 statusView.text = "Читаю CSV FatSecret…"
                 val csvText = withContext(Dispatchers.IO) {
-                    contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
-                        ?: error("Не удалось прочитать файл")
+                    when {
+                        sharedUri != null -> contentResolver.openInputStream(sharedUri)
+                            ?.bufferedReader(Charsets.UTF_8)
+                            ?.use { it.readText() }
+                            ?: error("Не удалось прочитать файл")
+                        sharedText != null -> sharedText
+                        else -> error("Отчёт не найден")
+                    }
                 }
                 require(csvText.isNotBlank()) { "CSV пустой" }
                 require(csvText.length <= 5_000_000) { "CSV слишком большой: максимум 5 МБ" }
 
-                val fileName = queryFileName(uri) ?: "fatsecret.csv"
+                val fileName = sharedUri?.let(::queryFileName)
+                    ?: intent?.getStringExtra(Intent.EXTRA_TITLE)?.takeIf { it.isNotBlank() }
+                    ?: "fatsecret.csv"
+
                 statusView.text = "Отправляю в dashboard…"
                 val body = JSONObject().apply {
                     put("token", token)
@@ -85,18 +95,34 @@ class ShareCsvActivity : AppCompatActivity() {
 
     private fun extractSharedUri(intent: Intent?): Uri? {
         intent ?: return null
-        return when (intent.action) {
-            Intent.ACTION_SEND -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
-                }
+
+        if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
+            val multiple = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
             }
-            Intent.ACTION_VIEW -> intent.data
-            else -> intent.data
+            multiple?.firstOrNull()?.let { return it }
         }
+
+        if (intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
+            val stream = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+            }
+            if (stream != null) return stream
+        }
+
+        intent.clipData?.let { clips ->
+            for (index in 0 until clips.itemCount) {
+                clips.getItemAt(index).uri?.let { return it }
+            }
+        }
+
+        return intent.data
     }
 
     private fun queryFileName(uri: Uri): String? {
