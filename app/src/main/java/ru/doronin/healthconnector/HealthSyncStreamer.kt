@@ -64,6 +64,8 @@ class HealthSyncStreamer(
         val today = LocalDate.now(zone)
         val requestedDates = (safeDays - 1 downTo 0).map { today.minusDays(it.toLong()) }
 
+        onProgress("Проверяю версию Google Sheets…")
+        ServerCompatibility.requireV3(endpoint)
         onProgress("Проверяю изменения Health Connect…")
         val changes = changesTracker.collect(zone)
         val deletionDates = if (changes.deletedRecordIds.isNotEmpty()) {

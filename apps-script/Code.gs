@@ -100,7 +100,7 @@ function doGet() {
   return json_({
     ok: true,
     service: 'Health Dashboard Sync',
-    schemaVersion: 2,
+    schemaVersion: 3,
     time: new Date().toISOString()
   });
 }
@@ -123,8 +123,14 @@ function doPost(e) {
     if (payload.action === 'fatsecretCsv') {
       return json_(importFatSecretCsv_(spreadsheet, logSheet, payload));
     }
+    if (payload.action === 'healthChangesV3') {
+      return json_(handleHealthChangesV3_(spreadsheet, logSheet, payload));
+    }
 
     validateHealthPayload_(payload);
+    if (payload.action === 'healthSyncV3') {
+      return json_(importHealthPayloadV3_(spreadsheet, logSheet, payload));
+    }
     return json_(importHealthPayload_(spreadsheet, logSheet, payload));
   } catch (error) {
     try {
@@ -202,7 +208,6 @@ function importHealthPayload_(spreadsheet, logSheet, payload) {
   upsertByKey_(workoutsSheet, workoutRows, 1);
   upsertByKey_(sleepSheet, sleepRows, 1);
   upsertByKey_(measurementsSheet, measurementRows, 1);
-  syncDiary_(spreadsheet, payload.days || []);
 
   logSheet.appendRow([
     new Date(), payload.deviceId || '', payload.rangeStart || '', payload.rangeEnd || '',
@@ -246,7 +251,6 @@ function importFatSecretCsv_(spreadsheet, logSheet, payload) {
 
   upsertFatSecretMeals_(tracker, parsed, payload.fileName || 'fatsecret.csv', spreadsheet);
   upsertNutritionDays_(nutrition, parsed.days, spreadsheet);
-  syncDiaryFoodSnack_(spreadsheet, parsed.days);
 
   validation.okMessages.forEach(msg => {
     logSheet.appendRow([new Date(), 'FatSecret', '', '', 1, 0, 'OK', msg]);
