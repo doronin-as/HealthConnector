@@ -28,7 +28,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add apps-script/Code.gs apps-script/IntegrityV3.gs
+          git add -A apps-script
           git diff --cached --check
           git commit -m 'Bundle Apps Script schema v3 into one deployable file'
           git push origin HEAD:main
