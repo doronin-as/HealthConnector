@@ -1,0 +1,36 @@
+name: Patch 1.6.1 security follow-up
+
+on:
+  push:
+    paths:
+      - '.github/trigger-security-161-followup'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply follow-up
+        run: python3 tools/patch_security_161_followup.py
+      - name: Validate security changes
+        run: |
+          git diff --check
+          cp apps-script/Code.gs /tmp/HealthConnectorCode.js
+          node --check /tmp/HealthConnectorCode.js
+          grep -F 'versionName = "1.6.1"' app/build.gradle.kts
+          grep -F 'tokenConfigured:' apps-script/Code.gs
+          ! grep -F 'apiToken:' apps-script/Code.gs
+          ! grep -F 'properties.getProperty('\''API_TOKEN'\'')' apps-script/Code.gs | grep -F 'console.log'
+          ! grep -F '.MainActivity' app/src/main/AndroidManifest.xml
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/res/layout/activity_main.xml apps-script/Code.gs app/build.gradle.kts
+          git commit -m 'Harden token handling for 1.6.1'
+          git push origin HEAD:main
