@@ -20,7 +20,8 @@ jobs:
           printf '\n\n// ===== Health Connector schema v3 integrity layer =====\n' >> apps-script/Code.gs
           cat apps-script/IntegrityV3.gs >> apps-script/Code.gs
           git rm apps-script/IntegrityV3.gs
-          node --check apps-script/Code.gs
+          cp apps-script/Code.gs /tmp/HealthConnectorCode.js
+          node --check /tmp/HealthConnectorCode.js
           ! grep -F 'syncDiary_(spreadsheet, payload.days || [])' apps-script/Code.gs
           ! grep -F 'syncDiaryFoodSnack_(spreadsheet, parsed.days)' apps-script/Code.gs
       - name: Commit merged Apps Script
