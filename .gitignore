@@ -1,0 +1,10 @@
+# Android signing material must never be committed.
+*.keystore
+*.jks
+.github/signing/
+app/healthconnector-dev.keystore
+
+# Build outputs
+.gradle/
+**/build/
+local.properties
