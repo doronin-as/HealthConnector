@@ -77,9 +77,11 @@ function setup() {
   if (!properties.getProperty('SPREADSHEET_ID')) {
     properties.setProperty('SPREADSHEET_ID', DEFAULT_SPREADSHEET_ID);
   }
+  let tokenCreated = false;
   if (!properties.getProperty('API_TOKEN')) {
     const token = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
     properties.setProperty('API_TOKEN', token);
+    tokenCreated = true;
   }
   const spreadsheet = getSpreadsheet_();
   ensureSheet_(spreadsheet, DAYS_SHEET, DAY_HEADERS);
@@ -90,7 +92,8 @@ function setup() {
 
   const result = {
     spreadsheetId: properties.getProperty('SPREADSHEET_ID'),
-    apiToken: properties.getProperty('API_TOKEN')
+    tokenConfigured: Boolean(properties.getProperty('API_TOKEN')),
+    tokenCreated: tokenCreated
   };
   console.log(JSON.stringify(result));
   return result;
