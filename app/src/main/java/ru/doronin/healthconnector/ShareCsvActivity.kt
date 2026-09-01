@@ -54,7 +54,7 @@ class ShareCsvActivity : AppCompatActivity() {
         lifecycleScope.launch {
             runCatching {
                 statusView.text = "Читаю отчёт FatSecret…"
-                val csvText = withContext(Dispatchers.IO) {
+                val rawCsvText = withContext(Dispatchers.IO) {
                     when {
                         sharedUri != null -> contentResolver.openInputStream(sharedUri)
                             ?.bufferedReader(Charsets.UTF_8)
@@ -64,14 +64,23 @@ class ShareCsvActivity : AppCompatActivity() {
                         else -> error("Отчёт не найден")
                     }
                 }
-                require(csvText.isNotBlank()) { "Отчёт пустой" }
-                require(csvText.length <= 5_000_000) { "Отчёт слишком большой: максимум 5 МБ" }
+                require(rawCsvText.isNotBlank()) { "Отчёт пустой" }
+                require(rawCsvText.length <= 5_000_000) { "Отчёт слишком большой: максимум 5 МБ" }
+
+                val normalized = normalizeFatSecretCsvForServer(rawCsvText)
+                val csvText = normalized.first
+                val normalizedMealLabels = normalized.second
 
                 val fileName = sharedUri?.let(::queryFileName)
                     ?: intent?.getStringExtra(Intent.EXTRA_TITLE)?.takeIf { it.isNotBlank() }
                     ?: "fatsecret.csv"
 
-                statusView.text = "Отправляю в dashboard…"
+                statusView.text = if (normalizedMealLabels > 0) {
+                    "Исправляю категории FatSecret и отправляю…"
+                } else {
+                    "Отправляю в dashboard…"
+                }
+
                 val body = JSONObject().apply {
                     put("token", token)
                     put("action", "fatsecretCsv")
@@ -79,6 +88,7 @@ class ShareCsvActivity : AppCompatActivity() {
                     put("csvText", csvText)
                     put("uploadedAt", Instant.now().toString())
                     put("sourceMimeType", intent?.type.orEmpty())
+                    put("normalizedMealLabels", normalizedMealLabels)
                 }
                 postBody(safeEndpoint, body)
             }.onSuccess { response ->
@@ -91,6 +101,60 @@ class ShareCsvActivity : AppCompatActivity() {
             }.onFailure { error ->
                 failAndOpenMain("Ошибка импорта FatSecret: ${error.message}")
             }
+        }
+    }
+
+    /**
+     * FatSecret has used slightly different localized names for the same snack bucket.
+     * The live Apps Script historically accepts "Перекус/Другое" and "Snacks/Other".
+     * Normalize only the first CSV field, preserving food names and nutrition values.
+     */
+    private fun normalizeFatSecretCsvForServer(csvText: String): Pair<String, Int> {
+        var replacements = 0
+        val firstField = Regex("""^(\s*\"?)([^\",\r\n]+)(\"?\s*,)""")
+
+        val normalizedText = csvText
+            .replace("\r\n", "\n")
+            .replace('\r', '\n')
+            .split('\n')
+            .joinToString("\n") { line ->
+                val match = firstField.find(line) ?: return@joinToString line
+                val rawLabel = match.groupValues[2].trim()
+                val normalizedLabel = normalizeFatSecretMealLabel(rawLabel)
+                if (normalizedLabel == rawLabel) return@joinToString line
+
+                replacements++
+                buildString(line.length + 8) {
+                    append(line.substring(0, match.range.first))
+                    append(match.groupValues[1])
+                    append(normalizedLabel)
+                    append(match.groupValues[3])
+                    append(line.substring(match.range.last + 1))
+                }
+            }
+
+        return normalizedText to replacements
+    }
+
+    private fun normalizeFatSecretMealLabel(label: String): String {
+        val compact = label
+            .trim()
+            .lowercase()
+            .replace(Regex("""\s*/\s*"""), "/")
+            .replace(Regex("""\s+"""), " ")
+
+        return when (compact) {
+            "перекусы/другое",
+            "перекус/другое",
+            "закуски/другое",
+            "снэки/другое" -> "Перекус/Другое"
+
+            "snacks/other",
+            "snack/other",
+            "snacks & other",
+            "snack & other" -> "Snacks/Other"
+
+            else -> label
         }
     }
 
