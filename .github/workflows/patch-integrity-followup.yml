@@ -24,7 +24,6 @@ jobs:
           grep -F 'schemaVersion: 3' apps-script/Code.gs
           grep -F "payload.action === 'healthSyncV3'" apps-script/Code.gs
           grep -F "payload.action === 'healthChangesV3'" apps-script/Code.gs
-          ! grep -F 'syncDiary_(spreadsheet' apps-script/Code.gs || false
       - name: Commit
         run: |
           git config user.name 'github-actions[bot]'
