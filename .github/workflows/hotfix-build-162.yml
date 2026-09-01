@@ -34,7 +34,7 @@ jobs:
           test -f app/src/main/res/drawable/ic_app_logo.xml
       - name: Restore compatible signing key from repository history
         run: |
-          git show d55bd9832e2c5250cc4658ef5629b4297984d03d9:.github/signing/healthconnector-dev.keystore.b64 > /tmp/healthconnector-dev.keystore.b64
+          git show d551c9b2e2c5250cc4658ef5629b4297984d03d9:.github/signing/healthconnector-dev.keystore.b64 > /tmp/healthconnector-dev.keystore.b64
           base64 --decode /tmp/healthconnector-dev.keystore.b64 > "$HC_SIGNING_STORE_FILE"
           chmod 600 "$HC_SIGNING_STORE_FILE"
           rm -f /tmp/healthconnector-dev.keystore.b64
