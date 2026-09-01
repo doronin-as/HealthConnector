@@ -17,11 +17,17 @@ class BackgroundSyncWorker(
         if (!prefs.getBoolean(BackgroundSyncScheduler.PREF_ENABLED, true)) return Result.success()
 
         val endpoint = prefs.getString("endpoint", "").orEmpty().trim()
-        val token = prefs.getString("token", "").orEmpty().trim()
+        val token = SecureTokenStore(applicationContext).getToken().trim()
         if (endpoint.isBlank() || token.isBlank()) {
             saveBackgroundStatus("Фоновая синхронизация: не настроен Google Sheets")
             return Result.success()
         }
+
+        val safeEndpoint = runCatching { EndpointSecurity.requireHttps(endpoint) }
+            .getOrElse {
+                saveBackgroundStatus("Фоновая синхронизация: нужен HTTPS URL Apps Script")
+                return Result.success()
+            }
 
         if (HealthConnectClient.getSdkStatus(applicationContext) != HealthConnectClient.SDK_AVAILABLE) {
             saveBackgroundStatus("Фоновая синхронизация: Health Connect недоступен")
@@ -49,7 +55,7 @@ class BackgroundSyncWorker(
 
         return try {
             val result = HealthSyncStreamer(applicationContext, client).sync(
-                endpoint = endpoint,
+                endpoint = safeEndpoint,
                 token = token,
                 days = BackgroundSyncScheduler.BACKGROUND_DAYS,
                 onProgress = { }
