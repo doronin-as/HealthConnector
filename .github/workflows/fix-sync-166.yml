@@ -1,0 +1,203 @@
+name: Apply and build 1.6.6 sync hotfix
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/fix-sync-166.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build:
+    runs-on: ubuntu-latest
+    env:
+      HC_SIGNING_STORE_FILE: /tmp/healthconnector-dev.keystore
+      HC_SIGNING_STORE_PASSWORD: android
+      HC_SIGNING_KEY_ALIAS: androiddebugkey
+      HC_SIGNING_KEY_PASSWORD: android
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply 1.6.6 sync fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          streamer = Path('app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt')
+          text = streamer.read_text()
+
+          old_sig = '''        days: Int,
+        onProgress: (String) -> Unit
+    ): SyncResult {'''
+          new_sig = '''        days: Int,
+        onProgress: (String) -> Unit,
+        includeHistoricalChanges: Boolean = true
+    ): SyncResult {'''
+          if old_sig not in text:
+              raise SystemExit('HealthSyncStreamer sync signature not found')
+          text = text.replace(old_sig, new_sig, 1)
+
+          old_block = '''        // A DeletionChange contains only recordId, not its timestamp. Usually the server can
+        // recover the affected date from the raw row. To guarantee correctness even when that row
+        // was never exported by an older app version, any deletion triggers a rare 30-day rebuild.
+        val deletionSafetyDates = if (changes.deletedRecordIds.isNotEmpty()) {
+            (0L..29L).map { today.minusDays(it) }
+        } else {
+            emptyList()
+        }
+
+        val oldestReadable = today.minusDays(29)
+        val dates = linkedSetOf<LocalDate>().apply {
+            addAll(requestedDates)
+            addAll(changes.affectedDates)
+            addAll(deletionDates)
+            addAll(deletionSafetyDates)
+        }.filter { !it.isBefore(oldestReadable) && !it.isAfter(today) }
+            .distinct()
+            .sorted()
+'''
+          new_block = '''        // DeletionChange contains only recordId. The Apps Script endpoint maps IDs that were
+        // previously exported back to their exact affected dates. If an ID was never exported,
+        // there is no stale raw row/day summary to repair. Do NOT expand one deletion into an
+        // unconditional 30-day rebuild: that made a 2-day WorkManager job run for many minutes
+        // and Android cancelled it with "Job was cancelled".
+        //
+        // Manual sync keeps historical changed dates. Background sync sets
+        // includeHistoricalChanges=false so it remains bounded to BACKGROUND_DAYS; deleted IDs are
+        // still sent to the server immediately, but an old day summary waits for a manual sync.
+        val requestedDateSet = requestedDates.toSet()
+        val affectedDates = if (includeHistoricalChanges) {
+            changes.affectedDates
+        } else {
+            changes.affectedDates.filterTo(linkedSetOf()) { it in requestedDateSet }
+        }
+        val mappedDeletionDates = if (includeHistoricalChanges) {
+            deletionDates
+        } else {
+            deletionDates.filterTo(linkedSetOf()) { it in requestedDateSet }
+        }
+
+        val oldestReadable = today.minusDays(29)
+        val dates = linkedSetOf<LocalDate>().apply {
+            addAll(requestedDates)
+            addAll(affectedDates)
+            addAll(mappedDeletionDates)
+        }.filter { !it.isBefore(oldestReadable) && !it.isAfter(today) }
+            .distinct()
+            .sorted()
+'''
+          if old_block not in text:
+              raise SystemExit('deletionSafetyDates block not found')
+          text = text.replace(old_block, new_block, 1)
+          streamer.write_text(text)
+
+          worker = Path('app/src/main/java/ru/doronin/healthconnector/BackgroundSyncWorker.kt')
+          text = worker.read_text()
+          import_anchor = 'import androidx.work.WorkerParameters\n'
+          if 'import kotlinx.coroutines.CancellationException\n' not in text:
+              text = text.replace(import_anchor, import_anchor + 'import kotlinx.coroutines.CancellationException\n', 1)
+          old_call = '''                days = BackgroundSyncScheduler.BACKGROUND_DAYS,
+                onProgress = { }
+            )'''
+          new_call = '''                days = BackgroundSyncScheduler.BACKGROUND_DAYS,
+                onProgress = { },
+                includeHistoricalChanges = false
+            )'''
+          if old_call not in text:
+              raise SystemExit('background sync call not found')
+          text = text.replace(old_call, new_call, 1)
+          old_catch = '''            Result.success()
+        } catch (error: Throwable) {
+            saveBackgroundStatus("Ошибка: ${error.message ?: error.javaClass.simpleName}")
+            if (runAttemptCount < 3) Result.retry() else Result.failure()
+        }
+'''
+          new_catch = '''            Result.success()
+        } catch (cancelled: CancellationException) {
+            // WorkManager/Android cancellation is lifecycle control, not a sync failure.
+            // Preserve coroutine cancellation semantics instead of recording "Job was cancelled".
+            throw cancelled
+        } catch (error: Throwable) {
+            saveBackgroundStatus("Ошибка: ${error.message ?: error.javaClass.simpleName}")
+            if (runAttemptCount < 3) Result.retry() else Result.failure()
+        }
+'''
+          if old_catch not in text:
+              raise SystemExit('worker catch block not found')
+          worker.write_text(text.replace(old_catch, new_catch, 1))
+
+          gradle = Path('app/build.gradle.kts')
+          text = gradle.read_text()
+          text = text.replace('versionCode = 19', 'versionCode = 20', 1)
+          text = text.replace('versionName = "1.6.5"', 'versionName = "1.6.6"', 1)
+          gradle.write_text(text)
+
+          readme = Path('README.md')
+          text = readme.read_text()
+          text = text.replace('Текущее состояние: **1.6.5** (`versionCode 19`).', 'Текущее состояние: **1.6.6** (`versionCode 20`).', 1)
+          marker = '## Что реализовано\n'
+          note = '''## 1.6.6 — исправление фоновой синхронизации\n\nИсправлен сценарий, при котором один `DeletionChange` Health Connect превращал фоновую синхронизацию последних 2 дней в принудительный rebuild всех последних 30 дней. Это могло превышать лимит выполнения WorkManager и завершаться `Job was cancelled`.\n\nТеперь:\n\n- удалённые записи отправляются в Apps Script по ID как и раньше;\n- серверные `affectedDates` используются точечно;\n- ручная синхронизация может подтянуть реально изменённые старые даты;\n- фоновая синхронизация жёстко ограничена `BACKGROUND_DAYS`;\n- `CancellationException` больше не записывается как обычная ошибка синхронизации.\n\n'''
+          if note not in text:
+              text = text.replace(marker, note + marker, 1)
+          readme.write_text(text)
+
+          doc = Path('docs/FATSECRET_IMPORT.md')
+          # FatSecret document remains focused on nutrition; no version bump needed there.
+
+          runbook = Path('docs/SYNC_RUNBOOK.md')
+          runbook.write_text('''# Health Connect sync runbook\n\nАктуально для **HealthConnector 1.6.6** (`versionCode 20`).\n\n## Потоки\n\n- Ручная синхронизация: выбранные пользователем дни + точные даты изменений Health Connect + даты удалений, которые Apps Script смог сопоставить с ранее экспортированными raw-записями.\n- Фоновая синхронизация: строго последние `BACKGROUND_DAYS` (сейчас 2 дня). Старые change-events не должны превращать Worker в длинный исторический rebuild.\n\n## Почему появился 1.6.6\n\nДо 1.6.6 любой `DeletionChange` добавлял в очередь **все последние 30 дней** через `deletionSafetyDates`. На устройстве это проявилось так:\n\n- при запуске 03.09.2026 прогресс неожиданно ушёл к 07.08.2026;\n- Worker выполнял большое число чтений/HTTP-пакетов;\n- Android/WorkManager отменял задачу;\n- `BackgroundSyncWorker` ловил системную cancellation как `Throwable` и сохранял `Ошибка: Job was cancelled`.\n\n## Исправление 1.6.6\n\n1. `deletionSafetyDates` удалён.\n2. `healthChangesV3` по-прежнему получает `deletedRecordIds`. Сервер возвращает точные `affectedDates` для тех записей, которые ранее были экспортированы.\n3. Если удалённый ID серверу неизвестен, исторический rebuild не запускается: у сервера нет stale raw-записи, которую нужно удалить.\n4. `HealthSyncStreamer.sync(... includeHistoricalChanges=false)` используется в `BackgroundSyncWorker`, поэтому background остаётся ограничен двумя днями.\n5. `CancellationException` пробрасывается обратно WorkManager и не маскируется как пользовательская ошибка.\n\n## Диагностика\n\nЕсли синхронизация снова зависает:\n\n1. Посмотреть текст прогресса. Если дата старше выбранного диапазона — проверить `HealthChangesTracker` и формирование `dates` в `HealthSyncStreamer`.\n2. Проверить `HC_Журнал` в Google Sheets: последнюю успешную дату/пакет и серверные ошибки.\n3. Проверить, не вырос ли `MAX_MEASUREMENTS_PER_REQUEST` и не превышает ли HTTP request разумный размер.\n4. Для фоновой задачи убедиться, что `includeHistoricalChanges = false`.\n5. Не добавлять обратно глобальный 30-дневный rebuild на один deletion.\n\n## Release checklist\n\n- увеличить `versionCode` и `versionName`;\n- собрать APK Java 17 / Gradle 8.11.1;\n- проверить подпись SHA-256 `319c0e1944727ba1128e6a8340bd68123b9e8b2cf328b0443e1e4a0387a85a80`;\n- установить поверх предыдущей версии без удаления данных;\n- ручной тест: 2 дня должны начинаться с вчера/сегодня, а не с даты месяц назад;\n- фоновый тест: дождаться Worker и проверить статус `Успешно`;\n- проверить `HC_Журнал`.\n''')
+          PY
+
+      - name: Validate source patch
+        run: |
+          grep -F 'versionName = "1.6.6"' app/build.gradle.kts
+          grep -F 'versionCode = 20' app/build.gradle.kts
+          grep -F 'includeHistoricalChanges: Boolean = true' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+          grep -F 'includeHistoricalChanges = false' app/src/main/java/ru/doronin/healthconnector/BackgroundSyncWorker.kt
+          grep -F 'catch (cancelled: CancellationException)' app/src/main/java/ru/doronin/healthconnector/BackgroundSyncWorker.kt
+          ! grep -F 'deletionSafetyDates' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+
+      - name: Commit source fix
+        run: |
+          git config user.name 'HealthConnector CI'
+          git config user.email 'actions@users.noreply.github.com'
+          git add app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt \
+                  app/src/main/java/ru/doronin/healthconnector/BackgroundSyncWorker.kt \
+                  app/build.gradle.kts README.md docs/SYNC_RUNBOOK.md
+          git commit -m 'Fix bounded background sync and cancellation handling'
+          git push origin HEAD:main
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Restore compatible signing key
+        run: |
+          git show d551c9b2e2c5250cc4658ef5629b4297984d03d9:.github/signing/healthconnector-dev.keystore.b64 > /tmp/healthconnector-dev.keystore.b64
+          base64 --decode /tmp/healthconnector-dev.keystore.b64 > "$HC_SIGNING_STORE_FILE"
+          chmod 600 "$HC_SIGNING_STORE_FILE"
+          rm -f /tmp/healthconnector-dev.keystore.b64
+
+      - name: Build signed APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Verify compatible signature
+        run: |
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | tee /tmp/apk-certs.txt
+          grep -F '319c0e1944727ba1128e6a8340bd68123b9e8b2cf328b0443e1e4a0387a85a80' /tmp/apk-certs.txt
+
+      - name: Upload 1.6.6 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-connector-1.6.6-sync-hotfix
+          path: app/build/outputs/apk/debug/app-debug.apk
