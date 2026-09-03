@@ -28,7 +28,7 @@ jobs:
           text = streamer.read_text()
           text = text.replace(
               '''        days: Int,\n        onProgress: (String) -> Unit\n    ): SyncResult {''',
-              '''        days: Int,\n        onProgress: (String) -> Unit,\n        includeHistoricalChanges: Boolean = true\n    ): SyncResult {''',
+              '''        days: Int,\n        includeHistoricalChanges: Boolean = true,\n        onProgress: (String) -> Unit\n    ): SyncResult {''',
               1,
           )
           old = '''        // A DeletionChange contains only recordId, not its timestamp. Usually the server can\n        // recover the affected date from the raw row. To guarantee correctness even when that row\n        // was never exported by an older app version, any deletion triggers a rare 30-day rebuild.\n        val deletionSafetyDates = if (changes.deletedRecordIds.isNotEmpty()) {\n            (0L..29L).map { today.minusDays(it) }\n        } else {\n            emptyList()\n        }\n\n        val oldestReadable = today.minusDays(29)\n        val dates = linkedSetOf<LocalDate>().apply {\n            addAll(requestedDates)\n            addAll(changes.affectedDates)\n            addAll(deletionDates)\n            addAll(deletionSafetyDates)\n        }.filter { !it.isBefore(oldestReadable) && !it.isAfter(today) }\n            .distinct()\n            .sorted()\n'''
@@ -46,7 +46,7 @@ jobs:
           )
           text = text.replace(
               '''                days = BackgroundSyncScheduler.BACKGROUND_DAYS,\n                onProgress = { }\n            )''',
-              '''                days = BackgroundSyncScheduler.BACKGROUND_DAYS,\n                onProgress = { },\n                includeHistoricalChanges = false\n            )''',
+              '''                days = BackgroundSyncScheduler.BACKGROUND_DAYS,\n                includeHistoricalChanges = false,\n                onProgress = { }\n            )''',
               1,
           )
           text = text.replace(
@@ -67,6 +67,7 @@ jobs:
           grep -F 'versionName = "1.6.6"' app/build.gradle.kts
           grep -F 'versionCode = 20' app/build.gradle.kts
           grep -F 'includeHistoricalChanges: Boolean = true' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+          grep -A1 -F 'includeHistoricalChanges: Boolean = true' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt | grep -F 'onProgress: (String) -> Unit'
           grep -F 'includeHistoricalChanges = false' app/src/main/java/ru/doronin/healthconnector/BackgroundSyncWorker.kt
           grep -F 'catch (cancelled: CancellationException)' app/src/main/java/ru/doronin/healthconnector/BackgroundSyncWorker.kt
           ! grep -F 'deletionSafetyDates' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
