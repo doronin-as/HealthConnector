@@ -1,0 +1,51 @@
+name: Build signed 1.6.7 diagnostics
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-167.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HC_SIGNING_STORE_FILE: /tmp/healthconnector-dev.keystore
+      HC_SIGNING_STORE_PASSWORD: android
+      HC_SIGNING_KEY_ALIAS: androiddebugkey
+      HC_SIGNING_KEY_PASSWORD: android
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Validate version and diagnostics
+        run: |
+          grep -F 'versionName = "1.6.7"' app/build.gradle.kts
+          grep -F 'SyncRunGate.runManual' app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+          grep -F 'tryRunBackground' app/src/main/java/ru/doronin/healthconnector/BackgroundSyncWorker.kt
+          grep -F "errorCode: 'LOCK_BUSY'" apps-script/Code.gs
+      - name: Restore compatible signing key
+        run: |
+          git show d551c9b2e2c5250cc4658ef5629b4297984d03d9:.github/signing/healthconnector-dev.keystore.b64 > /tmp/healthconnector-dev.keystore.b64
+          base64 --decode /tmp/healthconnector-dev.keystore.b64 > "$HC_SIGNING_STORE_FILE"
+          chmod 600 "$HC_SIGNING_STORE_FILE"
+          rm -f /tmp/healthconnector-dev.keystore.b64
+      - name: Build signed APK
+        run: gradle :app:assembleDebug --stacktrace
+      - name: Verify compatible signature
+        run: |
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | tee /tmp/apk-certs.txt
+          grep -F '319c0e1944727ba1128e6a8340bd68123b9e8b2cf328b0443e1e4a0387a85a80' /tmp/apk-certs.txt
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-connector-1.6.7-diagnostics
+          path: app/build/outputs/apk/debug/app-debug.apk
