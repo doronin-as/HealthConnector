@@ -57,6 +57,7 @@ class HealthSyncStreamer(
         endpoint: String,
         token: String,
         days: Int,
+        includeHistoricalChanges: Boolean = true,
         onProgress: (String) -> Unit
     ): SyncResult {
         val safeDays = days.coerceIn(1, 30)
@@ -73,21 +74,25 @@ class HealthSyncStreamer(
         } else {
             emptySet()
         }
-        // A DeletionChange contains only recordId, not its timestamp. Usually the server can
-        // recover the affected date from the raw row. To guarantee correctness even when that row
-        // was never exported by an older app version, any deletion triggers a rare 30-day rebuild.
-        val deletionSafetyDates = if (changes.deletedRecordIds.isNotEmpty()) {
-            (0L..29L).map { today.minusDays(it) }
+        // Keep periodic work bounded. One deletion must not expand a two-day background run
+        // into an unconditional 30-day rebuild.
+        val requestedDateSet = requestedDates.toSet()
+        val affectedDates = if (includeHistoricalChanges) {
+            changes.affectedDates
         } else {
-            emptyList()
+            changes.affectedDates.filterTo(linkedSetOf()) { it in requestedDateSet }
+        }
+        val mappedDeletionDates = if (includeHistoricalChanges) {
+            deletionDates
+        } else {
+            deletionDates.filterTo(linkedSetOf()) { it in requestedDateSet }
         }
 
         val oldestReadable = today.minusDays(29)
         val dates = linkedSetOf<LocalDate>().apply {
             addAll(requestedDates)
-            addAll(changes.affectedDates)
-            addAll(deletionDates)
-            addAll(deletionSafetyDates)
+            addAll(affectedDates)
+            addAll(mappedDeletionDates)
         }.filter { !it.isBefore(oldestReadable) && !it.isAfter(today) }
             .distinct()
             .sorted()
@@ -658,26 +663,75 @@ batcher.flush()
         return postBody(endpoint, body)
     }
 
-    private suspend fun postBody(endpoint: String, body: JSONObject): JSONObject? = withContext(Dispatchers.IO) {
-        val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
-        val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
-        connection.requestMethod = "POST"
-        connection.doOutput = true
-        connection.connectTimeout = 20_000
-        connection.readTimeout = 120_000
-        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-        connection.outputStream.buffered().use { output ->
-            body.toString().byteInputStream(Charsets.UTF_8).use { input -> input.copyTo(output, 16 * 1024) }
+    private suspend fun postBody(endpoint: String, body: JSONObject): JSONObject? {
+        val action = body.optString("action", "healthSync")
+        var attempt = 0
+        while (true) {
+            attempt++
+            try {
+                SyncDiagnostics.server(context, "Запрос $action, попытка $attempt/4")
+                val result = withContext(Dispatchers.IO) {
+                    val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
+                    val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
+                    try {
+                        connection.requestMethod = "POST"
+                        connection.doOutput = true
+                        connection.connectTimeout = 20_000
+                        connection.readTimeout = 90_000
+                        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                        connection.outputStream.buffered().use { output ->
+                            body.toString().byteInputStream(Charsets.UTF_8).use { input ->
+                                input.copyTo(output, 16 * 1024)
+                            }
+                        }
+                        val code = connection.responseCode
+                        val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
+                            ?.bufferedReader()?.use { it.readText() }.orEmpty()
+                        if (code !in 200..299) error("HTTP $code")
+                        if (response.isBlank()) return@withContext null
+                        val json = runCatching { JSONObject(response) }.getOrNull()
+                        if (json?.optBoolean("ok", true) == false) {
+                            val errorCode = json.optString("errorCode")
+                            val message = json.optString("message", response)
+                            error(if (errorCode.isBlank()) message else "$errorCode: $message")
+                        }
+                        json
+                    } finally {
+                        connection.disconnect()
+                    }
+                }
+                SyncDiagnostics.server(context, "Ответ $action получен", "OK")
+                return result
+            } catch (error: Throwable) {
+                val retryable = isRetryableRequestError(error)
+                if (!retryable || attempt >= 4) {
+                    SyncDiagnostics.server(
+                        context,
+                        "$action: ${error.message ?: error.javaClass.simpleName}",
+                        "ERROR"
+                    )
+                    throw error
+                }
+                val pauseMs = 1_500L * attempt
+                SyncDiagnostics.server(
+                    context,
+                    "$action: сервер занят или сеть не ответила; повтор через ${pauseMs / 1000.0} с",
+                    "WARNING"
+                )
+                delay(pauseMs)
+            }
         }
-        val code = connection.responseCode
-        val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
-            ?.bufferedReader()?.use { it.readText() }.orEmpty()
-        connection.disconnect()
-        if (code !in 200..299) error("HTTP $code")
-        if (response.isBlank()) return@withContext null
-        val json = runCatching { JSONObject(response) }.getOrNull()
-        if (json?.optBoolean("ok", true) == false) error(json.optString("message", response))
-        json
+    }
+
+    private fun isRetryableRequestError(error: Throwable): Boolean {
+        val value = (error.message ?: "").lowercase()
+        return error is java.net.SocketTimeoutException ||
+            "lock_busy" in value ||
+            "блокиров" in value ||
+            "timeout" in value ||
+            "timed out" in value ||
+            "http 429" in value ||
+            Regex("http 5\\d\\d").containsMatchIn(value)
     }
 
     private fun aggregateSleep(

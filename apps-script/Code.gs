@@ -111,7 +111,14 @@ function doGet() {
 function doPost(e) {
   const lock = LockService.getScriptLock();
   try {
-    lock.waitLock(30000);
+    if (!lock.tryLock(5000)) {
+      return json_({
+        ok: false,
+        errorCode: 'LOCK_BUSY',
+        error: 'Сервер занят другой синхронизацией',
+        message: 'Сервер занят другой синхронизацией. Приложение повторит запрос автоматически.'
+      });
+    }
     const payload = JSON.parse((e.postData && e.postData.contents) || '{}');
     if (!payload || typeof payload !== 'object') throw new Error('Пустой JSON');
 

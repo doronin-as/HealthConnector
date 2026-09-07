@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.7 — Sync diagnostics and lock recovery
+
+- Manual and background synchronization can no longer run in parallel inside the app.
+- A background run is skipped cleanly when a manual run is active instead of surfacing a lock timeout.
+- Google Sheets lock contention and transient network failures are retried automatically with backoff.
+- Added expandable diagnostics for manual sync, background sync, and Google Sheets/network stages.
+- Diagnostics record the stage, timestamp, retry, completion, and exact error category without storing the API token.
+- Apps Script returns a structured `LOCK_BUSY` response after a short wait so the client can retry.
+- The bounded-history behavior from the 1.6.6 hotfix is now part of the main source.
+
 ## 1.6.0 — Data Integrity
 
 - Daily cumulative metrics (steps, distance, calories, elevation, floors) now use Health Connect Aggregate API instead of summing raw records.

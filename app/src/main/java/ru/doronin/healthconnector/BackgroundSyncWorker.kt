@@ -6,6 +6,7 @@ import androidx.health.connect.client.HealthConnectFeatures
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.CancellationException
 
 class BackgroundSyncWorker(
     appContext: Context,
@@ -54,27 +55,56 @@ class BackgroundSyncWorker(
         }
 
         return try {
-            val result = HealthSyncStreamer(applicationContext, client).sync(
-                endpoint = safeEndpoint,
-                token = token,
-                days = BackgroundSyncScheduler.BACKGROUND_DAYS,
-                onProgress = { }
-            )
-            val now = System.currentTimeMillis()
-            prefs.edit()
-                .putLong(BackgroundSyncScheduler.PREF_LAST_RUN, now)
-                .putString(
-                    BackgroundSyncScheduler.PREF_LAST_STATUS,
-                    "Успешно: ${result.days} дн., ${result.workouts} трен., ${result.measurements} изм."
-                )
-                .putLong("dashboard_last_sync", now)
-                .putInt("dashboard_last_days", result.days)
-                .putInt("dashboard_last_workouts", result.workouts)
-                .putInt("dashboard_last_measurements", result.measurements)
-                .putInt("dashboard_last_sources", result.sources)
-                .putBoolean("dashboard_sheets_ok", true)
-                .apply()
-            Result.success()
+            val syncResult = SyncRunGate.tryRunBackground {
+                val runId = SyncDiagnostics.begin(applicationContext, "background")
+                try {
+                    val result = HealthSyncStreamer(applicationContext, client).sync(
+                        endpoint = safeEndpoint,
+                        token = token,
+                        days = BackgroundSyncScheduler.BACKGROUND_DAYS,
+                        includeHistoricalChanges = false,
+                        onProgress = { message ->
+                            SyncDiagnostics.progress(applicationContext, runId, "background", message)
+                        }
+                    )
+                    SyncDiagnostics.finish(
+                        applicationContext,
+                        runId,
+                        "background",
+                        "Успешно: ${result.days} дн., ${result.workouts} трен., ${result.measurements} изм."
+                    )
+                    result
+                } catch (error: Throwable) {
+                    SyncDiagnostics.failure(applicationContext, runId, "background", error)
+                    throw error
+                }
+            }
+
+            if (syncResult == null) {
+                val running = SyncRunGate.currentOrigin ?: "другой запуск"
+                val message = "Пропущено: уже выполняется $running"
+                SyncDiagnostics.skipped(applicationContext, "background", message)
+                saveBackgroundStatus(message)
+                Result.success()
+            } else {
+                val now = System.currentTimeMillis()
+                prefs.edit()
+                    .putLong(BackgroundSyncScheduler.PREF_LAST_RUN, now)
+                    .putString(
+                        BackgroundSyncScheduler.PREF_LAST_STATUS,
+                        "Успешно: ${syncResult.days} дн., ${syncResult.workouts} трен., ${syncResult.measurements} изм."
+                    )
+                    .putLong("dashboard_last_sync", now)
+                    .putInt("dashboard_last_days", syncResult.days)
+                    .putInt("dashboard_last_workouts", syncResult.workouts)
+                    .putInt("dashboard_last_measurements", syncResult.measurements)
+                    .putInt("dashboard_last_sources", syncResult.sources)
+                    .putBoolean("dashboard_sheets_ok", true)
+                    .apply()
+                Result.success()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: Throwable) {
             saveBackgroundStatus("Ошибка: ${error.message ?: error.javaClass.simpleName}")
             if (runAttemptCount < 3) Result.retry() else Result.failure()

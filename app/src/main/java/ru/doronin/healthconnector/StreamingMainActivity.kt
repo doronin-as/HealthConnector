@@ -133,6 +133,7 @@ class StreamingMainActivity : AppCompatActivity() {
         binding.days.setText(prefs.getInt("days", 7).toString())
 
         setupBackgroundSyncControls()
+        setupDiagnosticsControls()
         BackgroundSyncScheduler.apply(this)
 
         binding.exportConfig.setOnClickListener {
@@ -156,6 +157,45 @@ class StreamingMainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshBackgroundInfo()
+    }
+
+    private fun setupDiagnosticsControls() {
+        val container = binding.syncPage.getChildAt(0) as? LinearLayout ?: return
+        val card = MaterialCardView(this).apply {
+            radius = dp(20).toFloat()
+            strokeWidth = dp(1)
+            cardElevation = 0f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(10))
+        }
+        content.addView(TextView(this).apply {
+            text = "Диагностика синхронизации"
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        content.addView(TextView(this).apply {
+            text = "Нажми на раздел: внутри видны этап, время, повторные попытки и точное место ошибки."
+            textSize = 13f
+            alpha = 0.70f
+            setPadding(0, dp(6), 0, dp(4))
+        })
+        addDiagnosticDropdown(this, content, "Ручная синхронизация") {
+            SyncDiagnostics.render(this, "manual")
+        }
+        addDiagnosticDropdown(this, content, "Фоновая синхронизация") {
+            SyncDiagnostics.render(this, "background")
+        }
+        addDiagnosticDropdown(this, content, "Google Sheets и сеть") {
+            SyncDiagnostics.render(this, "server")
+        }
+        card.addView(content)
+        container.addView(card)
     }
 
     private fun setupBackgroundSyncControls() {
@@ -259,9 +299,34 @@ class StreamingMainActivity : AppCompatActivity() {
         }
 
         runCatching {
-            val streamer = HealthSyncStreamer(this, client)
-            streamer.sync(settings.endpoint, settings.token, settings.days) { message ->
-                binding.status.text = message
+            SyncRunGate.runManual(
+                onWaiting = { running ->
+                    binding.status.text = "Жду завершения ${running ?: "другой"} синхронизации…"
+                }
+            ) {
+                val runId = SyncDiagnostics.begin(this, "manual")
+                try {
+                    val streamer = HealthSyncStreamer(this, client)
+                    val result = streamer.sync(
+                        settings.endpoint,
+                        settings.token,
+                        settings.days,
+                        includeHistoricalChanges = true
+                    ) { message ->
+                        SyncDiagnostics.progress(this, runId, "manual", message)
+                        binding.status.text = message
+                    }
+                    SyncDiagnostics.finish(
+                        this,
+                        runId,
+                        "manual",
+                        "Дней ${result.days}, тренировок ${result.workouts}, измерений ${result.measurements}"
+                    )
+                    result
+                } catch (error: Throwable) {
+                    SyncDiagnostics.failure(this, runId, "manual", error)
+                    throw error
+                }
             }
         }.onSuccess { result ->
             binding.status.text =
