@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.8 — Security hardening and FatSecret import parity
+
+- Prevent Google Sheets formula injection from external FatSecret food text.
+- Use one tested `FatSecretCsvNormalizer` for both Android Share and manual CSV imports.
+- Build and publish a non-debuggable, minified signed release APK instead of `app-debug.apk`.
+- Remove the browser/file `ACTION_VIEW` entry point from `ShareCsvActivity`.
+- Compare API tokens using fixed-size HMAC digests without prefix-dependent early exit.
+- Deduplicate Health Connect permission-failure detection and use asynchronous diagnostics persistence.
+- Reuse already-read day records for same-day workout summaries; keep a direct-read fallback for cross-midnight sessions.
+- Remove unused Apps Script diary synchronization functions and add FatSecret normalizer unit tests.
+- Treat an empty Health Connect pagination token as terminal to avoid platform-specific read loops.
+
 ## 1.6.7 — Sync diagnostics and lock recovery
 
 - Manual and background synchronization can no longer run in parallel inside the app.

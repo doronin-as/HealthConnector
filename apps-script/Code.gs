@@ -123,7 +123,7 @@ function doPost(e) {
     if (!payload || typeof payload !== 'object') throw new Error('Пустой JSON');
 
     const expectedToken = PropertiesService.getScriptProperties().getProperty('API_TOKEN');
-    if (!expectedToken || payload.token !== expectedToken) {
+    if (!expectedToken || !constantTimeTokenEquals_(payload.token, expectedToken)) {
       throw new Error('Неверный API-токен');
     }
 
@@ -153,6 +153,33 @@ function doPost(e) {
   } finally {
     try { lock.releaseLock(); } catch (_) {}
   }
+}
+
+function constantTimeTokenEquals_(actual, expected) {
+  const actualText = String(actual == null ? '' : actual);
+  const expectedText = String(expected == null ? '' : expected);
+  if (!expectedText || actualText.length !== expectedText.length) return false;
+
+  // Compare fixed-size HMAC digests without an early exit. The expected token
+  // itself never becomes an observable comparison prefix.
+  const marker = 'HealthConnector API token verification v1';
+  const actualDigest = Utilities.computeHmacSha256Signature(marker, actualText);
+  const expectedDigest = Utilities.computeHmacSha256Signature(marker, expectedText);
+  let diff = 0;
+  for (let i = 0; i < expectedDigest.length; i++) {
+    diff |= (actualDigest[i] & 0xff) ^ (expectedDigest[i] & 0xff);
+  }
+  return diff === 0;
+}
+
+/**
+ * Google Sheets interprets external text beginning with =, +, - or @ as a
+ * formula. Prefixing an apostrophe forces literal text while keeping the
+ * displayed value readable. Apply this at the final write boundary.
+ */
+function sheetSafeExternalText_(value) {
+  const text = String(value == null ? '' : value);
+  return /^[=+\-@]/.test(text) ? `'${text}` : text;
 }
 
 function validateHealthPayload_(payload) {
@@ -517,7 +544,7 @@ function upsertFatSecretMeals_(sheet, parsed, fileName, spreadsheet) {
       meal.carbs,
       meal.fat,
       meal.kcal,
-      meal.foods.join(' | '),
+      sheetSafeExternalText_(meal.foods.join(' | ')),
       IMPORT_STATUS,
       `Импорт: ${fileName}; ${Utilities.formatDate(new Date(), tz, 'dd.MM.yyyy HH:mm')}`
     ]];
@@ -557,38 +584,6 @@ function upsertNutritionDays_(sheet, days, spreadsheet) {
       sheet.getRange(newRow, 1, 1, 5).setValues(values);
       existing.set(day.key, newRow);
     }
-  });
-}
-
-function syncDiaryFoodSnack_(spreadsheet, days) {
-  const sheet = spreadsheet.getSheetByName(DIARY_SHEET);
-  if (!sheet || !days.length) return;
-
-  const headerInfo = findHeader_(sheet);
-  if (!headerInfo) return;
-  const { row: headerRow, map } = headerInfo;
-  const dateColumn = findAlias_(map, ['дата']);
-  const snackColumn = findAlias_(map, ['полдник/перекус', 'полдник перекус']);
-  if (!dateColumn || !snackColumn) return;
-
-  // Важно: не используем setFormula(). Русская локаль Google Sheets использует
-  // другой синтаксис функций/разделителей. Пишем готовое числовое значение.
-  const snackByDate = new Map();
-  days.forEach(day => {
-    const total = (day.meals || [])
-      .filter(meal => meal.meal === 'Полдник' || meal.meal === 'Перекус/Другое')
-      .reduce((sum, meal) => sum + Number(meal.kcal || 0), 0);
-    snackByDate.set(day.key, round2_(total));
-  });
-
-  const tz = spreadsheet.getSpreadsheetTimeZone();
-  const lastRow = sheet.getLastRow();
-  if (lastRow <= headerRow) return;
-  const dateValues = sheet.getRange(headerRow + 1, dateColumn, lastRow - headerRow, 1).getValues();
-  dateValues.forEach((rowValue, idx) => {
-    const key = normalizeDateWithTz_(rowValue[0], tz);
-    if (!snackByDate.has(key)) return;
-    sheet.getRange(headerRow + 1 + idx, snackColumn).setValue(snackByDate.get(key));
   });
 }
 
@@ -654,63 +649,6 @@ function upsertByKey_(sheet, rows, keyColumnOneBased) {
     sheet.getRange(sheet.getLastRow() + 1, 1, appends.length, appends[0].length)
       .setValues(appends);
   }
-}
-
-function syncDiary_(spreadsheet, days) {
-  const sheet = spreadsheet.getSheetByName(DIARY_SHEET);
-  if (!sheet || !days.length) return;
-
-  const headerInfo = findHeader_(sheet);
-  if (!headerInfo) return;
-  const { row: headerRow, map } = headerInfo;
-  const dateColumn = findAlias_(map, ['дата']);
-  if (!dateColumn) return;
-
-  const aliases = {
-    steps: ['шаги', 'количество шагов'],
-    distanceKm: ['расстояние км', 'дистанция км', 'расстояние'],
-    activeCaloriesKcal: ['активные калории', 'активные ккал'],
-    sleepHours: ['сон ч', 'сон часов', 'продолжительность сна', 'сон'],
-    restingHeartRate: ['пульс покоя', 'пульс в покое'],
-    averageSpO2: ['spo2', 'сатурация', 'кислород'],
-    weightKg: ['вес кг', 'вес'],
-    workoutFlag: ['тренировка', 'тренировка да нет']
-  };
-
-  const targetColumns = {};
-  Object.keys(aliases).forEach(key => targetColumns[key] = findAlias_(map, aliases[key]));
-
-  const lastRow = Math.max(sheet.getLastRow(), headerRow + 1);
-  const existingDates = new Map();
-  if (lastRow > headerRow) {
-    const dateValues = sheet.getRange(headerRow + 1, dateColumn, lastRow - headerRow, 1).getValues();
-    dateValues.forEach((row, index) => {
-      const key = normalizeDateWithTz_(row[0], spreadsheet.getSpreadsheetTimeZone());
-      if (key) existingDates.set(key, headerRow + 1 + index);
-    });
-  }
-
-  days.forEach(day => {
-    const dateKey = day.date;
-    let row = existingDates.get(dateKey);
-    if (!row) {
-      row = sheet.getLastRow() + 1;
-      const tz = spreadsheet.getSpreadsheetTimeZone();
-      const d = Utilities.parseDate(`${dateKey} 00:00`, tz, 'yyyy-MM-dd HH:mm');
-      sheet.getRange(row, dateColumn).setValue(d);
-      existingDates.set(dateKey, row);
-    }
-    setIfMapped_(sheet, row, targetColumns.steps, day.steps);
-    setIfMapped_(sheet, row, targetColumns.distanceKm, day.distanceKm);
-    setIfMapped_(sheet, row, targetColumns.activeCaloriesKcal, day.activeCaloriesKcal);
-    setIfMapped_(sheet, row, targetColumns.sleepHours, day.sleepHours);
-    setIfMapped_(sheet, row, targetColumns.restingHeartRate, day.restingHeartRate);
-    setIfMapped_(sheet, row, targetColumns.averageSpO2, day.averageSpO2);
-    setIfMapped_(sheet, row, targetColumns.weightKg, day.weightKg);
-    if (targetColumns.workoutFlag) {
-      sheet.getRange(row, targetColumns.workoutFlag).setValue(Number(day.workoutCount || 0) > 0 ? 'Да' : 'Нет');
-    }
-  });
 }
 
 function findHeader_(sheet) {

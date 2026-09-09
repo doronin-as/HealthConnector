@@ -146,6 +146,10 @@ class HealthSyncStreamer(
         val cyclingCadenceStats = Stats()
         val powerStats = Stats()
 
+        // One holder keeps the suspend state machine compact while retaining the
+        // records already read for this day for workout summaries.
+        val workoutDayRecords = WorkoutDayRecords()
+
         var sleepSummary = SleepAggregation.empty()
         val sleepSessions = JSONArray()
         val workouts = JSONArray()
@@ -202,22 +206,26 @@ class HealthSyncStreamer(
 
         // Interval totals: one type is loaded, summarized, emitted and then becomes collectible.
         run {
-            val records = safeReadAll<StepsRecord>(dayStart, dayEnd)
+            workoutDayRecords.steps = safeReadAll<StepsRecord>(dayStart, dayEnd)
+            val records = workoutDayRecords.steps
             addSources(records, sources)
             for (r in records) emit("Steps", null, r.startTime, r.endTime, r.count, "steps", r)
         }
         run {
-            val records = safeReadAll<DistanceRecord>(dayStart, dayEnd)
+            workoutDayRecords.distance = safeReadAll<DistanceRecord>(dayStart, dayEnd)
+            val records = workoutDayRecords.distance
             addSources(records, sources)
             for (r in records) emit("Distance", null, r.startTime, r.endTime, r.distance.inKilometers, "km", r)
         }
         run {
-            val records = safeReadAll<ActiveCaloriesBurnedRecord>(dayStart, dayEnd)
+            workoutDayRecords.activeCalories = safeReadAll<ActiveCaloriesBurnedRecord>(dayStart, dayEnd)
+            val records = workoutDayRecords.activeCalories
             addSources(records, sources)
             for (r in records) emit("ActiveCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
         run {
-            val records = safeReadAll<TotalCaloriesBurnedRecord>(dayStart, dayEnd)
+            workoutDayRecords.totalCalories = safeReadAll<TotalCaloriesBurnedRecord>(dayStart, dayEnd)
+            val records = workoutDayRecords.totalCalories
             addSources(records, sources)
             for (r in records) emit("TotalCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
@@ -265,7 +273,8 @@ class HealthSyncStreamer(
         // High-frequency data is never flattened into another giant list. Samples are accumulated
         // into primitive statistics and streamed straight into measurement batches.
         run {
-            val records = preferBestSource(safeReadAll<HeartRateRecord>(dayStart, dayEnd))
+            workoutDayRecords.heartRate = safeReadAll<HeartRateRecord>(dayStart, dayEnd)
+            val records = preferBestSource(workoutDayRecords.heartRate)
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -334,17 +343,20 @@ class HealthSyncStreamer(
             }
         }
         run {
-            val records = safeReadAll<ElevationGainedRecord>(dayStart, dayEnd)
+            workoutDayRecords.elevation = safeReadAll<ElevationGainedRecord>(dayStart, dayEnd)
+            val records = workoutDayRecords.elevation
             addSources(records, sources)
             for (r in records) emit("ElevationGained", null, r.startTime, r.endTime, r.elevation.inMeters, "m", r)
         }
         run {
-            val records = safeReadAll<FloorsClimbedRecord>(dayStart, dayEnd)
+            workoutDayRecords.floors = safeReadAll<FloorsClimbedRecord>(dayStart, dayEnd)
+            val records = workoutDayRecords.floors
             addSources(records, sources)
             for (r in records) emit("FloorsClimbed", null, r.startTime, r.endTime, r.floors, "floors", r)
         }
         run {
-            val records = preferBestSource(safeReadAll<SpeedRecord>(dayStart, dayEnd))
+            workoutDayRecords.speed = safeReadAll<SpeedRecord>(dayStart, dayEnd)
+            val records = preferBestSource(workoutDayRecords.speed)
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -357,7 +369,8 @@ class HealthSyncStreamer(
             }
         }
         run {
-            val records = preferBestSource(safeReadAll<StepsCadenceRecord>(dayStart, dayEnd))
+            workoutDayRecords.stepCadence = safeReadAll<StepsCadenceRecord>(dayStart, dayEnd)
+            val records = preferBestSource(workoutDayRecords.stepCadence)
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -369,7 +382,8 @@ class HealthSyncStreamer(
             }
         }
         run {
-            val records = preferBestSource(safeReadAll<CyclingPedalingCadenceRecord>(dayStart, dayEnd))
+            workoutDayRecords.cyclingCadence = safeReadAll<CyclingPedalingCadenceRecord>(dayStart, dayEnd)
+            val records = preferBestSource(workoutDayRecords.cyclingCadence)
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -381,7 +395,8 @@ class HealthSyncStreamer(
             }
         }
         run {
-            val records = preferBestSource(safeReadAll<PowerRecord>(dayStart, dayEnd))
+            workoutDayRecords.power = safeReadAll<PowerRecord>(dayStart, dayEnd)
+            val records = preferBestSource(workoutDayRecords.power)
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -406,7 +421,7 @@ class HealthSyncStreamer(
         addSources(workoutRecords, sources)
 
         for (record in workoutRecords) {
-            workouts.put(buildWorkoutJson(record, sources))
+            workouts.put(buildWorkoutJson(record, workoutDayRecords, dayEnd, sources))
         }
 
         // Make sure the final partial measurement batch is persisted before the day summary.
@@ -519,58 +534,86 @@ batcher.flush()
 
     private suspend fun buildWorkoutJson(
         record: ExerciseSessionRecord,
+        dayRecords: WorkoutDayRecords,
+        dayEnd: Instant,
         sources: MutableSet<String>
     ): JSONObject {
         val start = record.startTime
         val end = record.endTime
+        val crossesDayBoundary = end > dayEnd
 
+        // For normal same-day sessions use records already fetched by syncDay. A rare
+        // session crossing midnight falls back to a direct range read to preserve the
+        // original behavior for the part that is outside the cached day.
         val steps = run {
-            val r = preferBestSource(safeReadAll<StepsRecord>(start, end)); addSources(r, sources); r.sumOf { it.count }
+            val candidate = if (crossesDayBoundary) safeReadAll<StepsRecord>(start, end)
+            else dayRecords.steps.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.count }
         }
         val distance = run {
-            val r = preferBestSource(safeReadAll<DistanceRecord>(start, end)); addSources(r, sources); r.sumOf { it.distance.inKilometers }
+            val candidate = if (crossesDayBoundary) safeReadAll<DistanceRecord>(start, end)
+            else dayRecords.distance.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.distance.inKilometers }
         }
         val activeCalories = run {
-            val r = preferBestSource(safeReadAll<ActiveCaloriesBurnedRecord>(start, end)); addSources(r, sources); r.sumOf { it.energy.inKilocalories }
+            val candidate = if (crossesDayBoundary) safeReadAll<ActiveCaloriesBurnedRecord>(start, end)
+            else dayRecords.activeCalories.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.energy.inKilocalories }
         }
         val totalCalories = run {
-            val r = preferBestSource(safeReadAll<TotalCaloriesBurnedRecord>(start, end)); addSources(r, sources); r.sumOf { it.energy.inKilocalories }
+            val candidate = if (crossesDayBoundary) safeReadAll<TotalCaloriesBurnedRecord>(start, end)
+            else dayRecords.totalCalories.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.energy.inKilocalories }
         }
         val heart = run {
             val stats = Stats()
-            val r = preferBestSource(safeReadAll<HeartRateRecord>(start, end)); addSources(r, sources)
+            val candidate = if (crossesDayBoundary) safeReadAll<HeartRateRecord>(start, end)
+            else dayRecords.heartRate.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.beatsPerMinute.toDouble())
             stats
         }
         val speed = run {
             val stats = Stats()
-            val r = preferBestSource(safeReadAll<SpeedRecord>(start, end)); addSources(r, sources)
+            val candidate = if (crossesDayBoundary) safeReadAll<SpeedRecord>(start, end)
+            else dayRecords.speed.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.speed.inKilometersPerHour)
             stats
         }
         val stepCadence = run {
             val stats = Stats()
-            val r = preferBestSource(safeReadAll<StepsCadenceRecord>(start, end)); addSources(r, sources)
+            val candidate = if (crossesDayBoundary) safeReadAll<StepsCadenceRecord>(start, end)
+            else dayRecords.stepCadence.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.rate)
             stats
         }
         val cyclingCadence = run {
             val stats = Stats()
-            val r = preferBestSource(safeReadAll<CyclingPedalingCadenceRecord>(start, end)); addSources(r, sources)
+            val candidate = if (crossesDayBoundary) safeReadAll<CyclingPedalingCadenceRecord>(start, end)
+            else dayRecords.cyclingCadence.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.revolutionsPerMinute)
             stats
         }
         val power = run {
             val stats = Stats()
-            val r = preferBestSource(safeReadAll<PowerRecord>(start, end)); addSources(r, sources)
+            val candidate = if (crossesDayBoundary) safeReadAll<PowerRecord>(start, end)
+            else dayRecords.power.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.power.inWatts)
             stats
         }
         val elevation = run {
-            val r = preferBestSource(safeReadAll<ElevationGainedRecord>(start, end)); addSources(r, sources); r.sumOf { it.elevation.inMeters }
+            val candidate = if (crossesDayBoundary) safeReadAll<ElevationGainedRecord>(start, end)
+            else dayRecords.elevation.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.elevation.inMeters }
         }
         val floors = run {
-            val r = preferBestSource(safeReadAll<FloorsClimbedRecord>(start, end)); addSources(r, sources); r.sumOf { it.floors }
+            val candidate = if (crossesDayBoundary) safeReadAll<FloorsClimbedRecord>(start, end)
+            else dayRecords.floors.filter { it.startTime < end && it.endTime > start }
+            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.floors }
         }
 
         return JSONObject().apply {
@@ -945,7 +988,7 @@ batcher.flush()
             } catch (error: Exception) {
                 // Android may wrap SecurityException inside HealthConnectException.
                 // Missing permission for an optional metric must not abort the whole sync.
-                if (isPermissionFailure(error)) {
+                if (HealthConnectErrorUtils.isPermissionFailure(error)) {
                     permissionDeniedTypes += typeKey<T>()
                     return emptyList()
                 }
@@ -976,25 +1019,6 @@ batcher.flush()
         is MetricRead.PermissionDenied -> null
     }
 
-    private fun isPermissionFailure(error: Throwable): Boolean {
-        var current: Throwable? = error
-        repeat(8) {
-            val value = current ?: return false
-            if (value is SecurityException) return true
-
-            val message = value.message.orEmpty()
-            if (
-                message.contains("SecurityException", ignoreCase = true) ||
-                message.contains("does not have permission", ignoreCase = true) ||
-                message.contains("permission to read data", ignoreCase = true) ||
-                message.contains("permission denied", ignoreCase = true)
-            ) {
-                return true
-            }
-            current = value.cause
-        }
-        return false
-    }
 
     private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {
         val all = ArrayList<T>()
@@ -1010,7 +1034,7 @@ batcher.flush()
             )
             all.addAll(response.records)
             pageToken = response.pageToken
-        } while (pageToken != null)
+        } while (!pageToken.isNullOrEmpty())
         return all
     }
 
@@ -1028,6 +1052,20 @@ batcher.flush()
         val measurements: Int,
         val sources: Int
     )
+
+    private class WorkoutDayRecords {
+        var steps: List<StepsRecord> = emptyList()
+        var distance: List<DistanceRecord> = emptyList()
+        var activeCalories: List<ActiveCaloriesBurnedRecord> = emptyList()
+        var totalCalories: List<TotalCaloriesBurnedRecord> = emptyList()
+        var heartRate: List<HeartRateRecord> = emptyList()
+        var speed: List<SpeedRecord> = emptyList()
+        var stepCadence: List<StepsCadenceRecord> = emptyList()
+        var cyclingCadence: List<CyclingPedalingCadenceRecord> = emptyList()
+        var power: List<PowerRecord> = emptyList()
+        var elevation: List<ElevationGainedRecord> = emptyList()
+        var floors: List<FloorsClimbedRecord> = emptyList()
+    }
 
     private data class DayResult(
         val workouts: Int,

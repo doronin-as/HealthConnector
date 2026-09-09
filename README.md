@@ -2,7 +2,7 @@
 
 Android-приложение для сбора персональных health-данных из **Android Health Connect** и импорта пищевого дневника из **FatSecret** в Google Sheets через Google Apps Script.
 
-Текущее состояние: **1.6.5** (`versionCode 19`).
+Текущее состояние: **1.6.8** (`versionCode 22`).
 
 > Важно: FatSecret-интеграция работает **не** как подключаемое приложение внутри списка интеграций FatSecret. Отчёт передаётся через Android **«Поделиться» → «FatSecret → Health Connector 2»**.
 
@@ -107,6 +107,15 @@ Share receiver переведён на wildcard `*/*`, потому что на 
 
 Причиной доработки был реальный integrity error за 01.09.2026: суточный итог FatSecret был 2568 kcal, а распознанные meal blocks давали только 2434 kcal. Дополнительные слоты ранее не входили в набор известных категорий.
 
+### 1.6.8
+
+- Share и ручной импорт используют один `FatSecretCsvNormalizer`; добавлены unit-тесты meal-slot mapping/merge и CSV quoting.
+- Текст продуктов из внешнего CSV экранируется перед записью в Google Sheets от formula injection (`=`, `+`, `-`, `@`).
+- Стабильный APK переведён с debug на подписанный release build (`debuggable=false`, R8).
+- Удалён `ACTION_VIEW/BROWSABLE` вход для произвольных файлов; остаётся пользовательский Android Share flow.
+- Удалены мёртвые Apps Script diary-функции и дубли `isPermissionFailure()`.
+- Workout summaries переиспользуют дневные Health Connect records вместо повторных запросов на каждую тренировку.
+
 ## Архитектура проекта
 
 ```text
@@ -114,10 +123,13 @@ app/
   Android application
 
 app/src/main/java/ru/doronin/healthconnector/ShareCsvActivity.kt
-  Приём FatSecret Share Intent, CSV parser, meal-slot normalization/merge, POST.
+  Приём FatSecret Share Intent и POST.
+
+app/src/main/java/ru/doronin/healthconnector/FatSecretCsvNormalizer.kt
+  Общий CSV parser и meal-slot normalization/merge для Share и ручного импорта.
 
 app/src/main/AndroidManifest.xml
-  Health Connect READ permissions, Share/View intent filters.
+  Health Connect READ permissions и Share intent filters.
 
 apps-script/Code.gs
   Google Apps Script endpoint, Health Connect import, FatSecret parser,
@@ -195,7 +207,7 @@ HC_SIGNING_KEY_PASSWORD
 health-connector-apk
 ```
 
-Если signing secret отсутствует, CI выполняет compile/security check, но stable APK не публикует.
+CI запускает unit-тесты и собирает настоящий `release` (`debuggable=false`, R8 включён). Если signing secret отсутствует, release compile/security check проходит, но stable APK не публикуется.
 
 ## Быстрая диагностика FatSecret
 
@@ -219,12 +231,11 @@ kcal meals=..., daily=...
 
 Приоритетные задачи:
 
-1. Добавить regression tests/CSV fixtures для всех основных и дополнительных FatSecret meal slots.
-2. Сохранить обезличенный реальный проблемный CSV как fixture.
-3. Добавить локальную integrity-проверку CSV в Android до отправки на сервер.
-4. При необходимости сохранять исходный `SourceMealSlot`, даже если каноническая категория остаётся `Перекус/Другое`.
-5. Автоматизировать version tags / GitHub Releases и прикладывать проверенный APK к release, а не искать его среди Actions artifacts.
-6. Решить явно, поддерживаем ли несколько файлов в `ACTION_SEND_MULTIPLE` или только один отчёт за импорт.
+1. Расширить regression fixtures реальным обезличенным проблемным CSV и английскими вариантами отчёта.
+2. Добавить локальную integrity-проверку CSV в Android до отправки на сервер.
+3. При необходимости сохранять исходный `SourceMealSlot`, даже если каноническая категория остаётся `Перекус/Другое`.
+4. Автоматизировать version tags / GitHub Releases и прикладывать проверенный APK к release, а не искать его среди Actions artifacts.
+5. Решить явно, поддерживаем ли несколько файлов в `ACTION_SEND_MULTIPLE` или только один отчёт за импорт.
 
 ## Правило для будущих изменений
 

@@ -1,6 +1,6 @@
 # FatSecret import — архитектура, ограничения и runbook
 
-> Актуально для **HealthConnector 1.6.5** (`versionCode 19`), 02.09.2026.
+> Актуально для **HealthConnector 1.6.8** (`versionCode 22`), 10.09.2026.
 >
 > Этот документ нужен как рабочая память проекта: что уже реализовано, почему реализация устроена именно так, где диагностировать ошибки и что делать при следующих изменениях FatSecret.
 
@@ -52,8 +52,9 @@ FatSecret передаёт экспортированный пищевой от�
 `ShareCsvActivity` зарегистрирована для:
 
 - `ACTION_SEND` + `*/*`;
-- `ACTION_SEND_MULTIPLE` + `*/*`;
-- `ACTION_VIEW` для `content://` / `file://` и известных текстовых/CSV MIME-типов.
+- `ACTION_SEND_MULTIPLE` + `*/*`.
+
+`ACTION_VIEW` / `BROWSABLE` для файлов удалён в 1.6.8: произвольный `content://`/`file://` больше нельзя передать импортеру через браузерную/VIEW-ссылку. Ручной импорт выполняется через внутренний file picker приложения.
 
 Wildcard `*/*` для Share используется намеренно. На разных версиях FatSecret / Android / MIUI отчёт может приходить как `text/*`, `application/csv`, `application/vnd.ms-excel`, `application/octet-stream` или другой MIME. Слишком узкий intent-filter приводил к тому, что HealthConnector вообще не появлялся в системном меню «Поделиться».
 
@@ -62,7 +63,6 @@ Wildcard `*/*` для Share используется намеренно. На р
 - `Intent.EXTRA_STREAM`;
 - `ACTION_SEND_MULTIPLE` (сейчас обрабатывается первый URI);
 - `ClipData`;
-- `Intent.data`;
 - `EXTRA_TEXT`;
 - `EXTRA_HTML_TEXT`.
 
@@ -123,9 +123,9 @@ protein meals=176.04, daily=188.63
 
 ---
 
-## 4. Канонизация приёмов пищи в 1.6.5
+## 4. Канонизация приёмов пищи в 1.6.8
 
-Файл: `app/src/main/java/ru/doronin/healthconnector/ShareCsvActivity.kt`
+Файл: `app/src/main/java/ru/doronin/healthconnector/FatSecretCsvNormalizer.kt`
 
 ### Остаются отдельными
 
@@ -183,7 +183,7 @@ index 4 → carbs
 index 7 → protein
 ```
 
-Суммирование выполняется в `mergeMealHeaders()`.
+Суммирование выполняется в `FatSecretCsvNormalizer.mergeMealHeaders()`. Один и тот же нормализатор вызывается и из `ShareCsvActivity`, и из ручной кнопки «Импорт CSV», поэтому оба пути имеют одинаковое поведение.
 
 CSV разбирается собственным `parseCsvRows()`, который учитывает:
 
@@ -223,6 +223,8 @@ MACRO_TOLERANCE = 0.2 g
 **Не увеличивать допуски только для того, чтобы скрыть ошибку импорта.** Большое расхождение почти всегда означает, что появился неизвестный слот/формат FatSecret или изменились колонки экспорта.
 
 ### Куда записываются данные
+
+После успешной проверки текстовые поля внешнего CSV дополнительно проходят защиту от Google Sheets formula injection: значения, начинающиеся с `=`, `+`, `-` или `@`, записываются как literal text.
 
 После успешной проверки:
 
@@ -323,7 +325,7 @@ HC_SIGNING_KEY_ALIAS
 HC_SIGNING_KEY_PASSWORD
 ```
 
-Если secret с ключом подписи отсутствует, workflow выполняет compile/security check, но **не публикует устанавливаемый stable APK**.
+Workflow всегда запускает unit-тесты и `assembleRelease`. Стабильная сборка имеет `debuggable=false` и проходит R8/minification. Если secret с ключом подписи отсутствует, workflow выполняет release compile/security check, но **не публикует устанавливаемый stable APK**.
 
 При наличии secrets артефакт называется:
 
@@ -334,7 +336,7 @@ health-connector-apk
 APK внутри сборки:
 
 ```text
-app/build/outputs/apk/debug/app-debug.apk
+app/build/outputs/apk/release/app-release.apk
 ```
 
 Не возвращать signing key в git и не хранить его в репозитории.
@@ -371,9 +373,9 @@ app/build/outputs/apk/debug/app-debug.apk
 
 ## 9. Что желательно сделать дальше
 
-### P0 — regression tests для FatSecret CSV
+### P0 — расширять regression tests для FatSecret CSV
 
-Сейчас основная защита — серверная проверка целостности и ручной тест. Нужно добавить набор небольших CSV fixtures:
+В 1.6.8 добавлены unit-тесты общего нормализатора. Следующий шаг — расширить набор небольших CSV fixtures:
 
 - только основные приёмы пищи;
 - `До Завтрака`;
@@ -407,7 +409,7 @@ Android уже понимает структуру блоков. Можно до
 
 ### P1 — автоматические GitHub Releases
 
-После успешного CI и ручной проверки создавать version tag (`v1.6.5`, `v1.6.6`, …) и прикладывать APK к GitHub Release. Тогда не придётся искать «последний правильный artifact» среди Actions runs.
+После успешного CI и ручной проверки создавать version tag (`v1.6.8`, `v1.6.9`, …) и прикладывать APK к GitHub Release. Тогда не придётся искать «последний правильный artifact» среди Actions runs.
 
 ### P2 — SEND_MULTIPLE
 
@@ -436,10 +438,13 @@ Wildcard `*/*` нужен для видимости в Android Share Sheet, но
 
 ```text
 app/src/main/java/ru/doronin/healthconnector/ShareCsvActivity.kt
-    Получение FatSecret Share Intent, CSV parsing/normalization/merge, POST.
+    Получение FatSecret Share Intent и POST.
+
+app/src/main/java/ru/doronin/healthconnector/FatSecretCsvNormalizer.kt
+    Общий CSV parsing/normalization/merge для Share и ручного импорта.
 
 app/src/main/AndroidManifest.xml
-    Health Connect permissions и Share/View intent filters.
+    Health Connect permissions и Share intent filters.
 
 apps-script/Code.gs
     API endpoint, FatSecret parser, integrity validation, запись в Google Sheets.

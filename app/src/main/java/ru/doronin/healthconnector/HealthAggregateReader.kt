@@ -53,7 +53,7 @@ class HealthAggregateReader(
                     sourcePackages = result.dataOrigins.map { it.packageName }.toSet()
                 )
             } catch (error: Throwable) {
-                if (isPermissionFailure(error)) {
+                if (HealthConnectErrorUtils.isPermissionFailure(error)) {
                     return MetricRead.PermissionDenied(error.message.orEmpty())
                 }
                 lastError = error
@@ -66,22 +66,6 @@ class HealthAggregateReader(
         )
     }
 
-    private fun isPermissionFailure(error: Throwable): Boolean {
-        var current: Throwable? = error
-        repeat(8) {
-            val value = current ?: return false
-            if (value is SecurityException) return true
-            val message = value.message.orEmpty()
-            if (
-                message.contains("SecurityException", ignoreCase = true) ||
-                message.contains("does not have permission", ignoreCase = true) ||
-                message.contains("permission to read data", ignoreCase = true) ||
-                message.contains("permission denied", ignoreCase = true)
-            ) return true
-            current = value.cause
-        }
-        return false
-    }
 
     data class DayAggregates(
         val steps: MetricRead<Long>,

@@ -431,13 +431,20 @@ class StreamingMainActivity : AppCompatActivity() {
                 require(csvText.isNotBlank()) { "CSV пустой" }
                 require(csvText.length <= 5_000_000) { "CSV слишком большой: максимум 5 МБ" }
 
-                binding.status.text = "Отправляю CSV в Google Таблицу…"
+                val normalized = FatSecretCsvNormalizer.normalize(csvText)
+                binding.status.text = if (normalized.normalizedMealLabels > 0) {
+                    "Объединяю дополнительные приёмы пищи…"
+                } else {
+                    "Отправляю CSV в Google Таблицу…"
+                }
                 val body = JSONObject().apply {
                     put("token", settings.token)
                     put("action", "fatsecretCsv")
                     put("fileName", fileName)
-                    put("csvText", csvText)
+                    put("csvText", normalized.csvText)
                     put("uploadedAt", Instant.now().toString())
+                    put("sourceMimeType", contentResolver.getType(uri).orEmpty())
+                    put("normalizedMealLabels", normalized.normalizedMealLabels)
                 }
                 postBody(settings.endpoint, body)
             }.onSuccess { response ->
