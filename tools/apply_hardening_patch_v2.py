@@ -33,6 +33,17 @@ if old_decl not in text:
     raise SystemExit('expanded workout cache declarations not found')
 text = text.replace(old_decl, new_decl, 1)
 
+# Remove the immutable cache construction produced by v1 before converting the
+# day-level assignments. The data will already live in the single mutable holder.
+constructor_start = text.find('        val workoutDayRecords = WorkoutDayRecords(\n')
+if constructor_start < 0:
+    raise SystemExit('redundant WorkoutDayRecords constructor start not found')
+constructor_end_marker = '        )\n        for (record in workoutRecords) {'
+constructor_end = text.find(constructor_end_marker, constructor_start)
+if constructor_end < 0:
+    raise SystemExit('redundant WorkoutDayRecords constructor end not found')
+text = text[:constructor_start] + '        for (record in workoutRecords) {' + text[constructor_end + len(constructor_end_marker):]
+
 mapping = {
     'dayStepsRecords': 'steps',
     'dayDistanceRecords': 'distance',
@@ -50,25 +61,6 @@ for old_name, field in mapping.items():
     text = text.replace(f'{old_name} = ', f'workoutDayRecords.{field} = ')
     text = text.replace(f'val records = {old_name}', f'val records = workoutDayRecords.{field}')
     text = text.replace(f'preferBestSource({old_name})', f'preferBestSource(workoutDayRecords.{field})')
-
-constructor_pattern = re.compile(
-    r'''        val workoutDayRecords = WorkoutDayRecords\(\n'''
-    r'''            steps = workoutDayRecords\.steps,\n'''
-    r'''            distance = workoutDayRecords\.distance,\n'''
-    r'''            activeCalories = workoutDayRecords\.activeCalories,\n'''
-    r'''            totalCalories = workoutDayRecords\.totalCalories,\n'''
-    r'''            heartRate = workoutDayRecords\.heartRate,\n'''
-    r'''            speed = workoutDayRecords\.speed,\n'''
-    r'''            stepCadence = workoutDayRecords\.stepCadence,\n'''
-    r'''            cyclingCadence = workoutDayRecords\.cyclingCadence,\n'''
-    r'''            power = workoutDayRecords\.power,\n'''
-    r'''            elevation = workoutDayRecords\.elevation,\n'''
-    r'''            floors = workoutDayRecords\.floors\n'''
-    r'''        \)\n'''
-)
-text, count = constructor_pattern.subn('', text, count=1)
-if count != 1:
-    raise SystemExit('redundant WorkoutDayRecords constructor not found')
 
 old_holder = '''    private data class WorkoutDayRecords(
         val steps: List<StepsRecord>,
