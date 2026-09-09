@@ -58,7 +58,11 @@ jobs:
 
       - name: Commit hardened sources
         run: |
-          rm -f tools/apply_hardening_patch.py tools/apply_hardening_patch_v2.py .github/workflows/apply-hardening-patch.yml .github/hardening-trigger
+          # Workflow files cannot be pushed by the default GITHUB_TOKEN. Keep
+          # them unchanged here; android.yml is updated directly after this run.
+          git checkout -- .github/workflows/android.yml .github/workflows/apply-hardening-patch.yml
+          rm -f tools/apply_hardening_patch.py tools/apply_hardening_patch_v2.py .github/hardening-trigger
+          rm -rf tools/__pycache__
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
