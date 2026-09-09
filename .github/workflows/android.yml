@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       HC_SIGNING_KEY_B64: ${{ secrets.HC_SIGNING_KEY_B64 }}
-      HC_SIGNING_STORE_FILE: /tmp/healthconnector-dev.keystore
+      HC_SIGNING_STORE_FILE: /tmp/healthconnector-release.keystore
       HC_SIGNING_STORE_PASSWORD: ${{ secrets.HC_SIGNING_STORE_PASSWORD }}
       HC_SIGNING_KEY_ALIAS: ${{ secrets.HC_SIGNING_KEY_ALIAS }}
       HC_SIGNING_KEY_PASSWORD: ${{ secrets.HC_SIGNING_KEY_PASSWORD }}
@@ -31,15 +31,25 @@ jobs:
           grep -F 'schemaVersion: 3' apps-script/Code.gs
           grep -F "payload.action === 'healthSyncV3'" apps-script/Code.gs
           grep -F "payload.action === 'healthChangesV3'" apps-script/Code.gs
-          ! grep -F 'syncDiary_(spreadsheet, payload.days || [])' apps-script/Code.gs
-          ! grep -F 'syncDiaryFoodSnack_(spreadsheet, parsed.days)' apps-script/Code.gs
+          ! grep -F 'function syncDiary_(' apps-script/Code.gs
+          ! grep -F 'function syncDiaryFoodSnack_(' apps-script/Code.gs
+          grep -F "sheetSafeExternalText_(meal.foods.join(' | '))" apps-script/Code.gs
+          grep -F 'constantTimeTokenEquals_(payload.token, expectedToken)' apps-script/Code.gs
           ! grep -F 'apiToken:' apps-script/Code.gs
           ! grep -R --include='*.kt' -F '.putString("token", token)' app/src/main/java
           ! grep -R --include='*.kt' -F 'prefs.getString("token"' app/src/main/java
           ! grep -R --include='*.kt' -F 'HTTP $code: $response' app/src/main/java
+          grep -F 'FatSecretCsvNormalizer.normalize(rawCsvText)' app/src/main/java/ru/doronin/healthconnector/ShareCsvActivity.kt
+          grep -F 'FatSecretCsvNormalizer.normalize(csvText)' app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+          ! grep -F 'android.intent.category.BROWSABLE' app/src/main/AndroidManifest.xml
           grep -F 'android:usesCleartextTraffic="false"' app/src/main/AndroidManifest.xml
+          grep -F 'isDebuggable = false' app/build.gradle.kts
+          grep -F 'isMinifyEnabled = true' app/build.gradle.kts
+          grep -F 'stableRelease' app/build.gradle.kts
           test ! -e .github/signing/healthconnector-dev.keystore.b64
-      - name: Restore stable development signing key
+      - name: Run unit tests
+        run: gradle :app:testReleaseUnitTest --stacktrace
+      - name: Restore stable release signing key
         if: env.HC_SIGNING_KEY_B64 != ''
         run: |
           printf '%s' "$HC_SIGNING_KEY_B64" | base64 --decode > "$HC_SIGNING_STORE_FILE"
@@ -48,20 +58,20 @@ jobs:
             -keystore "$HC_SIGNING_STORE_FILE" \
             -storepass "${HC_SIGNING_STORE_PASSWORD:-android}" \
             -alias "${HC_SIGNING_KEY_ALIAS:-androiddebugkey}" | grep -F "31:9C:0E:19:44:72:7B:A1:12:8E:6A:83:40:BD:68:12:3B:9E:8B:2C:F3:28:B0:44:3E:1E:4A:03:87:A8:5A:80"
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --stacktrace
-      - name: Verify stable APK signature
+      - name: Build release APK
+        run: gradle :app:assembleRelease --stacktrace
+      - name: Verify stable release APK signature
         if: env.HC_SIGNING_KEY_B64 != ''
         run: |
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)
-          "$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | tee /tmp/apk-certs.txt
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/release/app-release.apk | tee /tmp/apk-certs.txt
           grep -F "319c0e1944727ba1128e6a8340bd68123b9e8b2cf328b0443e1e4a0387a85a80" /tmp/apk-certs.txt
-      - name: Explain non-release build
+      - name: Explain unsigned CI build
         if: env.HC_SIGNING_KEY_B64 == ''
-        run: echo 'Stable signing secret is not configured; compile check passed but no installable release artifact will be published.'
-      - name: Upload stable APK
+        run: echo 'Stable signing secret is not configured; release compile/tests passed but no installable stable artifact will be published.'
+      - name: Upload stable release APK
         if: env.HC_SIGNING_KEY_B64 != ''
         uses: actions/upload-artifact@v4
         with:
           name: health-connector-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/release/app-release.apk

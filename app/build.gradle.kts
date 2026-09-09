@@ -13,7 +13,7 @@ android {
 
     signingConfigs {
         if (stableSigningStoreFile?.exists() == true) {
-            create("stableDebug") {
+            create("stableRelease") {
                 storeFile = stableSigningStoreFile
                 storePassword = System.getenv("HC_SIGNING_STORE_PASSWORD")
                     ?.takeIf { it.isNotBlank() } ?: "android"
@@ -29,13 +29,19 @@ android {
         applicationId = "ru.doronin.healthconnector.stable"
         minSdk = 26
         targetSdk = 35
-        versionCode = 21
-        versionName = "1.6.7"
+        versionCode = 22
+        versionName = "1.6.8"
     }
 
     buildTypes {
-        getByName("debug") {
-            signingConfigs.findByName("stableDebug")?.let { signingConfig = it }
+        getByName("release") {
+            isDebuggable = false
+            isMinifyEnabled = true
+            signingConfigs.findByName("stableRelease")?.let { signingConfig = it }
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 
@@ -56,4 +62,5 @@ dependencies {
     implementation("androidx.health.connect:connect-client:1.1.0")
     implementation("androidx.work:work-runtime-ktx:2.10.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    testImplementation("junit:junit:4.13.2")
 }

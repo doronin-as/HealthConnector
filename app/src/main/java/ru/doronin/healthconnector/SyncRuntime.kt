@@ -140,7 +140,7 @@ object SyncDiagnostics {
             put("message", message.take(700))
         }
         while (items.size > MAX_EVENTS) items.removeAt(0)
-        prefs.edit().putString(KEY_EVENTS, JSONArray(items).toString()).commit()
+        prefs.edit().putString(KEY_EVENTS, JSONArray(items).toString()).apply()
     }
 
     private fun readEvents(context: Context): List<JSONObject> {

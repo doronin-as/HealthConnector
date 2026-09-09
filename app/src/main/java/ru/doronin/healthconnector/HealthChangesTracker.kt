@@ -103,7 +103,7 @@ class HealthChangesTracker(
                     if (!keepReading) prefs.edit().putString(key, nextToken).apply()
                 } while (keepReading)
             } catch (error: Throwable) {
-                if (isPermissionFailure(error)) {
+                if (HealthConnectErrorUtils.isPermissionFailure(error)) {
                     // Keep other record-type tokens working. If permission is granted later,
                     // recreate this token and the normal lookback sync will fill recent history.
                     prefs.edit().remove(key).apply()
@@ -125,7 +125,7 @@ class HealthChangesTracker(
             ChangesTokenRequest(recordTypes = setOf(type as KClass<Record>))
         )
     } catch (error: Throwable) {
-        if (isPermissionFailure(error)) null else throw error
+        if (HealthConnectErrorUtils.isPermissionFailure(error)) null else throw error
     }
 
     private fun affectedDates(record: Record, zone: ZoneId): Set<LocalDate> = when (record) {
@@ -164,22 +164,6 @@ class HealthChangesTracker(
         return result
     }
 
-    private fun isPermissionFailure(error: Throwable): Boolean {
-        var current: Throwable? = error
-        repeat(8) {
-            val value = current ?: return false
-            if (value is SecurityException) return true
-            val message = value.message.orEmpty()
-            if (
-                message.contains("SecurityException", ignoreCase = true) ||
-                message.contains("does not have permission", ignoreCase = true) ||
-                message.contains("permission to read data", ignoreCase = true) ||
-                message.contains("permission denied", ignoreCase = true)
-            ) return true
-            current = value.cause
-        }
-        return false
-    }
 
     data class ChangeSet(
         val affectedDates: Set<LocalDate>,
