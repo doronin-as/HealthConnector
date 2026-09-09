@@ -1,0 +1,66 @@
+name: Apply security hardening patch
+
+on:
+  push:
+    branches: [ fix/security-hardening-fatsecret ]
+    paths:
+      - '.github/hardening-trigger'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply hardening changes
+        run: python3 tools/apply_hardening_patch.py
+
+      - name: Validate generated diff
+        run: |
+          git diff --check
+          python3 -m py_compile tools/apply_hardening_patch.py
+          cp apps-script/Code.gs /tmp/HealthConnectorCode.js
+          node --check /tmp/HealthConnectorCode.js
+          grep -F 'versionName = "1.6.8"' app/build.gradle.kts
+          grep -F 'versionCode = 22' app/build.gradle.kts
+          grep -F 'isDebuggable = false' app/build.gradle.kts
+          grep -F 'isMinifyEnabled = true' app/build.gradle.kts
+          grep -F 'FatSecretCsvNormalizer.normalize(rawCsvText)' app/src/main/java/ru/doronin/healthconnector/ShareCsvActivity.kt
+          grep -F 'FatSecretCsvNormalizer.normalize(csvText)' app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+          grep -F "sheetSafeExternalText_(meal.foods.join(' | '))" apps-script/Code.gs
+          ! grep -F 'function syncDiary_(' apps-script/Code.gs
+          ! grep -F 'function syncDiaryFoodSnack_(' apps-script/Code.gs
+          ! grep -R --include='*.kt' 'private fun isPermissionFailure' app/src/main/java
+          grep -R --include='*.kt' 'HealthConnectErrorUtils.isPermissionFailure' app/src/main/java
+          grep -F '.apply()' app/src/main/java/ru/doronin/healthconnector/SyncRuntime.kt
+          ! grep -F 'android.intent.category.BROWSABLE' app/src/main/AndroidManifest.xml
+          grep -F 'WorkoutDayRecords' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+          grep -F 'while (!pageToken.isNullOrEmpty())' app/src/main/java/ru/doronin/healthconnector/HealthSyncStreamer.kt
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Run tests and compile release
+        run: |
+          gradle :app:testReleaseUnitTest --stacktrace
+          gradle :app:assembleRelease --stacktrace
+
+      - name: Commit hardened sources
+        run: |
+          rm -f tools/apply_hardening_patch.py .github/workflows/apply-hardening-patch.yml .github/hardening-trigger
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Harden FatSecret import and release build'
+          git push origin HEAD:${GITHUB_REF_NAME}
