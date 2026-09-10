@@ -26,7 +26,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "ru.doronin.healthconnector.stable"
+        applicationId = "ru.doronin.healthconnector.side169"
         minSdk = 26
         targetSdk = 35
         versionCode = 23
