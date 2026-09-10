@@ -39,50 +39,42 @@ jobs:
           )
           text = replace_once(text, 'private const val MAX_EVENTS = 120', 'private const val MAX_EVENTS = 300', 'max events')
           text = replace_once(text, '        }.takeLast(35)\n', '        }.takeLast(80).asReversed()\n', 'latest events first')
-          old = '''    fun updateHeader() {
-              header.text = (if (details.visibility == View.VISIBLE) "▼ " else "▶ ") + title
-          }
-          updateHeader()
-          header.setOnClickListener {
-              details.visibility = if (details.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-              if (details.visibility == View.VISIBLE) details.text = detailsProvider()
-              updateHeader()
-          }
-          parent.addView(header)
-          parent.addView(details)
-          '''
-          new = '''    val handler = Handler(Looper.getMainLooper())
-          val refresher = object : Runnable {
-              override fun run() {
-                  if (details.visibility == View.VISIBLE && details.isAttachedToWindow) {
-                      details.text = detailsProvider()
-                      handler.postDelayed(this, 2_000L)
-                  }
-              }
-          }
-          fun updateHeader() {
-              header.text = (if (details.visibility == View.VISIBLE) "▼ " else "▶ ") + title
-          }
-          updateHeader()
-          header.setOnClickListener {
-              details.visibility = if (details.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-              handler.removeCallbacks(refresher)
-              if (details.visibility == View.VISIBLE) {
-                  details.text = detailsProvider()
-                  handler.postDelayed(refresher, 2_000L)
-              }
-              updateHeader()
-          }
-          details.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
-              override fun onViewAttachedToWindow(v: View) = Unit
-              override fun onViewDetachedFromWindow(v: View) {
-                  handler.removeCallbacks(refresher)
-              }
-          })
-          parent.addView(header)
-          parent.addView(details)
-          '''
-          text = replace_once(text, old, new, 'live diagnostic dropdown')
+          start = text.index('    fun updateHeader() {')
+          end_marker = '    parent.addView(details)\n'
+          end = text.index(end_marker, start) + len(end_marker)
+          new = (
+              '    val handler = Handler(Looper.getMainLooper())\n'
+              '    val refresher = object : Runnable {\n'
+              '        override fun run() {\n'
+              '            if (details.visibility == View.VISIBLE && details.isAttachedToWindow) {\n'
+              '                details.text = detailsProvider()\n'
+              '                handler.postDelayed(this, 2_000L)\n'
+              '            }\n'
+              '        }\n'
+              '    }\n'
+              '    fun updateHeader() {\n'
+              '        header.text = (if (details.visibility == View.VISIBLE) "▼ " else "▶ ") + title\n'
+              '    }\n'
+              '    updateHeader()\n'
+              '    header.setOnClickListener {\n'
+              '        details.visibility = if (details.visibility == View.VISIBLE) View.GONE else View.VISIBLE\n'
+              '        handler.removeCallbacks(refresher)\n'
+              '        if (details.visibility == View.VISIBLE) {\n'
+              '            details.text = detailsProvider()\n'
+              '            handler.postDelayed(refresher, 2_000L)\n'
+              '        }\n'
+              '        updateHeader()\n'
+              '    }\n'
+              '    details.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {\n'
+              '        override fun onViewAttachedToWindow(v: View) = Unit\n'
+              '        override fun onViewDetachedFromWindow(v: View) {\n'
+              '            handler.removeCallbacks(refresher)\n'
+              '        }\n'
+              '    })\n'
+              '    parent.addView(header)\n'
+              '    parent.addView(details)\n'
+          )
+          text = text[:start] + new + text[end:]
           runtime.write_text(text)
 
           activity = Path('app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt')
