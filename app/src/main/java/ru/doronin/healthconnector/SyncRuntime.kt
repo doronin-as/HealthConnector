@@ -1,6 +1,8 @@
 package ru.doronin.healthconnector
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -49,7 +51,7 @@ object SyncRunGate {
 object SyncDiagnostics {
     private const val PREFS = "settings"
     private const val KEY_EVENTS = "sync_diagnostic_events_v1"
-    private const val MAX_EVENTS = 120
+    private const val MAX_EVENTS = 300
 
     @Volatile private var activeRunId: String = ""
     @Volatile private var activeOrigin: String = ""
@@ -107,7 +109,7 @@ object SyncDiagnostics {
                     it.optString("stage").startsWith("SERVER")
             }
             else -> events.filter { it.optString("origin") == section }
-        }.takeLast(35)
+        }.takeLast(80).asReversed()
 
         if (filtered.isEmpty()) return "Записей пока нет."
         val formatter = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault())
@@ -209,15 +211,34 @@ fun addDiagnosticDropdown(
         setPadding(0, 0, 0, 18)
         setTextIsSelectable(true)
     }
+    val handler = Handler(Looper.getMainLooper())
+    val refresher = object : Runnable {
+        override fun run() {
+            if (details.visibility == View.VISIBLE && details.isAttachedToWindow) {
+                details.text = detailsProvider()
+                handler.postDelayed(this, 2_000L)
+            }
+        }
+    }
     fun updateHeader() {
         header.text = (if (details.visibility == View.VISIBLE) "▼ " else "▶ ") + title
     }
     updateHeader()
     header.setOnClickListener {
         details.visibility = if (details.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        if (details.visibility == View.VISIBLE) details.text = detailsProvider()
+        handler.removeCallbacks(refresher)
+        if (details.visibility == View.VISIBLE) {
+            details.text = detailsProvider()
+            handler.postDelayed(refresher, 2_000L)
+        }
         updateHeader()
     }
+    details.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+        override fun onViewAttachedToWindow(v: View) = Unit
+        override fun onViewDetachedFromWindow(v: View) {
+            handler.removeCallbacks(refresher)
+        }
+    })
     parent.addView(header)
     parent.addView(details)
 }

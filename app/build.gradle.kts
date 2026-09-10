@@ -29,8 +29,8 @@ android {
         applicationId = "ru.doronin.healthconnector.stable"
         minSdk = 26
         targetSdk = 35
-        versionCode = 26
-        versionName = "1.6.12"
+        versionCode = 27
+        versionName = "1.6.13"
     }
 
     buildTypes {
