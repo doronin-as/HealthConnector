@@ -19,7 +19,10 @@ object SyncRunGate {
     var currentOrigin: String? = null
         private set
 
-    suspend fun <T> runManual(onWaiting: (String?) -> Unit, block: suspend () -> T): T {
+    suspend fun <T> runManual(onWaiting: (String?) -> Unit, block: suspend () -> T): T? {
+        // A second manual tap must not queue another full sync or overwrite the
+        // progress text of the manual sync that is already running.
+        if (mutex.isLocked && currentOrigin == "manual") return null
         if (mutex.isLocked) onWaiting(currentOrigin)
         mutex.lock()
         currentOrigin = "manual"

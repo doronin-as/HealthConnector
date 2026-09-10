@@ -329,6 +329,9 @@ class StreamingMainActivity : AppCompatActivity() {
                 }
             }
         }.onSuccess { result ->
+            // null means the user tapped sync again while the existing manual run
+            // is still active. Keep that run's live progress visible and do nothing.
+            if (result == null) return@onSuccess
             binding.status.text =
                 "Синхронизация завершена: дней ${result.days}, тренировок ${result.workouts}, " +
                     "измерений ${result.measurements}, источников ${result.sources}"
