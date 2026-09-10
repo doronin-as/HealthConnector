@@ -74,6 +74,15 @@ class BackgroundSyncWorker(
                         "Успешно: ${result.days} дн., ${result.workouts} трен., ${result.measurements} изм."
                     )
                     result
+                } catch (cancelled: CancellationException) {
+                    // WorkManager can cancel a worker when constraints/state change.
+                    // Cancellation is lifecycle control, not an application failure.
+                    SyncDiagnostics.skipped(
+                        applicationContext,
+                        "background",
+                        "Фоновый запуск отменён системой; следующий запуск выполнится по расписанию"
+                    )
+                    throw cancelled
                 } catch (error: Throwable) {
                     SyncDiagnostics.failure(applicationContext, runId, "background", error)
                     throw error
