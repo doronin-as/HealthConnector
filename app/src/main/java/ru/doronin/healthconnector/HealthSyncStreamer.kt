@@ -270,6 +270,55 @@ class HealthSyncStreamer(
             }
         }
 
+        // Persist the dashboard-critical part of the day before processing high-frequency data.
+        // If a later raw-measurement upload is interrupted, HC_Дни and HC_Сон still stay current.
+        run {
+            val checkpointDay = JSONObject().apply { put("date", date.toString()) }
+            val checkpointFields = linkedSetOf<String>()
+            fun checkpointField(key: String, value: Any?) {
+                checkpointDay.put(key, value ?: JSONObject.NULL)
+                checkpointFields += key
+            }
+
+            if (aggregates.steps is MetricRead.Available) checkpointField("steps", stepsTotal)
+            if (aggregates.distance is MetricRead.Available) checkpointField("distanceKm", distanceKm)
+            if (aggregates.activeCalories is MetricRead.Available) checkpointField("activeCaloriesKcal", activeCaloriesKcal)
+            if (aggregates.totalCalories is MetricRead.Available) checkpointField("totalCaloriesKcal", totalCaloriesKcal)
+            if (aggregates.elevation is MetricRead.Available) checkpointField("elevationGainedM", elevationGainedM)
+            if (aggregates.floors is MetricRead.Available) checkpointField("floorsClimbed", floorsClimbed)
+
+            if (isTypeReadable<SleepSessionRecord>()) {
+                checkpointField("sleepHours", sleepSummary.hours)
+                checkpointField("deepSleepMinutes", sleepSummary.deepMinutes)
+                checkpointField("lightSleepMinutes", sleepSummary.lightMinutes)
+                checkpointField("remSleepMinutes", sleepSummary.remMinutes)
+                checkpointField("awakeMinutes", sleepSummary.awakeMinutes)
+                checkpointField("sleepStart", sleepSummary.start?.toString())
+                checkpointField("sleepEnd", sleepSummary.end?.toString())
+                checkpointField("sleepSessionCount", sleepSummary.sessionCount)
+                checkpointField("sleepStageCount", sleepSummary.stageCount)
+                checkpointField("mainSleepHours", sleepSummary.mainHours)
+                checkpointField("napCount", sleepSummary.napCount)
+                checkpointField("napMinutes", sleepSummary.napMinutes)
+            }
+
+            checkpointField("sourcePackages", jsonStringArray(sources))
+            checkpointDay.put("availableFields", JSONArray(checkpointFields.toList()))
+
+            onProgress("Сохраняю раннюю сводку за $date…")
+            postHealthPayload(
+                endpoint = endpoint,
+                token = token,
+                syncedAt = syncedAt,
+                rangeDate = date,
+                days = JSONArray().put(checkpointDay),
+                workouts = JSONArray(),
+                sleepSessions = sleepSessions,
+                measurements = JSONArray(),
+                sources = sources
+            )
+        }
+
         // High-frequency data is never flattened into another giant list. Samples are accumulated
         // into primitive statistics and streamed straight into measurement batches.
         run {
