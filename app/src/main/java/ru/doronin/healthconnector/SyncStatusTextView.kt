@@ -45,6 +45,7 @@ class SyncStatusTextView @JvmOverloads constructor(
 ) : MaterialTextView(context, attrs, defStyleAttr) {
 
     private val prefs by lazy { context.getSharedPreferences("settings", Context.MODE_PRIVATE) }
+    private val secureTokenStore by lazy { SecureTokenStore(context) }
     private var viewScope: CoroutineScope? = null
 
     private val expectedPermissions = setOf(
@@ -98,7 +99,7 @@ class SyncStatusTextView @JvmOverloads constructor(
     }
 
     private fun consumeStatus(message: String) {
-        val busy = message.startsWith("Читаю") || message.startsWith("Отправляю")
+        val busy = message.startsWith("Читаю") || message.startsWith("Отправляю") || message.startsWith("Сохраняю")
         rootView.findViewById<LinearProgressIndicator>(R.id.syncProgress)?.visibility =
             if (busy) View.VISIBLE else View.GONE
 
@@ -155,7 +156,7 @@ class SyncStatusTextView @JvmOverloads constructor(
         root.findViewById<TextView>(R.id.syncSourcesValue)?.text = prefs.getInt(KEY_LAST_SOURCES, 0).toString()
 
         val endpointConfigured = !prefs.getString("endpoint", "").isNullOrBlank()
-        val tokenConfigured = !prefs.getString("token", "").isNullOrBlank()
+        val tokenConfigured = secureTokenStore.getToken().isNotBlank()
         val sheetsOk = prefs.getBoolean(KEY_SHEETS_OK, false)
         root.findViewById<TextView>(R.id.sheetsStatus)?.text = when {
             sheetsOk -> "✓ Google Sheets подключён"
