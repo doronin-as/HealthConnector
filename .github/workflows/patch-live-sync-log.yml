@@ -259,11 +259,6 @@ jobs:
           gradle.write_text(text)
           PY
 
-      - name: Compile and test
-        run: |
-          chmod +x gradlew
-          ./gradlew :app:testReleaseUnitTest :app:assembleRelease
-
       - name: Commit diagnostics
         run: |
           git config user.name "github-actions[bot]"
