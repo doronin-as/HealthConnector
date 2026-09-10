@@ -152,10 +152,14 @@ class HealthSyncStreamer(
 
         var sleepSummary = SleepAggregation.empty()
         val sleepSessions = JSONArray()
-        val workouts = JSONArray()
+val workouts = JSONArray()
 
-        val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
-            onProgress("Отправляю измерения за $date…")
+var sentBatches = 0
+var sentMeasurements = 0
+val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
+    val batchSize = batch.length()
+    val batchNumber = sentBatches + 1
+    onProgress("[$date] Google Sheets: отправляю пачку #$batchNumber · $batchSize изм. · уже отправлено $sentMeasurements")
             postHealthPayload(
                 endpoint = endpoint,
                 token = token,
@@ -167,6 +171,9 @@ class HealthSyncStreamer(
                 measurements = batch,
                 sources = sources
             )
+            sentBatches = batchNumber
+            sentMeasurements += batchSize
+            onProgress("[$date] ✓ Пачка #$sentBatches принята · всего отправлено $sentMeasurements измерений")
         }
 
         suspend fun emit(
@@ -196,6 +203,7 @@ class HealthSyncStreamer(
 
         // Cumulative dashboard totals use Health Connect Aggregate API so overlapping origins
         // are deduplicated according to the user's Health Connect data priority.
+        onProgress("[$date] Этап 1/8 · читаю дневные агрегаты Health Connect…")
         val aggregates = aggregateReader.readDay(dayStart, dayEnd)
         val stepsTotal = metricValue(aggregates.steps, sources)
         val distanceKm = metricValue(aggregates.distance, sources)?.inKilometers
@@ -203,29 +211,38 @@ class HealthSyncStreamer(
         val totalCaloriesKcal = metricValue(aggregates.totalCalories, sources)?.inKilocalories
         val elevationGainedM = metricValue(aggregates.elevation, sources)?.inMeters
         val floorsClimbed = metricValue(aggregates.floors, sources)
+        onProgress("[$date] Агрегаты готовы · шаги ${stepsTotal ?: "—"} · дистанция ${distanceKm?.let { "%.2f".format(it) } ?: "—"} км")
 
         // Interval totals: one type is loaded, summarized, emitted and then becomes collectible.
         run {
+            onProgress("[$date] Этап 2/8 · читаю интервалы шагов…")
             workoutDayRecords.steps = safeReadAll<StepsRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.steps
+            onProgress("[$date] Шаги · найдено ${records.size} записей")
             addSources(records, sources)
             for (r in records) emit("Steps", null, r.startTime, r.endTime, r.count, "steps", r)
         }
         run {
+            onProgress("[$date] Читаю дистанцию…")
             workoutDayRecords.distance = safeReadAll<DistanceRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.distance
+            onProgress("[$date] Дистанция · найдено ${records.size} записей")
             addSources(records, sources)
             for (r in records) emit("Distance", null, r.startTime, r.endTime, r.distance.inKilometers, "km", r)
         }
         run {
+            onProgress("[$date] Читаю активные калории…")
             workoutDayRecords.activeCalories = safeReadAll<ActiveCaloriesBurnedRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.activeCalories
+            onProgress("[$date] Активные калории · найдено ${records.size} записей")
             addSources(records, sources)
             for (r in records) emit("ActiveCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
         run {
+            onProgress("[$date] Читаю общие калории…")
             workoutDayRecords.totalCalories = safeReadAll<TotalCaloriesBurnedRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.totalCalories
+            onProgress("[$date] Общие калории · найдено ${records.size} записей")
             addSources(records, sources)
             for (r in records) emit("TotalCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
@@ -234,12 +251,14 @@ class HealthSyncStreamer(
             // Attribute each complete sleep session to the day when the user wakes up.
             // This keeps an overnight sleep intact and allows several sessions on the same day
             // (main sleep, nap, additional sleep) without splitting them at midnight.
+            onProgress("[$date] Этап 3/8 · читаю сон…")
             val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
             val records = safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd)
                 .filter { it.endTime.atZone(zone).toLocalDate() == date }
                 .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
             addSources(records, sources)
             sleepSummary = aggregateSleep(records)
+            onProgress("[$date] Сон · ${records.size} сесс. · ${sleepSummary.stageCount} стадий · ${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч")
             for (r in records) {
                 val stageTotals = stageTotals(r.stages, r.startTime, r.endTime)
                 sleepSessions.put(JSONObject().apply {
@@ -305,7 +324,7 @@ class HealthSyncStreamer(
             checkpointField("sourcePackages", jsonStringArray(sources))
             checkpointDay.put("availableFields", JSONArray(checkpointFields.toList()))
 
-            onProgress("Сохраняю раннюю сводку за $date…")
+            onProgress("[$date] Этап 4/8 · сохраняю раннюю сводку и сон…")
             postHealthPayload(
                 endpoint = endpoint,
                 token = token,
@@ -317,13 +336,16 @@ class HealthSyncStreamer(
                 measurements = JSONArray(),
                 sources = sources
             )
+            onProgress("[$date] ✓ Ранняя сводка сохранена · теперь сырые измерения")
         }
 
         // High-frequency data is never flattened into another giant list. Samples are accumulated
         // into primitive statistics and streamed straight into measurement batches.
         run {
+            onProgress("[$date] Этап 5/8 · читаю пульс…")
             workoutDayRecords.heartRate = safeReadAll<HeartRateRecord>(dayStart, dayEnd)
             val records = preferBestSource(workoutDayRecords.heartRate)
+            onProgress("[$date] Пульс · ${records.size} серий · ${records.sumOf { it.samples.size }} отсчётов")
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -335,6 +357,7 @@ class HealthSyncStreamer(
             }
         }
         run {
+            onProgress("[$date] Читаю пульс покоя…")
             val records = preferBestSource(safeReadAll<RestingHeartRateRecord>(dayStart, dayEnd))
             addSources(records, sources)
             val stats = Stats()
@@ -345,6 +368,7 @@ class HealthSyncStreamer(
             restingHeartRate = stats.average()
         }
         run {
+            onProgress("[$date] Читаю HRV…")
             val records = preferBestSource(safeReadAll<HeartRateVariabilityRmssdRecord>(dayStart, dayEnd))
             addSources(records, sources)
             for (r in records) {
@@ -353,6 +377,7 @@ class HealthSyncStreamer(
             }
         }
         run {
+            onProgress("[$date] Читаю SpO₂…")
             val records = preferBestSource(safeReadAll<OxygenSaturationRecord>(dayStart, dayEnd))
             addSources(records, sources)
             for (r in records) {
@@ -361,6 +386,7 @@ class HealthSyncStreamer(
             }
         }
         run {
+            onProgress("[$date] Читаю частоту дыхания…")
             val records = preferBestSource(safeReadAll<RespiratoryRateRecord>(dayStart, dayEnd))
             addSources(records, sources)
             for (r in records) {
@@ -404,6 +430,7 @@ class HealthSyncStreamer(
             for (r in records) emit("FloorsClimbed", null, r.startTime, r.endTime, r.floors, "floors", r)
         }
         run {
+            onProgress("[$date] Этап 6/8 · читаю скорость и каденс…")
             workoutDayRecords.speed = safeReadAll<SpeedRecord>(dayStart, dayEnd)
             val records = preferBestSource(workoutDayRecords.speed)
             addSources(records, sources)
@@ -464,6 +491,7 @@ class HealthSyncStreamer(
             for (r in records) emit("Weight", r.time, null, null, r.weight.inKilograms, "kg", r)
         }
 
+        onProgress("[$date] Этап 7/8 · собираю тренировки…")
         val workoutRecords = preferBestSource(safeReadAll<ExerciseSessionRecord>(dayStart, dayEnd))
             .filter { it.startTime >= dayStart && it.startTime < dayEnd }
             .distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
@@ -474,7 +502,9 @@ class HealthSyncStreamer(
         }
 
         // Make sure the final partial measurement batch is persisted before the day summary.
-batcher.flush()
+        onProgress("[$date] Финализирую очередь измерений · накоплено ${batcher.totalCount}…")
+        batcher.flush()
+        onProgress("[$date] ✓ Все измерения отправлены · ${batcher.totalCount} изм. · $sentBatches пачек")
 
         val dayObject = JSONObject().apply { put("date", date.toString()) }
         val availableFields = linkedSetOf<String>()
@@ -561,7 +591,7 @@ batcher.flush()
         putField("sourcePackages", jsonStringArray(sources))
         dayObject.put("availableFields", JSONArray(availableFields.toList()))
 
-        onProgress("Отправляю сводку за $date…")
+        onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
         postHealthPayload(
             endpoint = endpoint,
             token = token,
@@ -573,6 +603,7 @@ batcher.flush()
             measurements = JSONArray(),
             sources = sources
         )
+        onProgress("[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен.")
 
         return DayResult(
             workouts = workoutRecords.size,

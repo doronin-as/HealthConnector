@@ -3,6 +3,7 @@ package ru.doronin.healthconnector
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -35,7 +36,10 @@ import androidx.health.connect.client.records.WeightRecord
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.switchmaterial.SwitchMaterial
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -305,6 +309,15 @@ class StreamingMainActivity : AppCompatActivity() {
                 }
             ) {
                 val runId = SyncDiagnostics.begin(this, "manual")
+                val syncStartedAt = SystemClock.elapsedRealtime()
+                var lastProgressMessage = "Запуск синхронизации…"
+                val heartbeat = lifecycleScope.launch {
+                    while (isActive) {
+                        delay(5_000L)
+                        val elapsedSec = (SystemClock.elapsedRealtime() - syncStartedAt) / 1000L
+                        binding.status.text = "$lastProgressMessage\n● Процесс идёт · ${elapsedSec} с"
+                    }
+                }
                 try {
                     val streamer = HealthSyncStreamer(this, client)
                     val result = streamer.sync(
@@ -313,8 +326,10 @@ class StreamingMainActivity : AppCompatActivity() {
                         settings.days,
                         includeHistoricalChanges = true
                     ) { message ->
+                        lastProgressMessage = message
+                        val elapsedSec = (SystemClock.elapsedRealtime() - syncStartedAt) / 1000L
                         SyncDiagnostics.progress(this, runId, "manual", message)
-                        binding.status.text = message
+                        binding.status.text = "$message\n● Процесс идёт · ${elapsedSec} с"
                     }
                     SyncDiagnostics.finish(
                         this,
@@ -323,12 +338,20 @@ class StreamingMainActivity : AppCompatActivity() {
                         "Дней ${result.days}, тренировок ${result.workouts}, измерений ${result.measurements}"
                     )
                     result
+                } catch (cancelled: CancellationException) {
+                    SyncDiagnostics.skipped(this, "manual", "Ручная синхронизация отменена системой или закрытием экрана")
+                    throw cancelled
                 } catch (error: Throwable) {
                     SyncDiagnostics.failure(this, runId, "manual", error)
                     throw error
+                } finally {
+                    heartbeat.cancel()
                 }
             }
         }.onSuccess { result ->
+            // null means the user tapped sync again while the existing manual run
+            // is still active. Keep that run's live progress visible and do nothing.
+            if (result == null) return@onSuccess
             binding.status.text =
                 "Синхронизация завершена: дней ${result.days}, тренировок ${result.workouts}, " +
                     "измерений ${result.measurements}, источников ${result.sources}"
