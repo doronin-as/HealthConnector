@@ -45,9 +45,12 @@ object BackgroundSyncScheduler {
             )
             .build()
 
+        // KEEP is intentional: apply() is called when the app opens and when settings
+        // are saved. UPDATE can replace/cancel an already running generation, which
+        // produced overlapping background runs and JobCancellationException in logs.
         manager.enqueueUniquePeriodicWork(
             UNIQUE_WORK_NAME,
-            ExistingPeriodicWorkPolicy.UPDATE,
+            ExistingPeriodicWorkPolicy.KEEP,
             request
         )
     }
