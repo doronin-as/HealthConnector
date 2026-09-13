@@ -9,6 +9,13 @@ const WORKOUTS_SHEET = 'HC_Тренировки';
 const LOG_SHEET = 'HC_Журнал';
 const SLEEP_SHEET = 'HC_Сон';
 const MEASUREMENTS_SHEET = 'HC_Измерения';
+const BODY_COMPOSITION_SHEET = 'HC_Состав_тела';
+const BODY_COMPOSITION_HEADERS = [
+  'Id', 'Timestamp', 'Date', 'DeviceAddress', 'Model', 'WeightKg', 'ImpedanceOhm',
+  'BMI', 'BodyFatPct', 'FatMassKg', 'WaterPct', 'WaterMassKg', 'MuscleMassKg',
+  'MusclePct', 'LeanBodyMassKg', 'BoneMassKg', 'VisceralFat', 'ProteinPct',
+  'BmrKcal', 'SyncedAt'
+];
 const DIARY_SHEET = 'Дневник';
 const FOOD_TRACKER_SHEET = 'Трекер_питания';
 const NUTRITION_SHEET = 'Питание';
@@ -89,6 +96,7 @@ function setup() {
   ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS);
   ensureSheet_(spreadsheet, SLEEP_SHEET, SLEEP_HEADERS);
   ensureSheet_(spreadsheet, MEASUREMENTS_SHEET, MEASUREMENT_HEADERS);
+  ensureSheet_(spreadsheet, BODY_COMPOSITION_SHEET, BODY_COMPOSITION_HEADERS);
 
   const result = {
     spreadsheetId: properties.getProperty('SPREADSHEET_ID'),
@@ -139,6 +147,9 @@ function doPost(e) {
     if (payload.action === 'healthSyncPlanV3') {
       return json_(getHealthSyncPlanV3_(spreadsheet, payload));
     }
+    if (payload.action === 'bodyCompositionV1') {
+      return json_(importBodyCompositionV1_(spreadsheet, logSheet, payload));
+    }
 
     validateHealthPayload_(payload);
     if (payload.action === 'healthSyncV3') {
@@ -183,6 +194,67 @@ function constantTimeTokenEquals_(actual, expected) {
 function sheetSafeExternalText_(value) {
   const text = String(value == null ? '' : value);
   return /^[=+\-@]/.test(text) ? `'${text}` : text;
+}
+
+function importBodyCompositionV1_(spreadsheet, logSheet, payload) {
+  const m = payload && payload.measurement;
+  if (!m || typeof m !== 'object') throw new Error('Нет measurement');
+  const id = String(m.id || '');
+  const date = String(m.date || '');
+  const weight = Number(m.weightKg);
+  if (!id) throw new Error('Нет id измерения весов');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Некорректная дата измерения весов');
+  if (!Number.isFinite(weight) || weight < 5 || weight > 250) throw new Error('Некорректный вес');
+
+  const syncedAt = new Date().toISOString();
+  const sheet = ensureSheet_(spreadsheet, BODY_COMPOSITION_SHEET, BODY_COMPOSITION_HEADERS);
+  const row = [[
+    id,
+    nullable_(m.measuredAt),
+    date,
+    sheetSafeExternalText_(m.deviceAddress || ''),
+    sheetSafeExternalText_(m.model || 'XMTZC05HM'),
+    weight,
+    nullable_(m.impedanceOhm),
+    nullable_(m.bmi),
+    nullable_(m.bodyFatPercent),
+    nullable_(m.fatMassKg),
+    nullable_(m.waterPercent),
+    nullable_(m.waterMassKg),
+    nullable_(m.muscleMassKg),
+    nullable_(m.musclePercent),
+    nullable_(m.leanBodyMassKg),
+    nullable_(m.boneMassKg),
+    nullable_(m.visceralFat),
+    nullable_(m.proteinPercent),
+    nullable_(m.basalMetabolicRateKcal),
+    syncedAt
+  ]];
+  upsertByKey_(sheet, row, 1);
+
+  // Keep the existing Dashboard weight field current without marking the entire day complete.
+  const daysSheet = ensureSheet_(spreadsheet, DAYS_SHEET, DAY_HEADERS_V3);
+  upsertDayObjectsPartialV3_(daysSheet, [{
+    date: date,
+    weightKg: weight,
+    sourcePackages: ['Xiaomi Scale XMTZC05HM']
+  }], syncedAt, spreadsheet.getSpreadsheetTimeZone());
+
+  // Also expose the raw weight in the generic measurements table.
+  const measurementsSheet = ensureSheet_(spreadsheet, MEASUREMENTS_SHEET, MEASUREMENT_HEADERS);
+  upsertByKey_(measurementsSheet, [[
+    'scale-weight|' + id,
+    nullable_(m.measuredAt),
+    '', '', 'Weight', weight, 'kg',
+    'xiaomi.scale.xmtzc05hm', 'Xiaomi Mi Body Composition Scale 2', syncedAt
+  ]], 1);
+
+  logSheet.appendRow([
+    new Date(), sheetSafeExternalText_(m.deviceAddress || ''), date, date, 1, 0, 'OK',
+    'Весы XMTZC05HM: ' + weight + ' кг' + (m.bodyFatPercent != null ? '; жир ' + m.bodyFatPercent + '%' : '')
+  ]);
+
+  return { ok: true, id: id, date: date, weightKg: weight, message: 'Измерение весов сохранено' };
 }
 
 function validateHealthPayload_(payload) {
