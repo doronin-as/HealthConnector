@@ -49,8 +49,6 @@ object MiScaleScanner {
      * AD type 0x16 (Service Data). It does not have to include 0x181B in the
      * separate advertised service UUID list. Therefore filtering only with
      * setServiceUuid() can silently miss every packet on some phones/firmwares.
-     * The first filter below matches the actual Service Data UUID; the other
-     * filters are compatibility fallbacks.
      */
     fun start(context: Context): Boolean {
         val app = context.applicationContext
@@ -75,25 +73,20 @@ object MiScaleScanner {
         val serviceUuid = ParcelUuid.fromString(MiScaleAdvertisementParser.BODY_COMPOSITION_SERVICE_UUID)
 
         val filters = listOf(
-            // Primary: XMTZC05HM sends the 13-byte measurement as Service Data 0x181B.
             ScanFilter.Builder()
                 .setServiceData(serviceUuid, byteArrayOf())
                 .build(),
-            // Fallback for firmwares that additionally advertise 0x181B as a service UUID.
             ScanFilter.Builder()
                 .setServiceUuid(serviceUuid)
                 .build(),
-            // Older XMTZC05HM firmwares commonly advertise this local name.
             ScanFilter.Builder()
                 .setDeviceName("MIBFS")
                 .build()
         )
 
         return runCatching {
-            // Stop an identical PendingIntent scan first so changing filters in a newer
-            // app version takes effect immediately instead of keeping the old scan.
             runCatching { scanner.stopScan(scanPendingIntent(app)) }
-            scanner.startScan(
+            val startCode = scanner.startScan(
                 filters,
                 ScanSettings.Builder()
                     .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
@@ -101,6 +94,9 @@ object MiScaleScanner {
                     .build(),
                 scanPendingIntent(app)
             )
+            if (startCode != 0) {
+                throw IllegalStateException("BLE scan start code $startCode")
+            }
             prefs.edit()
                 .putString(PREF_SCAN_STATE, "BLE-сканер запущен")
                 .putLong(PREF_SCAN_STARTED_AT, System.currentTimeMillis())
