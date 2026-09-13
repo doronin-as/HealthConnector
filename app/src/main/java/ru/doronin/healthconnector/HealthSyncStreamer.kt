@@ -844,6 +844,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                     val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
                     val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
                     try {
+                        connection.instanceFollowRedirects = true
                         connection.requestMethod = "POST"
                         connection.doOutput = true
                         connection.connectTimeout = 20_000
@@ -900,6 +901,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             "блокиров" in value ||
             "timeout" in value ||
             "timed out" in value ||
+            "http 404" in value ||
             "http 429" in value ||
             Regex("http 5\\d\\d").containsMatchIn(value)
     }
