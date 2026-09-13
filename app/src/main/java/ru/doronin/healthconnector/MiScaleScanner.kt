@@ -3,7 +3,6 @@ package ru.doronin.healthconnector
 import android.Manifest
 import android.app.PendingIntent
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -17,6 +16,17 @@ object MiScaleScanner {
     const val PREF_ENABLED = "scale_enabled"
     const val PREF_BOUND_ADDRESS = "scale_bound_address"
     const val PREF_SETUP_PROMPTED = "scale_setup_prompted"
+
+    const val PREF_SCAN_STATE = "scale_scan_state"
+    const val PREF_SCAN_STARTED_AT = "scale_scan_started_at"
+    const val PREF_LAST_PACKET_AT = "scale_last_packet_at"
+    const val PREF_LAST_PACKET_ADDRESS = "scale_last_packet_address"
+    const val PREF_LAST_PACKET_NAME = "scale_last_packet_name"
+    const val PREF_LAST_PACKET_RSSI = "scale_last_packet_rssi"
+    const val PREF_LAST_PACKET_HEX = "scale_last_packet_hex"
+    const val PREF_LAST_MEASUREMENT = "scale_last_measurement"
+    const val PREF_LAST_ERROR = "scale_last_error"
+
     const val ACTION_SCAN_RESULT = "ru.doronin.healthconnector.MI_SCALE_SCAN_RESULT"
     private const val REQUEST_CODE = 1811
 
@@ -32,38 +42,83 @@ object MiScaleScanner {
         ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
 
+    /**
+     * Starts a persistent PendingIntent based BLE scan.
+     *
+     * Mi Body Composition Scale 2 (XMTZC05HM) usually publishes UUID 0x181B as
+     * AD type 0x16 (Service Data). It does not have to include 0x181B in the
+     * separate advertised service UUID list. Therefore filtering only with
+     * setServiceUuid() can silently miss every packet on some phones/firmwares.
+     * The first filter below matches the actual Service Data UUID; the other
+     * filters are compatibility fallbacks.
+     */
     fun start(context: Context): Boolean {
         val app = context.applicationContext
         val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean(PREF_ENABLED, false) || !hasPermissions(app)) return false
 
-        val manager = app.getSystemService(BluetoothManager::class.java) ?: return false
-        val adapter = manager.adapter ?: return false
-        if (!adapter.isEnabled) return false
-        val scanner = adapter.bluetoothLeScanner ?: return false
+        fun fail(reason: String): Boolean {
+            prefs.edit()
+                .putString(PREF_SCAN_STATE, "Ошибка: $reason")
+                .putString(PREF_LAST_ERROR, reason)
+                .apply()
+            return false
+        }
+
+        if (!prefs.getBoolean(PREF_ENABLED, false)) return fail("автосчитывание выключено")
+        if (!hasPermissions(app)) return fail("нет разрешения Bluetooth")
+
+        val manager = app.getSystemService(BluetoothManager::class.java)
+            ?: return fail("BluetoothManager недоступен")
+        val adapter = manager.adapter ?: return fail("Bluetooth-адаптер недоступен")
+        if (!adapter.isEnabled) return fail("Bluetooth выключен")
+        val scanner = adapter.bluetoothLeScanner ?: return fail("BLE-сканер недоступен")
+        val serviceUuid = ParcelUuid.fromString(MiScaleAdvertisementParser.BODY_COMPOSITION_SERVICE_UUID)
+
+        val filters = listOf(
+            // Primary: XMTZC05HM sends the 13-byte measurement as Service Data 0x181B.
+            ScanFilter.Builder()
+                .setServiceData(serviceUuid, byteArrayOf())
+                .build(),
+            // Fallback for firmwares that additionally advertise 0x181B as a service UUID.
+            ScanFilter.Builder()
+                .setServiceUuid(serviceUuid)
+                .build(),
+            // Older XMTZC05HM firmwares commonly advertise this local name.
+            ScanFilter.Builder()
+                .setDeviceName("MIBFS")
+                .build()
+        )
 
         return runCatching {
+            // Stop an identical PendingIntent scan first so changing filters in a newer
+            // app version takes effect immediately instead of keeping the old scan.
+            runCatching { scanner.stopScan(scanPendingIntent(app)) }
             scanner.startScan(
-                listOf(
-                    ScanFilter.Builder()
-                        .setServiceUuid(ParcelUuid.fromString(MiScaleAdvertisementParser.BODY_COMPOSITION_SERVICE_UUID))
-                        .build()
-                ),
+                filters,
                 ScanSettings.Builder()
                     .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
                     .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
                     .build(),
                 scanPendingIntent(app)
             )
+            prefs.edit()
+                .putString(PREF_SCAN_STATE, "BLE-сканер запущен")
+                .putLong(PREF_SCAN_STARTED_AT, System.currentTimeMillis())
+                .remove(PREF_LAST_ERROR)
+                .apply()
             true
-        }.getOrDefault(false)
+        }.getOrElse { error ->
+            fail(error.message ?: error.javaClass.simpleName)
+        }
     }
 
     fun stop(context: Context) {
         val app = context.applicationContext
+        val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
         if (!hasPermissions(app)) return
         val scanner = app.getSystemService(BluetoothManager::class.java)?.adapter?.bluetoothLeScanner ?: return
         runCatching { scanner.stopScan(scanPendingIntent(app)) }
+        prefs.edit().putString(PREF_SCAN_STATE, "BLE-сканер остановлен").apply()
     }
 
     private fun scanPendingIntent(context: Context): PendingIntent {
