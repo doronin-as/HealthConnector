@@ -63,10 +63,32 @@ class HealthSyncStreamer(
         val safeDays = days.coerceIn(1, 30)
         val zone = ZoneId.systemDefault()
         val today = LocalDate.now(zone)
-        val requestedDates = (safeDays - 1 downTo 0).map { today.minusDays(it.toLong()) }
+        val fallbackStart = today.minusDays((safeDays - 1).toLong())
 
         onProgress("Проверяю версию Google Sheets…")
         ServerCompatibility.requireV3(endpoint)
+        onProgress("Проверяю состояние Dashboard…")
+        val plan = runCatching { fetchSyncPlan(endpoint, token, safeDays) }
+            .getOrElse { error ->
+                SyncDiagnostics.server(
+                    context,
+                    "healthSyncPlanV3 недоступен: ${error.message ?: error.javaClass.simpleName}; использую локальный диапазон",
+                    "WARNING"
+                )
+                SyncPlan(fallbackStart, "fallback", "План Dashboard недоступен")
+            }
+        val oldestReadable = today.minusDays(29)
+        val tableStart = plan.startDate.coerceAtLeast(oldestReadable).coerceAtMost(today)
+        // Background remains bounded; manual sync can repair an older incomplete day.
+        val requestedStart = if (includeHistoricalChanges) tableStart else tableStart.coerceAtLeast(fallbackStart)
+        val requestedDates = buildList {
+            var cursor = requestedStart
+            while (!cursor.isAfter(today)) {
+                add(cursor)
+                cursor = cursor.plusDays(1)
+            }
+        }
+        onProgress("${plan.message} · к обработке ${requestedDates.size} дн.")
         onProgress("Проверяю изменения Health Connect…")
         val changes = changesTracker.collect(zone)
         val deletionDates = if (changes.deletedRecordIds.isNotEmpty()) {
@@ -88,7 +110,6 @@ class HealthSyncStreamer(
             deletionDates.filterTo(linkedSetOf()) { it in requestedDateSet }
         }
 
-        val oldestReadable = today.minusDays(29)
         val dates = linkedSetOf<LocalDate>().apply {
             addAll(requestedDates)
             addAll(affectedDates)
@@ -334,9 +355,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 workouts = JSONArray(),
                 sleepSessions = sleepSessions,
                 measurements = JSONArray(),
-                sources = sources
+                sources = sources,
+                dayComplete = false
             )
-            onProgress("[$date] ✓ Ранняя сводка сохранена · теперь сырые измерения")
+            onProgress("[$date] ✓ Ранняя сводка сохранена · день помечен незавершённым")
         }
 
         // High-frequency data is never flattened into another giant list. Samples are accumulated
@@ -601,7 +623,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             workouts = workouts,
             sleepSessions = sleepSessions,
             measurements = JSONArray(),
-            sources = sources
+            sources = sources,
+            dayComplete = true
         )
         onProgress("[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен.")
 
@@ -729,6 +752,28 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
     }
 
+    private suspend fun fetchSyncPlan(
+        endpoint: String,
+        token: String,
+        fallbackDays: Int
+    ): SyncPlan {
+        val body = JSONObject().apply {
+            put("token", token)
+            put("action", "healthSyncPlanV3")
+            put("schemaVersion", 3)
+            put("fallbackDays", fallbackDays)
+        }
+        val response = postBody(endpoint, body)
+            ?: error("Dashboard не вернул план синхронизации")
+        val startDate = runCatching { LocalDate.parse(response.optString("startDate")) }
+            .getOrElse { error("Dashboard вернул некорректную дату старта") }
+        return SyncPlan(
+            startDate = startDate,
+            reason = response.optString("reason", "table"),
+            message = response.optString("message", "Dashboard: синхронизация с $startDate")
+        )
+    }
+
     private suspend fun postDeletedRecordIds(
         endpoint: String,
         token: String,
@@ -759,7 +804,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         workouts: JSONArray,
         sleepSessions: JSONArray,
         measurements: JSONArray,
-        sources: Set<String>
+        sources: Set<String>,
+        dayComplete: Boolean? = null
     ): JSONObject? {
         val body = JSONObject().apply {
             put("token", token)
@@ -773,6 +819,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             put("workouts", workouts)
             put("sleepSessions", sleepSessions)
             put("measurements", measurements)
+            if (dayComplete != null) put("dayComplete", dayComplete)
             put("sources", JSONArray().apply {
                 sources.sortedBy { sourcePriority(it) }.forEach { pkg ->
                     put(JSONObject().apply {
@@ -1131,6 +1178,13 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         val workouts: Int,
         val measurements: Int,
         val sources: Int
+    )
+
+
+    private data class SyncPlan(
+        val startDate: LocalDate,
+        val reason: String,
+        val message: String
     )
 
     private class WorkoutDayRecords {
