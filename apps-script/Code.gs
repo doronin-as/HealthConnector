@@ -147,6 +147,9 @@ function doPost(e) {
     if (payload.action === 'healthSyncPlanV3') {
       return json_(getHealthSyncPlanV3_(spreadsheet, payload));
     }
+    if (payload.action === 'dashboardSnapshotV1') {
+      return json_(getDashboardSnapshotV1_(spreadsheet));
+    }
     if (payload.action === 'bodyCompositionV1') {
       return json_(importBodyCompositionV1_(spreadsheet, logSheet, payload));
     }
@@ -194,6 +197,192 @@ function constantTimeTokenEquals_(actual, expected) {
 function sheetSafeExternalText_(value) {
   const text = String(value == null ? '' : value);
   return /^[=+\-@]/.test(text) ? `'${text}` : text;
+}
+
+function getDashboardSnapshotV1_(spreadsheet) {
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  return {
+    ok: true,
+    schemaVersion: 1,
+    fetchedAt: new Date().toISOString(),
+    dashboardUrl: spreadsheet.getUrl(),
+    profile: getDashboardProfileV1_(spreadsheet, tz),
+    summary: getDashboardLatestDayV1_(spreadsheet, tz),
+    devices: getDashboardDevicesV1_(spreadsheet, tz)
+  };
+}
+
+function getDashboardProfileV1_(spreadsheet, tz) {
+  const sheet = spreadsheet.getSheetByName('Профиль');
+  if (!sheet || sheet.getLastRow() < 1) {
+    return { heightCm: null, birthDate: null, sex: null, foundFields: [] };
+  }
+  const rows = sheet.getRange(1, 1, Math.min(sheet.getLastRow(), 200), 2).getValues();
+  const map = new Map();
+  rows.forEach(row => {
+    const key = String(row[0] == null ? '' : row[0]).trim().toLowerCase();
+    if (key) map.set(key, row[1]);
+  });
+  function pick(keys) {
+    for (const key of keys) {
+      if (map.has(key.toLowerCase())) return map.get(key.toLowerCase());
+    }
+    return null;
+  }
+  const height = dashboardNumberV1_(pick(['Рост, см', 'Рост', 'Height, cm', 'Height']));
+  const birthDate = dashboardDateV1_(pick(['Дата рождения', 'День рождения', 'Birth date', 'Birthday']), tz);
+  const rawSex = String(pick(['Пол', 'Sex', 'Gender']) || '').trim().toLowerCase();
+  let sex = null;
+  if (['мужской', 'муж', 'м', 'male', 'man'].includes(rawSex)) sex = 'male';
+  if (['женский', 'жен', 'ж', 'female', 'woman'].includes(rawSex)) sex = 'female';
+  const foundFields = [];
+  if (height != null) foundFields.push('heightCm');
+  if (birthDate) foundFields.push('birthDate');
+  if (sex) foundFields.push('sex');
+  return { heightCm: height, birthDate: birthDate, sex: sex, foundFields: foundFields };
+}
+
+function getDashboardLatestDayV1_(spreadsheet, tz) {
+  const sheet = ensureSheet_(spreadsheet, DAYS_SHEET, DAY_HEADERS_V3);
+  if (sheet.getLastRow() < 2) return {};
+  const width = Math.min(sheet.getLastColumn(), DAY_HEADERS_V3.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const count = Math.min(sheet.getLastRow() - 1, 120);
+  const start = sheet.getLastRow() - count + 1;
+  const rows = sheet.getRange(start, 1, count, width).getValues();
+  const dateIndex = headers.indexOf('Date');
+  let best = null;
+  let bestDate = '';
+  rows.forEach(row => {
+    const date = dateIndex >= 0 ? normalizeDateWithTz_(row[dateIndex], tz) : '';
+    if (date && date >= bestDate) {
+      bestDate = date;
+      best = row;
+    }
+  });
+  if (!best) return {};
+  function value(name) {
+    const index = headers.indexOf(name);
+    if (index < 0) return null;
+    const raw = best[index];
+    return raw === '' || raw === null || raw === undefined ? null : raw;
+  }
+  return {
+    date: bestDate,
+    steps: dashboardNumberV1_(value('Steps')),
+    weightKg: dashboardNumberV1_(value('WeightKg')),
+    sleepHours: dashboardNumberV1_(value('SleepHours')),
+    mainSleepHours: dashboardNumberV1_(value('MainSleepHours')),
+    restingHeartRate: dashboardNumberV1_(value('RestingHeartRate')),
+    averageHeartRate: dashboardNumberV1_(value('AvgHeartRate')),
+    averageSpO2: dashboardNumberV1_(value('AvgSpO2')),
+    activeCaloriesKcal: dashboardNumberV1_(value('ActiveCaloriesKcal')),
+    workoutCount: dashboardNumberV1_(value('WorkoutCount')),
+    syncedAt: dashboardIsoV1_(value('SyncedAt'))
+  };
+}
+
+function getDashboardDevicesV1_(spreadsheet, tz) {
+  const devices = new Map();
+  dashboardCollectSourcesV1_(spreadsheet.getSheetByName(MEASUREMENTS_SHEET), 'Измерения', devices, 2500);
+  dashboardCollectSourcesV1_(spreadsheet.getSheetByName(SLEEP_SHEET), 'Сон', devices, 800);
+  dashboardCollectSourcesV1_(spreadsheet.getSheetByName(WORKOUTS_SHEET), 'Тренировки', devices, 800);
+
+  const scale = spreadsheet.getSheetByName(BODY_COMPOSITION_SHEET);
+  if (scale && scale.getLastRow() >= 2) {
+    const width = Math.min(scale.getLastColumn(), BODY_COMPOSITION_HEADERS.length);
+    const headers = scale.getRange(1, 1, 1, width).getDisplayValues()[0];
+    const count = Math.min(scale.getLastRow() - 1, 100);
+    const rows = scale.getRange(scale.getLastRow() - count + 1, 1, count, width).getValues();
+    const addressIndex = headers.indexOf('DeviceAddress');
+    const modelIndex = headers.indexOf('Model');
+    const seenIndex = headers.indexOf('SyncedAt');
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      const address = addressIndex >= 0 ? String(row[addressIndex] || '').trim() : '';
+      const model = modelIndex >= 0 ? String(row[modelIndex] || '').trim() : '';
+      const key = 'scale|' + (address || model || 'XMTZC05HM');
+      if (!devices.has(key)) {
+        devices.set(key, {
+          type: 'Умные весы',
+          name: model === 'XMTZC05HM' || !model ? 'Xiaomi Mi Body Composition Scale 2' : model,
+          packageName: null,
+          address: address || null,
+          lastSeen: seenIndex >= 0 ? dashboardIsoV1_(row[seenIndex]) : null
+        });
+      }
+    }
+  }
+
+  // If raw tables are still empty, expose source packages from the latest daily row.
+  if (devices.size === 0) {
+    const days = spreadsheet.getSheetByName(DAYS_SHEET);
+    if (days && days.getLastRow() >= 2) {
+      const headers = days.getRange(1, 1, 1, days.getLastColumn()).getDisplayValues()[0];
+      const sourceIndex = headers.indexOf('Sources');
+      if (sourceIndex >= 0) {
+        const text = String(days.getRange(days.getLastRow(), sourceIndex + 1).getDisplayValue() || '');
+        text.split(',').map(x => x.trim()).filter(Boolean).forEach(pkg => {
+          devices.set('source|' + pkg, { type: 'Health Connect источник', name: pkg, packageName: pkg, address: null, lastSeen: null });
+        });
+      }
+    }
+  }
+  return Array.from(devices.values()).slice(0, 16);
+}
+
+function dashboardCollectSourcesV1_(sheet, type, devices, maxRows) {
+  if (!sheet || sheet.getLastRow() < 2) return;
+  const width = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const packageIndex = headers.indexOf('SourcePackage');
+  const nameIndex = headers.indexOf('SourceName');
+  const timeIndexes = ['SyncedAt', 'Time', 'Start', 'End'].map(name => headers.indexOf(name)).filter(index => index >= 0);
+  if (packageIndex < 0 && nameIndex < 0) return;
+  const count = Math.min(sheet.getLastRow() - 1, maxRows);
+  const rows = sheet.getRange(sheet.getLastRow() - count + 1, 1, count, width).getValues();
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    const pkg = packageIndex >= 0 ? String(row[packageIndex] || '').trim() : '';
+    const name = nameIndex >= 0 ? String(row[nameIndex] || '').trim() : '';
+    if (!pkg && !name) continue;
+    const key = 'hc|' + pkg + '|' + name;
+    if (devices.has(key)) continue;
+    let lastSeen = null;
+    for (const index of timeIndexes) {
+      if (row[index]) { lastSeen = dashboardIsoV1_(row[index]); break; }
+    }
+    devices.set(key, {
+      type: 'Health Connect · ' + type,
+      name: name || pkg,
+      packageName: pkg || null,
+      address: null,
+      lastSeen: lastSeen
+    });
+    if (devices.size >= 16) return;
+  }
+}
+
+function dashboardNumberV1_(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const number = Number(String(value).replace(/\s/g, '').replace(',', '.'));
+  return Number.isFinite(number) ? number : null;
+}
+
+function dashboardDateV1_(value, tz) {
+  if (value instanceof Date && !isNaN(value)) return Utilities.formatDate(value, tz, 'yyyy-MM-dd');
+  const text = String(value == null ? '' : value).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  let match = text.match(/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})$/);
+  if (match) return `${match[3]}-${match[2].padStart(2, '0')}-${match[1].padStart(2, '0')}`;
+  return null;
+}
+
+function dashboardIsoV1_(value) {
+  if (value instanceof Date && !isNaN(value)) return value.toISOString();
+  const text = String(value == null ? '' : value).trim();
+  return text || null;
 }
 
 function importBodyCompositionV1_(spreadsheet, logSheet, payload) {
