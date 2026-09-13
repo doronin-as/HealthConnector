@@ -1,0 +1,72 @@
+name: Patch version badge
+
+on:
+  push:
+    branches: [ feat/version-badge ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/version-badge
+
+      - name: Add version badge and launcher label support
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          activity = Path('app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt')
+          text = activity.read_text(encoding='utf-8')
+
+          anchor = '''        binding = ActivityMainBinding.inflate(layoutInflater)\n        setContentView(binding.root)\n\n'''
+          replacement = '''        binding = ActivityMainBinding.inflate(layoutInflater)\n        setContentView(binding.root)\n\n        setupVersionBadge()\n\n'''
+          if 'setupVersionBadge()' not in text:
+              if anchor not in text:
+                  raise SystemExit('onCreate anchor not found')
+              text = text.replace(anchor, replacement, 1)
+
+          method_anchor = '''    override fun onResume() {\n'''
+          method = '''    private fun setupVersionBadge() {\n        val header = binding.root.getChildAt(0) as? LinearLayout ?: return\n        val isTestBuild = BuildConfig.APPLICATION_ID != "ru.doronin.healthconnector.stable"\n        val badgeText = buildString {\n            append("v")\n            append(BuildConfig.VERSION_NAME)\n            if (isTestBuild) append(" · TEST")\n        }\n        val badge = TextView(this).apply {\n            text = badgeText\n            textSize = 11f\n            setTypeface(typeface, android.graphics.Typeface.BOLD)\n            setTextColor(\n                com.google.android.material.color.MaterialColors.getColor(\n                    this,\n                    com.google.android.material.R.attr.colorOnSecondaryContainer\n                )\n            )\n            background = android.graphics.drawable.GradientDrawable().apply {\n                shape = android.graphics.drawable.GradientDrawable.RECTANGLE\n                cornerRadius = dp(999).toFloat()\n                setColor(\n                    com.google.android.material.color.MaterialColors.getColor(\n                        this@StreamingMainActivity,\n                        com.google.android.material.R.attr.colorSecondaryContainer,\n                        0\n                    )\n                )\n            }\n            setPadding(dp(10), dp(4), dp(10), dp(4))\n            contentDescription = "Версия $badgeText"\n        }\n        header.addView(\n            badge,\n            1,\n            LinearLayout.LayoutParams(\n                LinearLayout.LayoutParams.WRAP_CONTENT,\n                LinearLayout.LayoutParams.WRAP_CONTENT\n            ).apply {\n                topMargin = dp(6)\n                bottomMargin = dp(2)\n            }\n        )\n    }\n\n'''
+          if 'private fun setupVersionBadge()' not in text:
+              if method_anchor not in text:
+                  raise SystemExit('onResume anchor not found')
+              text = text.replace(method_anchor, method + method_anchor, 1)
+          activity.write_text(text, encoding='utf-8')
+
+          gradle = Path('app/build.gradle.kts')
+          text = gradle.read_text(encoding='utf-8')
+          text = text.replace('versionCode = 28', 'versionCode = 29', 1)
+          text = text.replace('versionName = "1.6.14"', 'versionName = "1.6.15"', 1)
+          if 'manifestPlaceholders["appLabel"]' not in text:
+              text = text.replace(
+                  '        versionName = "1.6.15"\n',
+                  '        versionName = "1.6.15"\n        manifestPlaceholders["appLabel"] = "Health Connector"\n',
+                  1,
+              )
+          gradle.write_text(text, encoding='utf-8')
+
+          manifest = Path('app/src/main/AndroidManifest.xml')
+          text = manifest.read_text(encoding='utf-8')
+          text = text.replace('android:label="Health Connector 2"', 'android:label="${appLabel}"', 1)
+          text = text.replace('android:label="FatSecret → Health Connector 2"', 'android:label="FatSecret → ${appLabel}"', 1)
+          manifest.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/build.gradle.kts app/src/main/AndroidManifest.xml app/src/main/java/ru/doronin/healthconnector/StreamingMainActivity.kt
+          git diff --cached --check
+          git commit -m 'Show app version and distinguish test builds'
+          git push origin HEAD:feat/version-badge
