@@ -26,12 +26,12 @@ android {
     }
 
     defaultConfig {
-        applicationId = "ru.doronin.healthconnector.stable"
+        applicationId = "ru.doronin.healthconnector.side1620"
         minSdk = 26
         targetSdk = 35
         versionCode = 34
-        versionName = "1.6.20"
-        manifestPlaceholders["appLabel"] = "Health Connector"
+        versionName = "1.6.20-side"
+        manifestPlaceholders["appLabel"] = "HC 1.6.20 TEST"
     }
 
     buildTypes {
