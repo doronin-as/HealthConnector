@@ -883,6 +883,7 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
   const sheet = ensureSheet_(spreadsheet, DAYS_SHEET, DAY_HEADERS_V3);
   const tz = spreadsheet.getSpreadsheetTimeZone();
   const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const oldestRepairable = addDaysToDateKeyV3_(today, -29, tz);
   const fallbackDays = Math.max(1, Math.min(30, Number(payload.fallbackDays || 7)));
   const fallbackStart = addDaysToDateKeyV3_(today, -(fallbackDays - 1), tz);
 
@@ -906,7 +907,7 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
 
   values.forEach(row => {
     const date = normalizeDateWithTz_(row[dateIndex], tz);
-    if (!date || date > today) return;
+    if (!date || date < oldestRepairable || date > today) return;
     rows.push({
       date,
       complete: completeIndex >= 0 ? booleanCellV3_(row[completeIndex]) : null

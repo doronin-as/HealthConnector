@@ -624,7 +624,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             sleepSessions = sleepSessions,
             measurements = JSONArray(),
             sources = sources,
-            dayComplete = true
+            dayComplete = date.isBefore(LocalDate.now(zone))
         )
         onProgress("[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен.")
 
