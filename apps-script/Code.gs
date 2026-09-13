@@ -136,6 +136,9 @@ function doPost(e) {
     if (payload.action === 'healthChangesV3') {
       return json_(handleHealthChangesV3_(spreadsheet, logSheet, payload));
     }
+    if (payload.action === 'healthSyncPlanV3') {
+      return json_(getHealthSyncPlanV3_(spreadsheet, payload));
+    }
 
     validateHealthPayload_(payload);
     if (payload.action === 'healthSyncV3') {
@@ -711,7 +714,7 @@ function json_(object) {
 
 // ===== Health Connector schema v3 integrity layer =====
 const DAY_HEADERS_V3 = DAY_HEADERS.concat([
-  'MainSleepHours', 'NapCount', 'NapMinutes'
+  'MainSleepHours', 'NapCount', 'NapMinutes', 'SyncComplete', 'CompletedAt'
 ]);
 
 const DAY_FIELD_TO_HEADER_V3 = Object.freeze({
@@ -777,7 +780,7 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   const measurementsSheet = ensureSheet_(spreadsheet, MEASUREMENTS_SHEET, MEASUREMENT_HEADERS);
   const syncedAt = payload.syncedAt || new Date().toISOString();
 
-  upsertDayObjectsPartialV3_(daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone());
+  upsertDayObjectsPartialV3_(daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete);
 
   const workoutRows = (payload.workouts || []).map(w => [
     w.id, w.start, w.end, w.exerciseType, nullable_(w.title), Number(w.durationMinutes || 0),
@@ -819,7 +822,7 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   };
 }
 
-function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz) {
+function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
   if (!days.length) return;
   const headers = DAY_HEADERS_V3;
   const headerIndex = new Map(headers.map((value, index) => [value, index]));
@@ -841,14 +844,19 @@ function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz) {
     let rowNumber = existing.get(dateKey);
     let row;
 
-    if (rowNumber) {
+    const rebuildingDay = typeof dayComplete === 'boolean';
+    if (rowNumber && !rebuildingDay) {
       row = sheet.getRange(rowNumber, 1, 1, headers.length).getValues()[0];
     } else {
-      rowNumber = sheet.getLastRow() + 1;
+      if (!rowNumber) {
+        rowNumber = sheet.getLastRow() + 1;
+        existing.set(dateKey, rowNumber);
+        if (rowNumber > 2) copyRowFormat_(sheet, rowNumber, headers.length);
+      }
+      // A checkpoint/final snapshot is a full rebuild of HC_Дни.
+      // Clearing first prevents stale values from an older partial day.
       row = Array(headers.length).fill('');
       row[0] = Utilities.parseDate(`${dateKey} 00:00`, tz, 'yyyy-MM-dd HH:mm');
-      existing.set(dateKey, rowNumber);
-      if (rowNumber > 2) copyRowFormat_(sheet, rowNumber, headers.length);
     }
 
     available.forEach(key => {
@@ -862,8 +870,126 @@ function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz) {
     });
 
     row[headerIndex.get('SyncedAt')] = syncedAt;
+    if (typeof dayComplete === 'boolean') {
+      row[headerIndex.get('SyncComplete')] = dayComplete;
+      row[headerIndex.get('CompletedAt')] = dayComplete ? syncedAt : '';
+    }
     sheet.getRange(rowNumber, 1, 1, headers.length).setValues([row]);
   });
+}
+
+
+function getHealthSyncPlanV3_(spreadsheet, payload) {
+  const sheet = ensureSheet_(spreadsheet, DAYS_SHEET, DAY_HEADERS_V3);
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const oldestRepairable = addDaysToDateKeyV3_(today, -29, tz);
+  const fallbackDays = Math.max(1, Math.min(30, Number(payload.fallbackDays || 7)));
+  const fallbackStart = addDaysToDateKeyV3_(today, -(fallbackDays - 1), tz);
+
+  if (sheet.getLastRow() < 2) {
+    return {
+      ok: true,
+      schemaVersion: 3,
+      startDate: fallbackStart,
+      latestDate: '',
+      today,
+      reason: 'empty-table',
+      message: `HC_Дни пуст: начинаю с ${fallbackStart}`
+    };
+  }
+
+  const headers = sheet.getRange(1, 1, 1, DAY_HEADERS_V3.length).getDisplayValues()[0];
+  const dateIndex = headers.indexOf('Date');
+  const completeIndex = headers.indexOf('SyncComplete');
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, DAY_HEADERS_V3.length).getValues();
+  const rows = [];
+
+  values.forEach(row => {
+    const date = normalizeDateWithTz_(row[dateIndex], tz);
+    if (!date || date < oldestRepairable || date > today) return;
+    rows.push({
+      date,
+      complete: completeIndex >= 0 ? booleanCellV3_(row[completeIndex]) : null
+    });
+  });
+
+  if (!rows.length) {
+    return {
+      ok: true,
+      schemaVersion: 3,
+      startDate: fallbackStart,
+      latestDate: '',
+      today,
+      reason: 'no-valid-dates',
+      message: `В HC_Дни нет корректных дат: начинаю с ${fallbackStart}`
+    };
+  }
+
+  rows.sort((a, b) => a.date.localeCompare(b.date));
+  const byDate = new Map();
+  rows.forEach(row => byDate.set(row.date, row));
+  const dates = Array.from(byDate.keys()).sort();
+  const firstDate = dates[0];
+  const latestDate = dates[dates.length - 1];
+
+  // Interrupted syncs explicitly leave SyncComplete=false.
+  let startDate = dates.find(date => byDate.get(date).complete === false) || '';
+  let reason = startDate ? 'incomplete-day' : '';
+
+  // A missing date inside existing history is also a repair point.
+  if (!startDate) {
+    let cursor = firstDate;
+    while (cursor <= latestDate) {
+      if (!byDate.has(cursor)) {
+        startDate = cursor;
+        reason = 'gap';
+        break;
+      }
+      cursor = addDaysToDateKeyV3_(cursor, 1, tz);
+    }
+  }
+
+  // Legacy rows do not have SyncComplete. Re-read the latest legacy day once.
+  if (!startDate) {
+    const latest = byDate.get(latestDate);
+    if (latestDate === today) {
+      startDate = today;
+      reason = 'current-day';
+    } else if (latest.complete === true) {
+      startDate = addDaysToDateKeyV3_(latestDate, 1, tz);
+      reason = 'after-last-complete';
+    } else {
+      startDate = latestDate;
+      reason = 'legacy-latest-day';
+    }
+  }
+
+  if (startDate > today) startDate = today;
+  return {
+    ok: true,
+    schemaVersion: 3,
+    startDate,
+    latestDate,
+    today,
+    reason,
+    message: `Dashboard: последняя дата ${latestDate}; синхронизация с ${startDate}`
+  };
+}
+
+function booleanCellV3_(value) {
+  if (value === true) return true;
+  if (value === false) return false;
+  const text = String(value == null ? '' : value).trim().toLowerCase();
+  if (text === 'true' || text === '1' || text === 'да') return true;
+  if (text === 'false' || text === '0' || text === 'нет') return false;
+  return null;
+}
+
+function addDaysToDateKeyV3_(dateKey, days, tz) {
+  const date = Utilities.parseDate(`${dateKey} 12:00`, tz, 'yyyy-MM-dd HH:mm');
+  date.setDate(date.getDate() + Number(days || 0));
+  return Utilities.formatDate(date, tz, 'yyyy-MM-dd');
 }
 
 function handleHealthChangesV3_(spreadsheet, logSheet, payload) {
