@@ -29,8 +29,8 @@ android {
         applicationId = "ru.doronin.healthconnector.stable"
         minSdk = 26
         targetSdk = 35
-        versionCode = 34
-        versionName = "1.6.20"
+        versionCode = 35
+        versionName = "1.6.21"
         manifestPlaceholders["appLabel"] = "Health Connector"
     }
 

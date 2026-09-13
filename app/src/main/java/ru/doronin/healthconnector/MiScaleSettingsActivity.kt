@@ -140,6 +140,15 @@ class MiScaleSettingsActivity : AppCompatActivity() {
         refreshScannerDiagnostics()
 
         root.addView(Button(this).apply {
+            text = "Найти весы вручную"
+            setOnClickListener {
+                prefs.edit().putBoolean(MiScaleScanner.PREF_ENABLED, true).apply()
+                enabled.isChecked = true
+                startActivity(Intent(this@MiScaleSettingsActivity, MiScaleFinderActivity::class.java))
+            }
+        })
+
+        root.addView(Button(this).apply {
             text = "Проверить BLE-сканер сейчас"
             setOnClickListener {
                 prefs.edit().putBoolean(MiScaleScanner.PREF_ENABLED, enabled.isChecked).apply()
@@ -163,7 +172,7 @@ class MiScaleSettingsActivity : AppCompatActivity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "После сохранения встаньте на весы босиком. Первое стабильное измерение автоматически привяжет ближайшие совместимые весы; импеданс нужен для расчёта состава тела. Диагностика выше обновляется каждую секунду и покажет, видит ли телефон BLE-пакеты."
+            text = "После сохранения встаньте на весы босиком. Первое стабильное измерение автоматически привяжет ближайшие совместимые весы; импеданс нужен для расчёта состава тела. Если автопривязка не срабатывает, откройте «Найти весы вручную»: там запускается активный 30-секундный BLE-поиск без фильтра и можно выбрать весы вручную."
             textSize = 13f
             alpha = 0.72f
             setPadding(0, dp(12), 0, dp(12))
