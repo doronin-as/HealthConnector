@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.6.19 — In-app Dashboard, devices and automatic profile discovery
+
+- Added a dedicated `Дашборд` tab to HealthConnector as the default application page.
+- The in-app Dashboard reads the latest daily snapshot from Google Sheets and shows weight, steps, sleep, resting/average heart rate, SpO₂, active calories and workout count.
+- Added an authenticated Apps Script action `dashboardSnapshotV1`; the API token remains required and is not returned by the endpoint.
+- Added an `Устройства и источники` block that combines local Xiaomi scale state, Health Connect availability, source apps/packages seen in `HC_Измерения`, `HC_Сон` and `HC_Тренировки`, and scale information from `HC_Состав_тела`.
+- Added a button to open the full Google Dashboard and a manual Dashboard refresh action.
+- Added automatic scale-profile discovery from the hidden `Профиль` sheet. Height and date of birth are loaded automatically; sex is also loaded when a `Пол`/`Sex`/`Gender` row exists.
+- Automatically discovered scale-profile values are persisted locally and reused by body-composition calculations. Missing fields preserve the local/manual fallback instead of being overwritten with blanks.
+- The scale settings screen now visibly reports which profile fields were found in Dashboard and includes an explicit `Обновить профиль из Dashboard` button.
+- First launch no longer forces the scale settings screen before the Apps Script URL/token are configured; the main screen opens first so Dashboard discovery can work.
+- Opening scale settings from the main screen now saves the currently entered Apps Script URL/token first, so profile discovery uses the current connection settings.
+- Dashboard refreshes after a successful manual synchronization, after configuration restore, on resume, and on explicit refresh.
+- Added retry/redirect handling to Dashboard snapshot requests for transient `404`, `408`, `429`, lock-busy and `5xx` failures.
+- Bumped Android version to `1.6.19` / versionCode `33`.
+
 ## 1.6.18 — Xiaomi Mi Body Composition Scale 2 integration
 
 - Added direct Bluetooth LE support for Xiaomi Mi Body Composition Scale 2 (`XMTZC05HM`).
