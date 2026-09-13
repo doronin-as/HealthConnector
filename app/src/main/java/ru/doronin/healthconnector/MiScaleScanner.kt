@@ -3,7 +3,6 @@ package ru.doronin.healthconnector
 import android.Manifest
 import android.app.PendingIntent
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -95,7 +94,7 @@ object MiScaleScanner {
                     .build(),
                 scanPendingIntent(app)
             )
-            if (startCode != ScanCallback.SCAN_SUCCESS) {
+            if (startCode != 0) {
                 throw IllegalStateException("BLE scan start code $startCode")
             }
             prefs.edit()
