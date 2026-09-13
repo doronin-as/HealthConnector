@@ -63,6 +63,11 @@
             android:exported="false"
             android:label="Умные весы Xiaomi" />
 
+        <activity
+            android:name=".MiScaleFinderActivity"
+            android:exported="false"
+            android:label="Поиск весов Xiaomi" />
+
         <receiver
             android:name=".MiScaleScanReceiver"
             android:exported="false" />
