@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.6.22 — BLE zero-result diagnostics and scanner ownership
+
+- Fixed the manual Xiaomi scale finder so it stops the persistent PendingIntent BLE scan before starting its foreground high-power scan.
+- Added a short hand-off delay before registering the foreground `ScanCallback`, avoiding OEM Bluetooth stacks that silently starve a second concurrent scanner.
+- Manual scale discovery now reports the number of raw BLE callbacks separately from the number of parsed/identified devices.
+- Scan results without `scanRecord` are no longer discarded before diagnostics; they are counted and can still be listed when an address is available.
+- Added diagnostics for missing scan records and failures while reading Bluetooth device addresses.
+- Added an explicit Bluetooth LE hardware-feature check and explicit legacy-advertisement scanning for older Xiaomi scale advertising.
+- Added system-location state to live BLE diagnostics. If Android returns zero callbacks and system location is disabled, the UI calls this out explicitly because some Xiaomi/MIUI builds gate BLE scanning behind the location master switch.
+- Added shortcuts to Android Bluetooth settings and system location settings directly from the scale finder.
+- Timeout messaging now distinguishes: no BLE callbacks at all, BLE callbacks with no accessible devices, BLE devices found but no Xiaomi Scale signature, and a recognized scale.
+- The normal persistent background scanner is restarted when the manual finder closes.
+- Bumped Android version to `1.6.22` / versionCode `36`.
+
 ## 1.6.21 — Forced Xiaomi scale finder
 
 - Added a dedicated `Найти весы вручную` screen from Xiaomi scale settings.
