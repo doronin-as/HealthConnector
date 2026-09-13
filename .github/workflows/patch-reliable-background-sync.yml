@@ -78,102 +78,35 @@ jobs:
               const val MANUAL_NOTIFICATION_ID = 16160
               const val BACKGROUND_NOTIFICATION_ID = 16161
               private const val CHANNEL_ID = "health_connector_sync"
-
-              fun info(context: Context, id: Int, title: String, text: String): ForegroundInfo {
-                  ensureChannel(context)
-                  val n = notification(context, title, text)
-                  return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ForegroundInfo(id, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else ForegroundInfo(id, n)
-              }
-
-              fun update(context: Context, id: Int, title: String, text: String) {
-                  ensureChannel(context)
-                  context.getSystemService(NotificationManager::class.java).notify(id, notification(context, title, text))
-              }
-
-              private fun notification(context: Context, title: String, text: String) = NotificationCompat.Builder(context, CHANNEL_ID)
-                  .setSmallIcon(R.drawable.ic_app_logo).setContentTitle(title).setContentText(text.take(120))
-                  .setStyle(NotificationCompat.BigTextStyle().bigText(text)).setOngoing(true).setOnlyAlertOnce(true).setSilent(true)
-                  .setContentIntent(PendingIntent.getActivity(context,0,Intent(context,StreamingMainActivity::class.java).apply { flags=Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP },PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build()
-
-              private fun ensureChannel(context: Context) {
-                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-                  val manager=context.getSystemService(NotificationManager::class.java)
-                  if (manager.getNotificationChannel(CHANNEL_ID)!=null) return
-                  manager.createNotificationChannel(NotificationChannel(CHANNEL_ID,"Синхронизация HealthConnector",NotificationManager.IMPORTANCE_LOW).apply { description="Ход длительной синхронизации Health Connect"; setSound(null,null) })
-              }
+              fun info(context: Context, id: Int, title: String, text: String): ForegroundInfo { ensureChannel(context); val n=notification(context,title,text); return if (Build.VERSION.SDK_INT>=Build.VERSION_CODES.Q) ForegroundInfo(id,n,ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else ForegroundInfo(id,n) }
+              fun update(context: Context, id: Int, title: String, text: String) { ensureChannel(context); context.getSystemService(NotificationManager::class.java).notify(id,notification(context,title,text)) }
+              private fun notification(context: Context, title: String, text: String)=NotificationCompat.Builder(context,CHANNEL_ID).setSmallIcon(R.drawable.ic_app_logo).setContentTitle(title).setContentText(text.take(120)).setStyle(NotificationCompat.BigTextStyle().bigText(text)).setOngoing(true).setOnlyAlertOnce(true).setSilent(true).setContentIntent(PendingIntent.getActivity(context,0,Intent(context,StreamingMainActivity::class.java).apply { flags=Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP },PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build()
+              private fun ensureChannel(context: Context) { if (Build.VERSION.SDK_INT<Build.VERSION_CODES.O) return; val manager=context.getSystemService(NotificationManager::class.java); if (manager.getNotificationChannel(CHANNEL_ID)!=null) return; manager.createNotificationChannel(NotificationChannel(CHANNEL_ID,"Синхронизация HealthConnector",NotificationManager.IMPORTANCE_LOW).apply { description="Ход длительной синхронизации Health Connect"; setSound(null,null) }) }
           }
           EOF
 
           cat > app/src/main/java/ru/doronin/healthconnector/ManualSyncScheduler.kt <<'EOF'
           package ru.doronin.healthconnector
-
           import android.content.Context
-          import androidx.work.BackoffPolicy
-          import androidx.work.Constraints
-          import androidx.work.ExistingWorkPolicy
-          import androidx.work.NetworkType
-          import androidx.work.OneTimeWorkRequestBuilder
-          import androidx.work.WorkManager
+          import androidx.work.*
           import java.util.concurrent.TimeUnit
-
-          object ManualSyncScheduler {
-              const val UNIQUE_WORK_NAME = "health_connector_manual_sync"
-              fun enqueue(context: Context) {
-                  val request=OneTimeWorkRequestBuilder<ManualSyncWorker>().setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).setBackoffCriteria(BackoffPolicy.EXPONENTIAL,30,TimeUnit.SECONDS).build()
-                  WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(UNIQUE_WORK_NAME,ExistingWorkPolicy.KEEP,request)
-              }
-          }
+          object ManualSyncScheduler { const val UNIQUE_WORK_NAME="health_connector_manual_sync"; fun enqueue(context: Context) { val request=OneTimeWorkRequestBuilder<ManualSyncWorker>().setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).setBackoffCriteria(BackoffPolicy.EXPONENTIAL,30,TimeUnit.SECONDS).build(); WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(UNIQUE_WORK_NAME,ExistingWorkPolicy.KEEP,request) } }
           EOF
 
           cat > app/src/main/java/ru/doronin/healthconnector/ManualSyncWorker.kt <<'EOF'
           package ru.doronin.healthconnector
-
           import android.content.Context
           import android.os.SystemClock
           import androidx.health.connect.client.HealthConnectClient
           import androidx.health.connect.client.HealthConnectFeatures
           import androidx.health.connect.client.permission.HealthPermission
-          import androidx.work.CoroutineWorker
-          import androidx.work.Data
-          import androidx.work.WorkerParameters
-          import androidx.work.workDataOf
+          import androidx.work.*
           import kotlinx.coroutines.CancellationException
-
           class ManualSyncWorker(appContext: Context, workerParams: WorkerParameters) : CoroutineWorker(appContext, workerParams) {
-              override suspend fun doWork(): Result {
-                  val prefs=applicationContext.getSharedPreferences("settings",Context.MODE_PRIVATE)
-                  val endpoint=prefs.getString("endpoint","").orEmpty().trim()
-                  val token=SecureTokenStore(applicationContext).getToken().trim()
-                  val days=prefs.getInt("days",7).coerceIn(1,30)
-                  if (endpoint.isBlank() || token.isBlank()) return failure("Не настроены URL Apps Script или токен")
-                  val safeEndpoint=runCatching { EndpointSecurity.requireHttps(endpoint) }.getOrElse { return failure(it.message ?: "Некорректный URL Apps Script") }
-                  if (HealthConnectClient.getSdkStatus(applicationContext)!=HealthConnectClient.SDK_AVAILABLE) return failure("Health Connect недоступен")
-                  val client=HealthConnectClient.getOrCreate(applicationContext)
-                  val bgFeature=client.features.getFeatureStatus(HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND)
-                  if (bgFeature==HealthConnectFeatures.FEATURE_STATUS_AVAILABLE) {
-                      val granted=runCatching { client.permissionController.getGrantedPermissions() }.getOrElse { return failure("Не удалось проверить разрешения Health Connect") }
-                      if (HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND !in granted) return failure("Разреши Health Connect чтение данных в фоне")
-                  }
-                  setForeground(SyncForeground.info(applicationContext,SyncForeground.MANUAL_NOTIFICATION_ID,"HealthConnector · синхронизация","Запуск… приложение можно свернуть"))
-                  val runId=SyncDiagnostics.begin(applicationContext,"manual")
-                  val startedAt=SystemClock.elapsedRealtime()
-                  return try {
-                      val result=SyncRunGate.runManual(onWaiting={ running -> val m="Ожидаю завершения ${running ?: "другой"} синхронизации…"; publish(m); SyncDiagnostics.progress(applicationContext,runId,"manual",m) }) {
-                          HealthSyncStreamer(applicationContext,client).sync(endpoint=safeEndpoint,token=token,days=days,includeHistoricalChanges=true,onProgress={ message -> val elapsed=(SystemClock.elapsedRealtime()-startedAt)/1000L; publish("$message · ${elapsed} с"); SyncDiagnostics.progress(applicationContext,runId,"manual",message) })
-                      }
-                      if (result==null) { SyncDiagnostics.skipped(applicationContext,"manual","Повторный ручной запуск не создан"); Result.success() }
-                      else {
-                          val now=System.currentTimeMillis()
-                          prefs.edit().putLong("dashboard_last_sync",now).putInt("dashboard_last_days",result.days).putInt("dashboard_last_workouts",result.workouts).putInt("dashboard_last_measurements",result.measurements).putInt("dashboard_last_sources",result.sources).putBoolean("dashboard_sheets_ok",true).apply()
-                          SyncDiagnostics.finish(applicationContext,runId,"manual","Дней ${result.days}, тренировок ${result.workouts}, измерений ${result.measurements}")
-                          Result.success(workDataOf(KEY_DAYS to result.days,KEY_WORKOUTS to result.workouts,KEY_MEASUREMENTS to result.measurements,KEY_SOURCES to result.sources))
-                      }
-                  } catch (cancelled: CancellationException) { SyncDiagnostics.skipped(applicationContext,"manual","Foreground-задание отменено системой"); throw cancelled }
-                  catch (error: Throwable) { SyncDiagnostics.failure(applicationContext,runId,"manual",error); failure(error.message ?: error.javaClass.simpleName) }
-              }
-              private fun publish(message:String) { setProgressAsync(workDataOf(KEY_PROGRESS to message)); SyncForeground.update(applicationContext,SyncForeground.MANUAL_NOTIFICATION_ID,"HealthConnector · синхронизация",message) }
+              override suspend fun doWork(): Result { val prefs=applicationContext.getSharedPreferences("settings",Context.MODE_PRIVATE); val endpoint=prefs.getString("endpoint","").orEmpty().trim(); val token=SecureTokenStore(applicationContext).getToken().trim(); val days=prefs.getInt("days",7).coerceIn(1,30); if(endpoint.isBlank()||token.isBlank()) return failure("Не настроены URL Apps Script или токен"); val safeEndpoint=runCatching{EndpointSecurity.requireHttps(endpoint)}.getOrElse{return failure(it.message?:"Некорректный URL Apps Script")}; if(HealthConnectClient.getSdkStatus(applicationContext)!=HealthConnectClient.SDK_AVAILABLE) return failure("Health Connect недоступен"); val client=HealthConnectClient.getOrCreate(applicationContext); val bgFeature=client.features.getFeatureStatus(HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND); if(bgFeature==HealthConnectFeatures.FEATURE_STATUS_AVAILABLE){ val granted=runCatching{client.permissionController.getGrantedPermissions()}.getOrElse{return failure("Не удалось проверить разрешения Health Connect")}; if(HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND !in granted) return failure("Разреши Health Connect чтение данных в фоне") }; setForeground(SyncForeground.info(applicationContext,SyncForeground.MANUAL_NOTIFICATION_ID,"HealthConnector · синхронизация","Запуск… приложение можно свернуть")); val runId=SyncDiagnostics.begin(applicationContext,"manual"); val startedAt=SystemClock.elapsedRealtime(); return try { val result=SyncRunGate.runManual(onWaiting={running->val m="Ожидаю завершения ${running?:"другой"} синхронизации…";publish(m);SyncDiagnostics.progress(applicationContext,runId,"manual",m)}) { HealthSyncStreamer(applicationContext,client).sync(endpoint=safeEndpoint,token=token,days=days,includeHistoricalChanges=true,onProgress={message->val elapsed=(SystemClock.elapsedRealtime()-startedAt)/1000L;publish("$message · ${elapsed} с");SyncDiagnostics.progress(applicationContext,runId,"manual",message)}) }; if(result==null){SyncDiagnostics.skipped(applicationContext,"manual","Повторный ручной запуск не создан");Result.success()} else { val now=System.currentTimeMillis(); prefs.edit().putLong("dashboard_last_sync",now).putInt("dashboard_last_days",result.days).putInt("dashboard_last_workouts",result.workouts).putInt("dashboard_last_measurements",result.measurements).putInt("dashboard_last_sources",result.sources).putBoolean("dashboard_sheets_ok",true).apply(); SyncDiagnostics.finish(applicationContext,runId,"manual","Дней ${result.days}, тренировок ${result.workouts}, измерений ${result.measurements}"); Result.success(workDataOf(KEY_DAYS to result.days,KEY_WORKOUTS to result.workouts,KEY_MEASUREMENTS to result.measurements,KEY_SOURCES to result.sources)) } } catch(cancelled:CancellationException){SyncDiagnostics.skipped(applicationContext,"manual","Foreground-задание отменено системой");throw cancelled} catch(error:Throwable){SyncDiagnostics.failure(applicationContext,runId,"manual",error);failure(error.message?:error.javaClass.simpleName)} }
+              private fun publish(message:String){setProgressAsync(workDataOf(KEY_PROGRESS to message));SyncForeground.update(applicationContext,SyncForeground.MANUAL_NOTIFICATION_ID,"HealthConnector · синхронизация",message)}
               private fun failure(message:String):Result=Result.failure(Data.Builder().putString(KEY_ERROR,message).build())
-              companion object { const val KEY_PROGRESS="progress"; const val KEY_ERROR="error"; const val KEY_DAYS="days"; const val KEY_WORKOUTS="workouts"; const val KEY_MEASUREMENTS="measurements"; const val KEY_SOURCES="sources" }
+              companion object{const val KEY_PROGRESS="progress";const val KEY_ERROR="error";const val KEY_DAYS="days";const val KEY_WORKOUTS="workouts";const val KEY_MEASUREMENTS="measurements";const val KEY_SOURCES="sources"}
           }
           EOF
 
@@ -184,3 +117,4 @@ jobs:
           git add app
           git commit -m "Run sync reliably in foreground workers"
           git push origin feat/reliable-background-sync
+# trigger
