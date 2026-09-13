@@ -1,0 +1,118 @@
+name: Deploy Apps Script
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'apps-script/**'
+  workflow_dispatch:
+
+concurrency:
+  group: apps-script-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy production Apps Script
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      APPS_SCRIPT_ID: ${{ secrets.APPS_SCRIPT_ID }}
+      APPS_SCRIPT_DEPLOYMENT_ID: ${{ secrets.APPS_SCRIPT_DEPLOYMENT_ID }}
+      CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate deployment secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${APPS_SCRIPT_ID}" ]] || { echo '::error::Missing secret APPS_SCRIPT_ID'; exit 1; }
+          [[ -n "${APPS_SCRIPT_DEPLOYMENT_ID}" ]] || { echo '::error::Missing secret APPS_SCRIPT_DEPLOYMENT_ID'; exit 1; }
+          [[ -n "${CLASPRC_JSON}" ]] || { echo '::error::Missing secret CLASPRC_JSON'; exit 1; }
+
+      - name: Install clasp
+        run: npm install --global @google/clasp@3.4.1
+
+      - name: Prepare authenticated working copy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          printf '%s' "${CLASPRC_JSON}" > "${HOME}/.clasprc.json"
+          chmod 600 "${HOME}/.clasprc.json"
+
+          DEPLOY_DIR="${RUNNER_TEMP}/apps-script-deploy"
+          mkdir -p "${DEPLOY_DIR}"
+          cat > "${DEPLOY_DIR}/.clasp.json" <<EOF
+          {"scriptId":"${APPS_SCRIPT_ID}","rootDir":"."}
+          EOF
+
+          cd "${DEPLOY_DIR}"
+          clasp pull
+
+          # Pull first so the current manifest and any additional server files are
+          # preserved. Only the repository-owned Code file is replaced.
+          if [[ -f Code.js ]]; then
+            TARGET_FILE='Code.js'
+          elif [[ -f Code.gs ]]; then
+            TARGET_FILE='Code.gs'
+          else
+            echo '::error::Apps Script project does not contain Code.js/Code.gs'
+            exit 1
+          fi
+
+          cp "${GITHUB_WORKSPACE}/apps-script/Code.gs" "${TARGET_FILE}"
+          test -f appsscript.json || { echo '::error::Apps Script manifest was not pulled'; exit 1; }
+
+      - name: Push source to Apps Script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/apps-script-deploy"
+          clasp push --force
+
+      - name: Create immutable Apps Script version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/apps-script-deploy"
+          DESCRIPTION="GitHub ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}"
+          clasp create-version "${DESCRIPTION}" --json > "${RUNNER_TEMP}/apps-script-version.json"
+          VERSION="$(jq -er '.versionNumber' "${RUNNER_TEMP}/apps-script-version.json")"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Created Apps Script version ${VERSION}"
+
+      - name: Update existing web app deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/apps-script-deploy"
+          VERSION='${{ steps.version.outputs.version }}'
+          DESCRIPTION="GitHub ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}"
+          clasp update-deployment "${APPS_SCRIPT_DEPLOYMENT_ID}" \
+            --versionNumber "${VERSION}" \
+            --description "${DESCRIPTION}" \
+            --json
+
+      - name: Deployment summary
+        shell: bash
+        run: |
+          {
+            echo '### Apps Script deployed'
+            echo
+            echo "- Version: ${{ steps.version.outputs.version }}"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo '- Existing deployment ID was updated; the web-app URL stays unchanged.'
+          } >> "${GITHUB_STEP_SUMMARY}"
