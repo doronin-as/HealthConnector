@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.6.21 — Forced Xiaomi scale finder
+
+- Added a dedicated `Найти весы вручную` screen from Xiaomi scale settings.
+- Manual discovery runs a 30-second `SCAN_MODE_LOW_LATENCY` BLE scan without restrictive filters, so the phone can surface the scale even when firmware advertisements do not match the known background filters.
+- The finder shows a live countdown plus the number of all nearby BLE devices and the number recognized as likely Xiaomi body-composition scales.
+- Known scale candidates are detected from Service Data UUID `0x181B`, advertised service UUID `0x181B`, known scale names, and successfully parsed stable measurements.
+- Candidate rows show device name, Bluetooth address, RSSI, recognition reason, and weight/impedance when a stable body-composition packet is already available.
+- Added explicit manual binding: the user can select a discovered candidate and store its Bluetooth address as the bound scale.
+- Added an optional `Показать все BLE-устройства` mode as a diagnostic escape hatch for unknown firmware signatures; manual binding of an unrecognized device remains possible when the user identifies it confidently.
+- The normal low-power persistent background scanner is restarted after leaving the manual finder or after binding.
+- Added runtime Bluetooth permission handling and system Bluetooth enable flow directly in the finder.
+- Bumped Android version to `1.6.21` / versionCode `35`.
+
+## 1.6.20 — Xiaomi scale BLE discovery diagnostics
+
+- Fixed XMTZC05HM discovery so the persistent scanner matches Body Composition `0x181B` when it is published as BLE Service Data, not only as an advertised service UUID.
+- Added fallback filters for advertised `0x181B` and the legacy `MIBFS` device name.
+- The PendingIntent scanner now stops/restarts before applying new filters, avoiding stale scan registration after an app update.
+- Added persistent BLE diagnostics: scan state/start time, last packet time/address/name/RSSI, last parsed measurement, and last scanner error.
+- Added live scanner diagnostics to the Xiaomi scale settings screen, refreshed every second while the screen is open.
+- Added `Проверить BLE-сканер сейчас` for an explicit background scanner restart/test.
+- Bumped Android version to `1.6.20` / versionCode `34`.
+
 ## 1.6.19 — In-app Dashboard, devices and automatic profile discovery
 
 - Added a dedicated `Дашборд` tab to HealthConnector as the default application page.
