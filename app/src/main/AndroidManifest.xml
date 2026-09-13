@@ -28,7 +28,7 @@
         android:usesCleartextTraffic="false"
         android:icon="@drawable/ic_app_logo"
         android:roundIcon="@drawable/ic_app_logo"
-        android:label="Health Connector 2"
+        android:label="${appLabel}"
         android:theme="@style/Theme.HealthConnector">
         <activity
             android:name=".StreamingMainActivity"
@@ -42,7 +42,7 @@
         <activity
             android:name=".ShareCsvActivity"
             android:exported="true"
-            android:label="FatSecret → Health Connector 2">
+            android:label="FatSecret → ${appLabel}">
             <!-- FatSecret/Android vendors may expose the exported report using
                  different MIME types. A wildcard share receiver guarantees that
                  Android can offer Health Connector in the share sheet; the activity

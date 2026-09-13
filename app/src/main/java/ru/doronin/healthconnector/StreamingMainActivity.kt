@@ -132,6 +132,8 @@ class StreamingMainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        setupVersionBadge()
+
         binding.endpoint.setText(prefs.getString("endpoint", ""))
         binding.token.setText(secureTokenStore.getToken())
         binding.days.setText(prefs.getInt("days", 7).toString())
@@ -156,6 +158,52 @@ class StreamingMainActivity : AppCompatActivity() {
             val settings = saveSettingsFromForm()
             lifecycleScope.launch { synchronize(settings) }
         }
+    }
+
+    private fun setupVersionBadge() {
+        val header = binding.root.getChildAt(0) as? LinearLayout ?: return
+        val isTestBuild = packageName != "ru.doronin.healthconnector.stable"
+        val versionName = packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+        val badgeText = buildString {
+            append("v")
+            append(versionName)
+            if (isTestBuild) append(" · TEST")
+        }
+        val badge = TextView(this).apply {
+            text = badgeText
+            textSize = 11f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(
+                com.google.android.material.color.MaterialColors.getColor(
+                    this,
+                    com.google.android.material.R.attr.colorOnSecondaryContainer
+                )
+            )
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                cornerRadius = dp(999).toFloat()
+                setColor(
+                    com.google.android.material.color.MaterialColors.getColor(
+                        this@StreamingMainActivity,
+                        com.google.android.material.R.attr.colorSecondaryContainer,
+                        0
+                    )
+                )
+            }
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            contentDescription = "Версия $badgeText"
+        }
+        header.addView(
+            badge,
+            1,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(6)
+                bottomMargin = dp(2)
+            }
+        )
     }
 
     override fun onResume() {
