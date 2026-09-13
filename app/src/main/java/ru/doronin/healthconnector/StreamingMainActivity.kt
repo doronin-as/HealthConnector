@@ -162,10 +162,11 @@ class StreamingMainActivity : AppCompatActivity() {
 
     private fun setupVersionBadge() {
         val header = binding.root.getChildAt(0) as? LinearLayout ?: return
-        val isTestBuild = BuildConfig.APPLICATION_ID != "ru.doronin.healthconnector.stable"
+        val isTestBuild = packageName != "ru.doronin.healthconnector.stable"
+        val versionName = packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
         val badgeText = buildString {
             append("v")
-            append(BuildConfig.VERSION_NAME)
+            append(versionName)
             if (isTestBuild) append(" · TEST")
         }
         val badge = TextView(this).apply {
