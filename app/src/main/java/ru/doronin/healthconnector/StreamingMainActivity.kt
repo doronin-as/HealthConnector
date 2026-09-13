@@ -133,6 +133,7 @@ class StreamingMainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         setupVersionBadge()
+        setupMiScaleSettingsCard()
 
         binding.endpoint.setText(prefs.getString("endpoint", ""))
         binding.token.setText(secureTokenStore.getToken())
@@ -240,6 +241,49 @@ class StreamingMainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshBackgroundInfo()
+    }
+
+    private fun setupMiScaleSettingsCard() {
+        val container = binding.settingsPage.getChildAt(0) as? LinearLayout ?: return
+        val card = MaterialCardView(this).apply {
+            radius = dp(20).toFloat()
+            strokeWidth = dp(1)
+            cardElevation = 0f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(18), dp(20), dp(18))
+        }
+        content.addView(TextView(this).apply {
+            text = "Умные весы Xiaomi"
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        val enabled = prefs.getBoolean(MiScaleScanner.PREF_ENABLED, false)
+        val address = prefs.getString(MiScaleScanner.PREF_BOUND_ADDRESS, "").orEmpty()
+        val lastWeight = prefs.getString(MiScaleUploadWorker.PREF_LAST_WEIGHT, "").orEmpty()
+        content.addView(TextView(this).apply {
+            text = buildString {
+                append(if (enabled) "Автосчитывание включено" else "Автосчитывание выключено")
+                if (address.isNotBlank()) append(" · ").append(address)
+                if (lastWeight.isNotBlank()) append("\nПоследний вес: ").append(lastWeight).append(" кг")
+            }
+            textSize = 13f
+            alpha = 0.72f
+            setPadding(0, dp(6), 0, dp(10))
+        })
+        content.addView(android.widget.Button(this).apply {
+            text = "Настроить весы"
+            setOnClickListener {
+                startActivity(android.content.Intent(this@StreamingMainActivity, MiScaleSettingsActivity::class.java))
+            }
+        })
+        card.addView(content)
+        container.addView(card)
     }
 
     private fun setupDiagnosticsControls() {
