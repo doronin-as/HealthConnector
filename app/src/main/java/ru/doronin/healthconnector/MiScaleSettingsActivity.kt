@@ -2,6 +2,8 @@ package ru.doronin.healthconnector
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.View
 import android.widget.ArrayAdapter
@@ -27,12 +29,32 @@ class MiScaleSettingsActivity : AppCompatActivity() {
     private lateinit var sex: Spinner
     private lateinit var boundInfo: TextView
     private lateinit var profileSyncInfo: TextView
+    private lateinit var scannerInfo: TextView
+    private val handler = Handler(Looper.getMainLooper())
+    private val refreshRunnable = object : Runnable {
+        override fun run() {
+            refreshBoundInfo()
+            refreshScannerDiagnostics()
+            handler.postDelayed(this, 1000L)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         title = "Умные весы"
         setContentView(buildContent())
         autoLoadProfileFromDashboard()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        handler.removeCallbacks(refreshRunnable)
+        handler.post(refreshRunnable)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(refreshRunnable)
+        super.onPause()
     }
 
     private fun buildContent(): View {
@@ -104,11 +126,32 @@ class MiScaleSettingsActivity : AppCompatActivity() {
 
         boundInfo = TextView(this).apply {
             textSize = 13f
-            alpha = 0.75f
-            setPadding(0, dp(16), 0, dp(8))
+            alpha = 0.82f
+            setPadding(0, dp(16), 0, dp(6))
         }
         root.addView(boundInfo)
+
+        scannerInfo = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, dp(4), 0, dp(8))
+        }
+        root.addView(scannerInfo)
         refreshBoundInfo()
+        refreshScannerDiagnostics()
+
+        root.addView(Button(this).apply {
+            text = "Проверить BLE-сканер сейчас"
+            setOnClickListener {
+                prefs.edit().putBoolean(MiScaleScanner.PREF_ENABLED, enabled.isChecked).apply()
+                val started = MiScaleScanner.start(this@MiScaleSettingsActivity)
+                refreshScannerDiagnostics()
+                Toast.makeText(
+                    this@MiScaleSettingsActivity,
+                    if (started) "BLE-сканер запущен. Встаньте на весы." else "Сканер не запустился — см. диагностику ниже.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        })
 
         root.addView(Button(this).apply {
             text = "Сбросить привязку весов"
@@ -120,7 +163,7 @@ class MiScaleSettingsActivity : AppCompatActivity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "После сохранения встаньте на весы босиком. Первое стабильное измерение автоматически привяжет ближайшие совместимые весы; импеданс нужен для расчёта состава тела."
+            text = "После сохранения встаньте на весы босиком. Первое стабильное измерение автоматически привяжет ближайшие совместимые весы; импеданс нужен для расчёта состава тела. Диагностика выше обновляется каждую секунду и покажет, видит ли телефон BLE-пакеты."
             textSize = 13f
             alpha = 0.72f
             setPadding(0, dp(12), 0, dp(12))
@@ -216,8 +259,20 @@ class MiScaleSettingsActivity : AppCompatActivity() {
         if (sexValue != null) edit.putString(MiScaleProfile.PREF_SEX, sexValue)
         edit.apply()
 
-        if (enabled.isChecked) MiScaleScanner.start(this) else MiScaleScanner.stop(this)
-        Toast.makeText(this, if (enabled.isChecked) "Весы включены. Встаньте на них для привязки." else "Считывание весов выключено", Toast.LENGTH_LONG).show()
+        val started = if (enabled.isChecked) MiScaleScanner.start(this) else {
+            MiScaleScanner.stop(this)
+            false
+        }
+        refreshScannerDiagnostics()
+        Toast.makeText(
+            this,
+            when {
+                !enabled.isChecked -> "Считывание весов выключено"
+                started -> "BLE-сканер запущен. Встаньте на весы для привязки."
+                else -> "Не удалось запустить BLE-сканер — откройте настройки весов и посмотрите диагностику."
+            },
+            Toast.LENGTH_LONG
+        ).show()
         continueToMain()
     }
 
@@ -227,6 +282,30 @@ class MiScaleSettingsActivity : AppCompatActivity() {
             "Весы ещё не привязаны"
         } else {
             "Привязаны весы: $address"
+        }
+    }
+
+    private fun refreshScannerDiagnostics() {
+        if (!::scannerInfo.isInitialized) return
+        val permissions = if (MiScaleScanner.hasPermissions(this)) "разрешения ✓" else "разрешения НЕТ"
+        val state = prefs.getString(MiScaleScanner.PREF_SCAN_STATE, "Сканер ещё не запускался").orEmpty()
+        val packetAt = prefs.getLong(MiScaleScanner.PREF_LAST_PACKET_AT, 0L)
+        val address = prefs.getString(MiScaleScanner.PREF_LAST_PACKET_ADDRESS, "").orEmpty()
+        val name = prefs.getString(MiScaleScanner.PREF_LAST_PACKET_NAME, "").orEmpty()
+        val rssi = prefs.getInt(MiScaleScanner.PREF_LAST_PACKET_RSSI, 0)
+        val last = prefs.getString(MiScaleScanner.PREF_LAST_MEASUREMENT, "").orEmpty()
+        val error = prefs.getString(MiScaleScanner.PREF_LAST_ERROR, "").orEmpty()
+        val packetText = if (packetAt <= 0L) {
+            "BLE-пакеты: пока не получены"
+        } else {
+            val sec = ((System.currentTimeMillis() - packetAt).coerceAtLeast(0L) / 1000L)
+            val device = listOf(name, address).filter { it.isNotBlank() }.joinToString(" · ")
+            "Последний BLE-пакет: ${sec}с назад${if (device.isBlank()) "" else " · $device"}${if (rssi == 0) "" else " · $rssi dBm"}"
+        }
+        scannerInfo.text = buildString {
+            append("Диагностика: $permissions\n$state\n$packetText")
+            if (last.isNotBlank()) append("\nПоследнее измерение: $last")
+            if (error.isNotBlank()) append("\nОшибка: $error")
         }
     }
 
