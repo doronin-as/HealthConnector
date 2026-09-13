@@ -14,6 +14,8 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.format.DateTimeParseException
 
@@ -24,11 +26,13 @@ class MiScaleSettingsActivity : AppCompatActivity() {
     private lateinit var birthDate: EditText
     private lateinit var sex: Spinner
     private lateinit var boundInfo: TextView
+    private lateinit var profileSyncInfo: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         title = "Умные весы"
         setContentView(buildContent())
+        autoLoadProfileFromDashboard()
     }
 
     private fun buildContent(): View {
@@ -45,7 +49,7 @@ class MiScaleSettingsActivity : AppCompatActivity() {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         root.addView(TextView(this).apply {
-            text = "Модель XMTZC05HM. HealthConnector слушает BLE-пакеты весов без Mi Fitness и сохраняет измерения в Dashboard. Для жира, воды и мышц нужны рост, дата рождения и пол."
+            text = "Модель XMTZC05HM. HealthConnector слушает BLE-пакеты весов без Mi Fitness и сохраняет измерения в Dashboard. Рост, дата рождения и пол сначала ищутся автоматически в листе «Профиль»; ручной ввод остаётся резервным."
             textSize = 14f
             alpha = 0.72f
             setPadding(0, dp(8), 0, dp(12))
@@ -56,6 +60,18 @@ class MiScaleSettingsActivity : AppCompatActivity() {
             isChecked = prefs.getBoolean(MiScaleScanner.PREF_ENABLED, true)
         }
         root.addView(enabled)
+
+        profileSyncInfo = TextView(this).apply {
+            text = "Автоподхват профиля: проверяю Dashboard…"
+            textSize = 13f
+            alpha = 0.78f
+            setPadding(0, dp(12), 0, dp(4))
+        }
+        root.addView(profileSyncInfo)
+        root.addView(Button(this).apply {
+            text = "Обновить профиль из Dashboard"
+            setOnClickListener { autoLoadProfileFromDashboard(manual = true) }
+        })
 
         root.addView(label("Рост, см"))
         height = EditText(this).apply {
@@ -121,6 +137,42 @@ class MiScaleSettingsActivity : AppCompatActivity() {
 
         return ScrollView(this).apply { addView(root) }
     }
+
+    private fun autoLoadProfileFromDashboard(manual: Boolean = false) {
+        val endpoint = prefs.getString("endpoint", "").orEmpty().trim()
+        val token = SecureTokenStore(this).getToken().trim()
+        if (endpoint.isBlank() || token.isBlank()) {
+            profileSyncInfo.text = "Автоподхват: сначала сохрани URL Apps Script и токен в HealthConnector."
+            return
+        }
+
+        profileSyncInfo.text = if (manual) "Обновляю профиль из Dashboard…" else "Автоподхват профиля: читаю лист «Профиль»…"
+        lifecycleScope.launch {
+            runCatching { DashboardApi.fetch(endpoint, token) }
+                .onSuccess { snapshot ->
+                    val applied = DashboardApi.applyScaleProfile(prefs, snapshot.profile)
+                    snapshot.profile.heightCm?.let { height.setText(trimNumber(it)) }
+                    snapshot.profile.birthDate?.let { birthDate.setText(it) }
+                    when (snapshot.profile.sex) {
+                        "male" -> sex.setSelection(1)
+                        "female" -> sex.setSelection(2)
+                    }
+                    val found = buildList {
+                        if (snapshot.profile.heightCm != null) add("рост ✓")
+                        if (snapshot.profile.birthDate != null) add("дата рождения ✓")
+                        if (snapshot.profile.sex != null) add("пол ✓") else add("пол — нет в таблице")
+                    }
+                    profileSyncInfo.text = "Профиль загружен из Dashboard: ${found.joinToString(" · ")}" +
+                        if (applied.isEmpty()) "" else "\nАвтоматически сохранено: ${applied.joinToString()}"
+                }
+                .onFailure { error ->
+                    profileSyncInfo.text = "Не удалось загрузить профиль из Dashboard: ${error.message ?: error.javaClass.simpleName}. Можно заполнить поля вручную."
+                }
+        }
+    }
+
+    private fun trimNumber(value: Double): String =
+        if (value % 1.0 == 0.0) value.toInt().toString() else value.toString()
 
     private fun label(textValue: String) = TextView(this).apply {
         text = textValue

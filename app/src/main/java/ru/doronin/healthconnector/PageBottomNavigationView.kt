@@ -20,17 +20,18 @@ class PageBottomNavigationView @JvmOverloads constructor(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        if (selectedItemId == 0) selectedItemId = R.id.nav_sync
+        if (selectedItemId == 0) selectedItemId = R.id.nav_dashboard
         showPage(selectedItemId)
     }
 
     private fun showPage(itemId: Int) {
         val root = rootView ?: return
+        val dashboardPage = root.findViewById<View>(R.id.dashboardPage) ?: return
         val syncPage = root.findViewById<View>(R.id.syncPage) ?: return
         val settingsPage = root.findViewById<View>(R.id.settingsPage) ?: return
 
-        val settingsSelected = itemId == R.id.nav_settings
-        syncPage.visibility = if (settingsSelected) View.GONE else View.VISIBLE
-        settingsPage.visibility = if (settingsSelected) View.VISIBLE else View.GONE
+        dashboardPage.visibility = if (itemId == R.id.nav_dashboard) View.VISIBLE else View.GONE
+        syncPage.visibility = if (itemId == R.id.nav_sync) View.VISIBLE else View.GONE
+        settingsPage.visibility = if (itemId == R.id.nav_settings) View.VISIBLE else View.GONE
     }
 }

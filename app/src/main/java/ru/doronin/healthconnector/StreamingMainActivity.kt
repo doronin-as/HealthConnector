@@ -58,6 +58,11 @@ class StreamingMainActivity : AppCompatActivity() {
 
     private var backgroundInfo: TextView? = null
     private var backgroundSwitch: SwitchMaterial? = null
+    private var dashboardStatusText: TextView? = null
+    private var dashboardSummaryText: TextView? = null
+    private var dashboardDevicesText: TextView? = null
+    private var dashboardProfileText: TextView? = null
+    private var dashboardGoogleUrl: String? = null
 
     private val recordPermissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
@@ -132,6 +137,7 @@ class StreamingMainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        setupDashboardPage()
         setupVersionBadge()
         setupMiScaleSettingsCard()
 
@@ -165,6 +171,7 @@ class StreamingMainActivity : AppCompatActivity() {
             }
         }
         setupManualSyncObserver()
+        refreshDashboardSnapshot()
     }
 
     private fun setupManualSyncObserver() {
@@ -182,6 +189,7 @@ class StreamingMainActivity : AppCompatActivity() {
                         val days = work.outputData.getInt(ManualSyncWorker.KEY_DAYS, -1)
                         val measurements = work.outputData.getInt(ManualSyncWorker.KEY_MEASUREMENTS, -1)
                         if (days >= 0) binding.status.text = "Синхронизация завершена: дней $days, измерений $measurements"
+                        refreshDashboardSnapshot(showStatus = false)
                     }
                     androidx.work.WorkInfo.State.FAILED -> {
                         val error = work.outputData.getString(ManualSyncWorker.KEY_ERROR) ?: "неизвестная ошибка"
@@ -241,6 +249,209 @@ class StreamingMainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshBackgroundInfo()
+        refreshDashboardSnapshot(showStatus = false)
+    }
+
+    private fun setupDashboardPage() {
+        val frame = binding.syncPage.parent as? android.widget.FrameLayout ?: return
+        if (findViewById<android.view.View?>(R.id.dashboardPage) != null) return
+
+        val scroll = android.widget.ScrollView(this).apply {
+            id = R.id.dashboardPage
+            isFillViewport = true
+            visibility = android.view.View.GONE
+            layoutParams = android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(24))
+        }
+        scroll.addView(container)
+
+        container.addView(TextView(this).apply {
+            text = "Дашборд"
+            textSize = 24f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        container.addView(TextView(this).apply {
+            text = "Последние данные из Google Dashboard, профиль и активные источники."
+            textSize = 14f
+            alpha = 0.72f
+            setPadding(0, dp(4), 0, dp(12))
+        })
+
+        dashboardStatusText = TextView(this).apply {
+            text = "Загружаю Dashboard…"
+            textSize = 13f
+            alpha = 0.78f
+            setPadding(0, 0, 0, dp(8))
+        }.also(container::addView)
+
+        container.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Обновить Dashboard"
+            setOnClickListener {
+                saveSettingsFromForm()
+                refreshDashboardSnapshot()
+            }
+        })
+
+        dashboardSummaryText = TextView(this).apply {
+            text = "Нет данных"
+            textSize = 15f
+            setLineSpacing(0f, 1.18f)
+        }
+        container.addView(makeDashboardCard("Последние показатели", dashboardSummaryText!!))
+
+        dashboardDevicesText = TextView(this).apply {
+            text = "Ищу устройства и источники…"
+            textSize = 14f
+            setLineSpacing(0f, 1.18f)
+        }
+        container.addView(makeDashboardCard("Устройства и источники", dashboardDevicesText!!))
+
+        dashboardProfileText = TextView(this).apply {
+            text = "Профиль ещё не загружен"
+            textSize = 14f
+            setLineSpacing(0f, 1.18f)
+        }
+        container.addView(makeDashboardCard("Автоподхват профиля", dashboardProfileText!!))
+
+        container.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Открыть Google Dashboard"
+            setOnClickListener {
+                val url = dashboardGoogleUrl
+                if (url.isNullOrBlank()) {
+                    refreshDashboardSnapshot()
+                } else {
+                    startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+                }
+            }
+        })
+
+        frame.addView(scroll, 0)
+    }
+
+    private fun makeDashboardCard(title: String, body: TextView): MaterialCardView =
+        MaterialCardView(this).apply {
+            radius = dp(20).toFloat()
+            strokeWidth = dp(1)
+            cardElevation = 0f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
+            addView(LinearLayout(this@StreamingMainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(18), dp(18), dp(18), dp(18))
+                addView(TextView(this@StreamingMainActivity).apply {
+                    text = title
+                    textSize = 18f
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                })
+                body.setPadding(0, dp(8), 0, 0)
+                addView(body)
+            })
+        }
+
+    private fun refreshDashboardSnapshot(showStatus: Boolean = true) {
+        if (!::binding.isInitialized || dashboardStatusText == null) return
+        val endpoint = binding.endpoint.text?.toString()?.trim().orEmpty().ifBlank {
+            prefs.getString("endpoint", "").orEmpty().trim()
+        }
+        val token = secureTokenStore.getToken().trim()
+        if (endpoint.isBlank() || token.isBlank()) {
+            dashboardStatusText?.text = "Для Dashboard сначала укажи URL Apps Script и токен в настройках."
+            return
+        }
+        if (showStatus) dashboardStatusText?.text = "Обновляю данные из Google Dashboard…"
+
+        lifecycleScope.launch {
+            runCatching { DashboardApi.fetch(endpoint, token) }
+                .onSuccess { snapshot ->
+                    val applied = DashboardApi.applyScaleProfile(prefs, snapshot.profile)
+                    dashboardGoogleUrl = snapshot.dashboardUrl
+                    dashboardStatusText?.text = buildString {
+                        append("Dashboard подключён")
+                        snapshot.fetchedAt?.let { append(" · ").append(it.take(19).replace('T', ' ')) }
+                        if (applied.isNotEmpty()) append("\nПрофиль весов обновлён автоматически: ").append(applied.joinToString())
+                    }
+                    renderDashboardSummary(snapshot.summary)
+                    renderDashboardDevices(snapshot.devices)
+                    renderDashboardProfile(snapshot.profile)
+                }
+                .onFailure { error ->
+                    dashboardStatusText?.text = "Ошибка Dashboard: ${error.message ?: error.javaClass.simpleName}"
+                }
+        }
+    }
+
+    private fun renderDashboardSummary(summary: DashboardApi.Summary) {
+        fun number(value: Double?, digits: Int = 1): String = when {
+            value == null -> "—"
+            digits == 0 -> String.format(java.util.Locale.getDefault(), "%.0f", value)
+            else -> String.format(java.util.Locale.getDefault(), "%.1f", value)
+        }
+        val sleep = summary.mainSleepHours ?: summary.sleepHours
+        dashboardSummaryText?.text = buildString {
+            append("Дата: ").append(summary.date ?: "—")
+            append("\nВес: ").append(number(summary.weightKg)).append(if (summary.weightKg != null) " кг" else "")
+            append("\nШаги: ").append(summary.steps?.toString() ?: "—")
+            append("\nСон: ").append(number(sleep)).append(if (sleep != null) " ч" else "")
+            append("\nПульс покоя: ").append(number(summary.restingHeartRate, 0)).append(if (summary.restingHeartRate != null) " уд/мин" else "")
+            append("\nСредний пульс: ").append(number(summary.averageHeartRate, 0)).append(if (summary.averageHeartRate != null) " уд/мин" else "")
+            append("\nSpO₂: ").append(number(summary.averageSpO2)).append(if (summary.averageSpO2 != null) "%" else "")
+            append("\nАктивные калории: ").append(number(summary.activeCaloriesKcal, 0)).append(if (summary.activeCaloriesKcal != null) " ккал" else "")
+            append("\nТренировки: ").append(summary.workoutCount?.toString() ?: "—")
+        }
+    }
+
+    private fun renderDashboardDevices(remote: List<DashboardApi.Device>) {
+        val lines = mutableListOf<String>()
+        val scaleEnabled = prefs.getBoolean(MiScaleScanner.PREF_ENABLED, false)
+        val scaleAddress = prefs.getString(MiScaleScanner.PREF_BOUND_ADDRESS, "").orEmpty()
+        val scaleWeight = prefs.getString(MiScaleUploadWorker.PREF_LAST_WEIGHT, "").orEmpty()
+        lines += buildString {
+            append("Xiaomi Mi Body Composition Scale 2 · XMTZC05HM")
+            append(if (scaleEnabled) " · автосчитывание включено" else " · выключено")
+            if (scaleAddress.isNotBlank()) append("\n  Bluetooth: ").append(scaleAddress)
+            if (scaleWeight.isNotBlank()) append(" · последний вес ").append(scaleWeight).append(" кг")
+        }
+        lines += if (HealthConnectClient.getSdkStatus(this) == HealthConnectClient.SDK_AVAILABLE) {
+            "Health Connect · доступен"
+        } else {
+            "Health Connect · недоступен"
+        }
+        remote.distinctBy { listOf(it.type, it.name, it.packageName, it.address) }.forEach { device ->
+            lines += buildString {
+                append(device.name)
+                if (device.type.isNotBlank()) append(" · ").append(device.type)
+                device.packageName?.let { append("\n  ").append(it) }
+                device.address?.let { append(" · ").append(it) }
+                device.lastSeen?.let { append("\n  Последние данные: ").append(it) }
+            }
+        }
+        dashboardDevicesText?.text = lines.distinct().joinToString("\n\n")
+    }
+
+    private fun renderDashboardProfile(profile: DashboardApi.Profile) {
+        val localSex = prefs.getString(MiScaleProfile.PREF_SEX, "").orEmpty()
+        dashboardProfileText?.text = buildString {
+            append("Лист «Профиль»: ")
+            append(if (profile.heightCm != null) "рост ✓" else "рост —")
+            append(" · ")
+            append(if (profile.birthDate != null) "дата рождения ✓" else "дата рождения —")
+            append(" · ")
+            append(if (profile.sex != null) "пол ✓" else "пол — не найден")
+            append("\nРост и дата рождения автоматически передаются модулю весов при каждом обновлении Dashboard.")
+            if (profile.sex == null && localSex.isNotBlank()) {
+                append(" Для пола используется сохранённое в приложении значение.")
+            } else if (profile.sex == null) {
+                append(" Пол нужно один раз выбрать в настройках весов или добавить строку «Пол» в лист «Профиль».")
+            }
+        }
     }
 
     private fun setupMiScaleSettingsCard() {
@@ -279,6 +490,7 @@ class StreamingMainActivity : AppCompatActivity() {
         content.addView(android.widget.Button(this).apply {
             text = "Настроить весы"
             setOnClickListener {
+                saveSettingsFromForm()
                 startActivity(android.content.Intent(this@StreamingMainActivity, MiScaleSettingsActivity::class.java))
             }
         })
@@ -554,6 +766,7 @@ class StreamingMainActivity : AppCompatActivity() {
         }.onSuccess {
             binding.status.text = "Настройки восстановлены"
             refreshBackgroundInfo()
+            refreshDashboardSnapshot()
         }.onFailure {
             binding.status.text = "Ошибка импорта настроек: ${it.message}"
         }

@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <menu xmlns:android="http://schemas.android.com/apk/res/android">
     <item
+        android:id="@+id/nav_dashboard"
+        android:icon="@drawable/ic_dashboard_24"
+        android:title="Дашборд" />
+    <item
         android:id="@+id/nav_sync"
         android:icon="@drawable/ic_sync_24"
         android:title="Синхронизация" />
