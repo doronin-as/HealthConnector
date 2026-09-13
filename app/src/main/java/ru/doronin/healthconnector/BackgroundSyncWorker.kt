@@ -54,6 +54,10 @@ class BackgroundSyncWorker(
             return Result.success()
         }
 
+        setForeground(
+            SyncForeground.info(applicationContext, SyncForeground.BACKGROUND_NOTIFICATION_ID, "HealthConnector · фоновая синхронизация", "Подготовка данных Health Connect…")
+        )
+
         return try {
             val syncResult = SyncRunGate.tryRunBackground {
                 val runId = SyncDiagnostics.begin(applicationContext, "background")
@@ -65,6 +69,7 @@ class BackgroundSyncWorker(
                         includeHistoricalChanges = false,
                         onProgress = { message ->
                             SyncDiagnostics.progress(applicationContext, runId, "background", message)
+                            SyncForeground.update(applicationContext, SyncForeground.BACKGROUND_NOTIFICATION_ID, "HealthConnector · фоновая синхронизация", message)
                         }
                     )
                     SyncDiagnostics.finish(

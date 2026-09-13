@@ -156,8 +156,39 @@ class StreamingMainActivity : AppCompatActivity() {
         binding.permissions.setOnClickListener { permissionLauncher.launch(requestedPermissions()) }
         binding.sync.setOnClickListener {
             val settings = saveSettingsFromForm()
-            lifecycleScope.launch { synchronize(settings) }
+            if (settings.endpoint.isBlank() || settings.token.isBlank()) {
+                binding.status.text = "Укажи URL Apps Script и токен"
+            } else {
+                ManualSyncScheduler.enqueue(this)
+                binding.status.text = "Синхронизация запущена в фоне · приложение можно свернуть"
+            }
         }
+        setupManualSyncObserver()
+    }
+
+    private fun setupManualSyncObserver() {
+        androidx.work.WorkManager.getInstance(this)
+            .getWorkInfosForUniqueWorkLiveData(ManualSyncScheduler.UNIQUE_WORK_NAME)
+            .observe(this) { works ->
+                val work = works.lastOrNull() ?: return@observe
+                val progress = work.progress.getString(ManualSyncWorker.KEY_PROGRESS).orEmpty()
+                when (work.state) {
+                    androidx.work.WorkInfo.State.ENQUEUED, androidx.work.WorkInfo.State.BLOCKED ->
+                        binding.status.text = "Синхронизация ожидает запуска · можно свернуть приложение"
+                    androidx.work.WorkInfo.State.RUNNING ->
+                        binding.status.text = if (progress.isBlank()) "Синхронизация выполняется в фоне · можно свернуть приложение" else "$progress\n● Фоновая работа активна"
+                    androidx.work.WorkInfo.State.SUCCEEDED -> {
+                        val days = work.outputData.getInt(ManualSyncWorker.KEY_DAYS, -1)
+                        val measurements = work.outputData.getInt(ManualSyncWorker.KEY_MEASUREMENTS, -1)
+                        if (days >= 0) binding.status.text = "Синхронизация завершена: дней $days, измерений $measurements"
+                    }
+                    androidx.work.WorkInfo.State.FAILED -> {
+                        val error = work.outputData.getString(ManualSyncWorker.KEY_ERROR) ?: "неизвестная ошибка"
+                        binding.status.text = "Ошибка синхронизации: $error"
+                    }
+                    androidx.work.WorkInfo.State.CANCELLED -> binding.status.text = "Синхронизация отменена системой"
+                }
+            }
     }
 
     private fun setupVersionBadge() {
