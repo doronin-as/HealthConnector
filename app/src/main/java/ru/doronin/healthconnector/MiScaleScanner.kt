@@ -30,6 +30,7 @@ object MiScaleScanner {
     const val ACTION_SCAN_RESULT = "ru.doronin.healthconnector.MI_SCALE_SCAN_RESULT"
     private const val REQUEST_CODE = 1811
 
+    /** Permissions required by Android before a BLE scan can be registered. */
     fun requiredRuntimePermissions(): Array<String> = when {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> arrayOf(
             Manifest.permission.BLUETOOTH_SCAN,
@@ -38,9 +39,40 @@ object MiScaleScanner {
         else -> arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
     }
 
+    /**
+     * Permissions requested by the interactive scale finder.
+     *
+     * Android 12+ normally gates BLE discovery with BLUETOOTH_SCAN. Some OEM
+     * stacks, including Xiaomi/MIUI builds, still return zero scan callbacks
+     * unless location permission is also granted. We therefore request location
+     * explicitly for this diagnostic/manual discovery path instead of claiming
+     * neverForLocation in the manifest.
+     */
+    fun finderRuntimePermissions(): Array<String> = buildList {
+        addAll(requiredRuntimePermissions())
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }.distinct().toTypedArray()
+
     fun hasPermissions(context: Context): Boolean = requiredRuntimePermissions().all {
         ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
+
+    fun hasBluetoothScanPermission(context: Context): Boolean = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+        else -> hasLocationPermission(context)
+    }
+
+    fun hasBluetoothConnectPermission(context: Context): Boolean = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        else -> true
+    }
+
+    fun hasLocationPermission(context: Context): Boolean =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
     /**
      * Starts a persistent PendingIntent based BLE scan.
