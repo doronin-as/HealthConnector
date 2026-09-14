@@ -1,6 +1,7 @@
 package ru.doronin.healthconnector
 
 import android.content.Intent
+import android.location.LocationManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -296,7 +297,6 @@ class MiScaleSettingsActivity : AppCompatActivity() {
 
     private fun refreshScannerDiagnostics() {
         if (!::scannerInfo.isInitialized) return
-        val permissions = if (MiScaleScanner.hasPermissions(this)) "разрешения ✓" else "разрешения НЕТ"
         val state = prefs.getString(MiScaleScanner.PREF_SCAN_STATE, "Сканер ещё не запускался").orEmpty()
         val packetAt = prefs.getLong(MiScaleScanner.PREF_LAST_PACKET_AT, 0L)
         val address = prefs.getString(MiScaleScanner.PREF_LAST_PACKET_ADDRESS, "").orEmpty()
@@ -304,6 +304,15 @@ class MiScaleSettingsActivity : AppCompatActivity() {
         val rssi = prefs.getInt(MiScaleScanner.PREF_LAST_PACKET_RSSI, 0)
         val last = prefs.getString(MiScaleScanner.PREF_LAST_MEASUREMENT, "").orEmpty()
         val error = prefs.getString(MiScaleScanner.PREF_LAST_ERROR, "").orEmpty()
+        val locationEnabled = runCatching {
+            getSystemService(LocationManager::class.java)?.isLocationEnabled ?: true
+        }.getOrDefault(true)
+        val permissionsText = buildString {
+            append("BLE Scan: ${if (MiScaleScanner.hasBluetoothScanPermission(this@MiScaleSettingsActivity)) "✓" else "НЕТ"}")
+            append(" · Bluetooth Connect: ${if (MiScaleScanner.hasBluetoothConnectPermission(this@MiScaleSettingsActivity)) "✓" else "НЕТ"}")
+            append("\nГеолокация-разрешение: ${if (MiScaleScanner.hasLocationPermission(this@MiScaleSettingsActivity)) "✓" else "НЕТ"}")
+            append(" · системная геолокация: ${if (locationEnabled) "включена" else "ВЫКЛЮЧЕНА"}")
+        }
         val packetText = if (packetAt <= 0L) {
             "BLE-пакеты: пока не получены"
         } else {
@@ -312,7 +321,7 @@ class MiScaleSettingsActivity : AppCompatActivity() {
             "Последний BLE-пакет: ${sec}с назад${if (device.isBlank()) "" else " · $device"}${if (rssi == 0) "" else " · $rssi dBm"}"
         }
         scannerInfo.text = buildString {
-            append("Диагностика: $permissions\n$state\n$packetText")
+            append("Диагностика:\n$permissionsText\n$state\n$packetText")
             if (last.isNotBlank()) append("\nПоследнее измерение: $last")
             if (error.isNotBlank()) append("\nОшибка: $error")
         }
