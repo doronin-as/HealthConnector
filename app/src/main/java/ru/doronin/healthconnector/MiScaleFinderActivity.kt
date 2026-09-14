@@ -47,6 +47,7 @@ class MiScaleFinderActivity : AppCompatActivity() {
     private var scanning = false
     private var showAll = false
     private var searchEndsAt = 0L
+    private var scanPass = 1
     private var rawCallbacks = 0
     private var batchCallbacks = 0
     private var callbacksWithoutRecord = 0
@@ -56,21 +57,36 @@ class MiScaleFinderActivity : AppCompatActivity() {
         if (!isFinishing && !isDestroyed) startForegroundScan()
     }
 
+    private val delayedFallbackStart = Runnable {
+        if (!isFinishing && !isDestroyed) startForegroundScan()
+    }
+
+    private val fallbackSwitch = Runnable {
+        if (scanPass == 1 && scanning && rawCallbacks == 0) {
+            switchToFallback("за ${FALLBACK_AFTER_MS / 1000}с Android не вернул ни одного callback")
+        }
+    }
+
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
-        if (MiScaleScanner.hasPermissions(this)) {
+        val missing = missingFinderPermissions()
+        if (missing.isEmpty()) {
             startSearch()
         } else {
             val denied = grants.filterValues { !it }.keys.joinToString()
-            status.text = "Нет разрешения Bluetooth${if (denied.isBlank()) "." else ": $denied"}"
+            status.text = buildString {
+                append("Не выданы все разрешения для диагностического BLE-поиска.")
+                if (denied.isNotBlank()) append("\nОтклонено: $denied")
+                append("\n${permissionStatusText()}")
+            }
         }
     }
 
     private val enableBluetoothLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        startSearch()
+        ensurePermissionsAndStart()
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -86,12 +102,17 @@ class MiScaleFinderActivity : AppCompatActivity() {
         }
 
         override fun onScanFailed(errorCode: Int) {
-            scanning = false
             prefs.edit()
-                .putString(MiScaleScanner.PREF_LAST_ERROR, "manual BLE scan failed: $errorCode")
+                .putString(MiScaleScanner.PREF_LAST_ERROR, "manual BLE scan failed on pass $scanPass: $errorCode")
                 .apply()
-            status.text = "Ошибка BLE-сканера: код $errorCode. Нажми «Искать заново»."
-            renderResults()
+            if (scanPass == 1 && rawCallbacks == 0) {
+                switchToFallback("первый BLE-проход завершился ошибкой $errorCode")
+            } else {
+                scanning = false
+                handler.removeCallbacks(ticker)
+                status.text = "Ошибка BLE-сканера: код $errorCode (проход $scanPass/2). Нажми «Искать заново».\n${permissionStatusText()}"
+                renderResults()
+            }
         }
     }
 
@@ -100,14 +121,17 @@ class MiScaleFinderActivity : AppCompatActivity() {
             if (!scanning) return
             val remaining = ((searchEndsAt - System.currentTimeMillis()).coerceAtLeast(0L) + 999L) / 1000L
             val likely = devices.values.count { it.isLikelyScale }
-            val location = if (isSystemLocationEnabled()) "геолокация вкл." else "ГЕОЛОКАЦИЯ ВЫКЛ."
             status.text = buildString {
-                append("Ищу весы… ${remaining}с · BLE-устройств: ${devices.size} · похожих: $likely")
-                append("\nСырых BLE-callback: $rawCallbacks · $location")
+                append("Ищу весы… ${remaining}с · проход $scanPass/2 · BLE-устройств: ${devices.size} · похожих: $likely")
+                append("\nСырых BLE-callback: $rawCallbacks")
+                if (batchCallbacks > 0) append(" · batch: $batchCallbacks")
                 if (callbacksWithoutRecord > 0) append(" · без scanRecord: $callbacksWithoutRecord")
                 if (addressReadFailures > 0) append(" · адрес недоступен: $addressReadFailures")
-                if (rawCallbacks == 0 && remaining <= 20L && !isSystemLocationEnabled()) {
-                    append("\n⚠ Android пока не отдаёт BLE-результаты. На некоторых Xiaomi/MIUI для сканирования должна быть включена системная геолокация.")
+                append("\n${permissionStatusText()}")
+                if (rawCallbacks == 0 && scanPass == 1) {
+                    append("\nЕсли callback останется 0, приложение автоматически переключит BLE-сканер на резервный системный режим.")
+                } else if (rawCallbacks == 0 && scanPass == 2) {
+                    append("\n⚠ Даже резервный системный BLE-режим пока не получает результатов.")
                 }
             }
             renderResults()
@@ -128,6 +152,8 @@ class MiScaleFinderActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         handler.removeCallbacks(delayedForegroundStart)
+        handler.removeCallbacks(delayedFallbackStart)
+        handler.removeCallbacks(fallbackSwitch)
         stopSearch(timeout = false, restartBackground = true)
         super.onDestroy()
     }
@@ -147,7 +173,7 @@ class MiScaleFinderActivity : AppCompatActivity() {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         root.addView(TextView(this).apply {
-            text = "Разбуди весы: встань на них босиком и не сходи до завершения измерения. Ручной режим временно останавливает фоновый BLE-сканер и запускает отдельный активный поиск без фильтров."
+            text = "Разбуди весы: встань на них босиком и не сходи до завершения измерения. Ручной режим временно останавливает фоновый BLE-сканер, ждёт освобождения Bluetooth-стека и запускает активный поиск без фильтров. Если Android не отдаёт ни одного callback, автоматически включается второй системный режим сканирования."
             textSize = 14f
             alpha = 0.76f
             setPadding(0, dp(8), 0, dp(14))
@@ -205,7 +231,7 @@ class MiScaleFinderActivity : AppCompatActivity() {
         root.addView(resultsContainer)
 
         root.addView(TextView(this).apply {
-            text = "Диагностика различает «Android вообще не вызвал BLE callback» и «callback пришёл, но реклама устройства неполная». Если сырых callback остаётся 0, проблема находится ниже распознавания Xiaomi Scale — на уровне разрешений, системной геолокации или Bluetooth-стека телефона."
+            text = "Диагностика теперь отдельно показывает разрешение BLE-сканирования, Bluetooth Connect, доступ к геолокации и состояние системной службы геолокации. Если оба прохода завершаются с 0 сырых callback, проблема находится ниже распознавания Xiaomi Scale — на уровне Android/MIUI Bluetooth-стека или системных ограничений."
             textSize = 12f
             alpha = 0.68f
             setPadding(0, dp(16), 0, 0)
@@ -214,12 +240,15 @@ class MiScaleFinderActivity : AppCompatActivity() {
         return ScrollView(this).apply { addView(root) }
     }
 
-    private fun ensurePermissionsAndStart() {
-        val missing = MiScaleScanner.requiredRuntimePermissions().filter {
+    private fun missingFinderPermissions(): List<String> =
+        MiScaleScanner.finderRuntimePermissions().filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
+
+    private fun ensurePermissionsAndStart() {
+        val missing = missingFinderPermissions()
         if (missing.isNotEmpty()) {
-            status.text = "Нужно разрешение Bluetooth для поиска весов."
+            status.text = "Для полного BLE-поиска нужны Nearby devices и доступ к геолокации.\n${permissionStatusText()}"
             permissionsLauncher.launch(missing.toTypedArray())
             return
         }
@@ -233,6 +262,8 @@ class MiScaleFinderActivity : AppCompatActivity() {
      */
     private fun startSearch() {
         handler.removeCallbacks(delayedForegroundStart)
+        handler.removeCallbacks(delayedFallbackStart)
+        handler.removeCallbacks(fallbackSwitch)
         stopSearch(timeout = false, restartBackground = false)
         MiScaleScanner.stop(this)
 
@@ -241,12 +272,15 @@ class MiScaleFinderActivity : AppCompatActivity() {
         batchCallbacks = 0
         callbacksWithoutRecord = 0
         addressReadFailures = 0
+        scanPass = 1
+        searchEndsAt = 0L
         renderResults()
-        status.text = "Фоновый BLE-сканер остановлен. Запускаю активный поиск…"
+        status.text = "Фоновый BLE-сканер остановлен. Жду 2 секунды, чтобы MIUI освободила Bluetooth-стек…\n${permissionStatusText()}"
 
-        // Give the vendor Bluetooth stack a short moment to release the old
-        // PendingIntent scan registration before registering ScanCallback.
-        handler.postDelayed(delayedForegroundStart, 500L)
+        // Xiaomi/MIUI stacks can retain the PendingIntent registration briefly
+        // after stopScan(). A longer hand-off is intentional here: this screen
+        // is a diagnostic path and reliability is more important than 1.5 s.
+        handler.postDelayed(delayedForegroundStart, FOREGROUND_HANDOFF_MS)
     }
 
     private fun startForegroundScan() {
@@ -277,51 +311,101 @@ class MiScaleFinderActivity : AppCompatActivity() {
             return
         }
 
-        runCatching {
-            scanner.startScan(
-                emptyList(),
-                ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                    .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-                    .setReportDelay(0L)
-                    .setLegacy(true)
-                    .build(),
-                scanCallback
-            )
-            scanning = true
+        if (searchEndsAt == 0L) {
             searchEndsAt = System.currentTimeMillis() + SEARCH_MS
+        }
+        if (System.currentTimeMillis() >= searchEndsAt) {
+            stopSearch(timeout = true)
+            return
+        }
+
+        runCatching {
+            if (scanPass == 1) {
+                scanner.startScan(
+                    emptyList(),
+                    ScanSettings.Builder()
+                        .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                        .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                        .setReportDelay(0L)
+                        .setLegacy(true)
+                        .build(),
+                    scanCallback
+                )
+            } else {
+                // Exercise Android's simplest/default scanning path as a fallback.
+                // This intentionally avoids custom ScanSettings in case an OEM
+                // Bluetooth stack mishandles the first registration mode.
+                scanner.startScan(scanCallback)
+            }
+            scanning = true
             prefs.edit()
-                .putString(MiScaleScanner.PREF_SCAN_STATE, "Ручной активный поиск весов (фон остановлен)")
+                .putString(
+                    MiScaleScanner.PREF_SCAN_STATE,
+                    if (scanPass == 1) "Ручной BLE-поиск: LOW_LATENCY legacy" else "Ручной BLE-поиск: резервный системный режим"
+                )
                 .putLong(MiScaleScanner.PREF_SCAN_STARTED_AT, System.currentTimeMillis())
                 .remove(MiScaleScanner.PREF_LAST_ERROR)
                 .apply()
             handler.removeCallbacks(ticker)
             handler.post(ticker)
+            if (scanPass == 1) {
+                handler.removeCallbacks(fallbackSwitch)
+                handler.postDelayed(fallbackSwitch, FALLBACK_AFTER_MS)
+            }
         }.onFailure { error ->
-            status.text = "Не удалось запустить активный BLE-поиск: ${error.message ?: error.javaClass.simpleName}"
-            prefs.edit().putString(MiScaleScanner.PREF_LAST_ERROR, error.message ?: error.javaClass.simpleName).apply()
+            prefs.edit().putString(
+                MiScaleScanner.PREF_LAST_ERROR,
+                "manual BLE start failed on pass $scanPass: ${error.message ?: error.javaClass.simpleName}"
+            ).apply()
+            if (scanPass == 1 && rawCallbacks == 0) {
+                switchToFallback("не удалось запустить первый BLE-режим: ${error.message ?: error.javaClass.simpleName}")
+            } else {
+                status.text = "Не удалось запустить BLE-поиск (проход $scanPass/2): ${error.message ?: error.javaClass.simpleName}\n${permissionStatusText()}"
+            }
         }
+    }
+
+    private fun switchToFallback(reason: String) {
+        if (scanPass != 1 || rawCallbacks != 0) return
+        handler.removeCallbacks(fallbackSwitch)
+        handler.removeCallbacks(ticker)
+        stopForegroundCallback()
+        scanning = false
+        scanPass = 2
+        prefs.edit()
+            .putString(MiScaleScanner.PREF_SCAN_STATE, "Переключаю BLE-поиск на резервный режим: $reason")
+            .apply()
+        status.text = "0 BLE-callback в первом режиме. Перезапускаю сканер через ${FALLBACK_HANDOFF_MS} мс…\nПричина: $reason\n${permissionStatusText()}"
+        handler.removeCallbacks(delayedFallbackStart)
+        handler.postDelayed(delayedFallbackStart, FALLBACK_HANDOFF_MS)
+    }
+
+    private fun stopForegroundCallback() {
+        val scanner = getSystemService(BluetoothManager::class.java)?.adapter?.bluetoothLeScanner
+        runCatching { scanner?.stopScan(scanCallback) }
     }
 
     private fun stopSearch(timeout: Boolean, restartBackground: Boolean = false) {
         handler.removeCallbacks(ticker)
+        handler.removeCallbacks(fallbackSwitch)
+        handler.removeCallbacks(delayedForegroundStart)
+        handler.removeCallbacks(delayedFallbackStart)
         if (scanning) {
-            val scanner = getSystemService(BluetoothManager::class.java)?.adapter?.bluetoothLeScanner
-            runCatching { scanner?.stopScan(scanCallback) }
+            stopForegroundCallback()
             scanning = false
-            if (timeout) {
-                val likely = devices.values.count { it.isLikelyScale }
-                status.text = when {
-                    rawCallbacks == 0 -> buildString {
-                        append("Поиск завершён: Android не вернул ни одного BLE-callback.")
-                        append("\nBluetooth: включён · разрешения: ✓ · системная геолокация: ${if (isSystemLocationEnabled()) "включена" else "ВЫКЛЮЧЕНА"}.")
-                        append("\nПопробуй включить геолокацию, затем «Искать заново». Если снова 0 — проверим системный Bluetooth-стек/ограничения MIUI.")
-                    }
-                    likely > 0 -> "Поиск завершён. Найдено похожих на весы: $likely. Выбери устройство ниже. Сырых callback: $rawCallbacks."
-                    else -> "Поиск завершён: Android отдаёт BLE ($rawCallbacks callback), но Xiaomi Scale не распознаны. Включи «Показать все BLE-устройства»."
+        }
+        if (timeout) {
+            val likely = devices.values.count { it.isLikelyScale }
+            status.text = when {
+                rawCallbacks == 0 -> buildString {
+                    append("Поиск завершён: оба BLE-режима не вернули ни одного callback.")
+                    append("\n${permissionStatusText()}")
+                    append("\nЭто уже не ошибка распознавания Xiaomi Scale: Android/MIUI не отдаёт приложению BLE-рекламу. Следующий шаг — системные ограничения Bluetooth/батареи или проверка через внешний BLE-сканер.")
                 }
-                renderResults()
+                likely > 0 -> "Поиск завершён. Найдено похожих на весы: $likely. Выбери устройство ниже. Сырых callback: $rawCallbacks."
+                else -> "Поиск завершён: Android отдаёт BLE ($rawCallbacks callback), но Xiaomi Scale не распознаны. Включи «Показать все BLE-устройства».\n${permissionStatusText()}"
             }
+            renderResults()
         }
         if (restartBackground && prefs.getBoolean(MiScaleScanner.PREF_ENABLED, false)) {
             MiScaleScanner.start(this)
@@ -451,6 +535,13 @@ class MiScaleFinderActivity : AppCompatActivity() {
         finish()
     }
 
+    private fun permissionStatusText(): String = buildString {
+        append("BLE Scan: ${if (MiScaleScanner.hasBluetoothScanPermission(this@MiScaleFinderActivity)) "✓" else "НЕТ"}")
+        append(" · Bluetooth Connect: ${if (MiScaleScanner.hasBluetoothConnectPermission(this@MiScaleFinderActivity)) "✓" else "НЕТ"}")
+        append("\nГеолокация-разрешение: ${if (MiScaleScanner.hasLocationPermission(this@MiScaleFinderActivity)) "✓" else "НЕТ"}")
+        append(" · системная геолокация: ${if (isSystemLocationEnabled()) "включена" else "ВЫКЛЮЧЕНА"}")
+    }
+
     private fun isSystemLocationEnabled(): Boolean = runCatching {
         getSystemService(LocationManager::class.java)?.isLocationEnabled ?: true
     }.getOrDefault(true)
@@ -468,6 +559,9 @@ class MiScaleFinderActivity : AppCompatActivity() {
 
     companion object {
         private const val SEARCH_MS = 30_000L
+        private const val FOREGROUND_HANDOFF_MS = 2_000L
+        private const val FALLBACK_AFTER_MS = 8_000L
+        private const val FALLBACK_HANDOFF_MS = 800L
         private const val MAX_RENDERED = 30
     }
 }
