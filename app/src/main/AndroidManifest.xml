@@ -4,10 +4,13 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_HEALTH" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -25,7 +28,9 @@
     <uses-permission android:name="android.permission.health.READ_ACTIVE_CALORIES_BURNED" />
     <uses-permission android:name="android.permission.health.READ_TOTAL_CALORIES_BURNED" />
     <uses-permission android:name="android.permission.health.READ_ELEVATION_GAINED" />
+    <uses-permission android:name="android.permission.health.WRITE_ELEVATION_GAINED" />
     <uses-permission android:name="android.permission.health.READ_FLOORS_CLIMBED" />
+    <uses-permission android:name="android.permission.health.WRITE_FLOORS_CLIMBED" />
     <uses-permission android:name="android.permission.health.READ_SPEED" />
     <uses-permission android:name="android.permission.health.READ_STEPS_CADENCE" />
     <uses-permission android:name="android.permission.health.READ_CYCLING_PEDALING_CADENCE" />
@@ -34,6 +39,7 @@
     <uses-permission android:name="android.permission.health.READ_SKIN_TEMPERATURE" />
 
     <application
+        android:name=".HealthConnectorApplication"
         android:allowBackup="false"
         android:usesCleartextTraffic="false"
         android:icon="@drawable/ic_app_logo"
@@ -44,6 +50,11 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
+
+        <service
+            android:name=".floors.PhoneFloorTrackingService"
+            android:exported="false"
+            android:foregroundServiceType="health" />
 
         <activity
             android:name=".PermissionGateActivity"
@@ -57,6 +68,11 @@
         <activity
             android:name=".StreamingMainActivity"
             android:exported="true" />
+
+        <activity
+            android:name=".floors.PhoneFloorSettingsActivity"
+            android:exported="false"
+            android:label="Этажи по датчикам телефона" />
 
         <activity
             android:name=".MiScaleSettingsActivity"
