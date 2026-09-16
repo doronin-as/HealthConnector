@@ -1105,17 +1105,16 @@ function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
     let rowNumber = existing.get(dateKey);
     let row;
 
-    const rebuildingDay = typeof dayComplete === 'boolean';
-    if (rowNumber && !rebuildingDay) {
+    if (rowNumber) {
+      // Preserve fields that this client could not read. availableFields below is
+      // authoritative for fields that were actually read and may still clear a
+      // stale value by sending null. This prevents a partial permission grant or
+      // interrupted checkpoint from erasing a previously complete day.
       row = sheet.getRange(rowNumber, 1, 1, headers.length).getValues()[0];
     } else {
-      if (!rowNumber) {
-        rowNumber = sheet.getLastRow() + 1;
-        existing.set(dateKey, rowNumber);
-        if (rowNumber > 2) copyRowFormat_(sheet, rowNumber, headers.length);
-      }
-      // A checkpoint/final snapshot is a full rebuild of HC_Дни.
-      // Clearing first prevents stale values from an older partial day.
+      rowNumber = sheet.getLastRow() + 1;
+      existing.set(dateKey, rowNumber);
+      if (rowNumber > 2) copyRowFormat_(sheet, rowNumber, headers.length);
       row = Array(headers.length).fill('');
       row[0] = Utilities.parseDate(`${dateKey} 00:00`, tz, 'yyyy-MM-dd HH:mm');
     }
