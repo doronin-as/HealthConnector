@@ -1,1 +1,1 @@
-Trigger Android APK build.
+HealthConnector build trigger
