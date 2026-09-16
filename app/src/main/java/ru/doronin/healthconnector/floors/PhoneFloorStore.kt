@@ -13,6 +13,14 @@ object PhoneFloorStore {
     private const val KEY_ELEVATION_METERS = "elevation_meters"
     private const val KEY_LAST_DETECTION_AT = "last_detection_at"
     private const val KEY_LAST_HEALTH_CONNECT_ERROR = "last_health_connect_error"
+    private const val KEY_HISTORY = "history"
+    private const val MAX_HISTORY_POINTS = 240
+
+    data class HistoryPoint(
+        val timestampEpochMs: Long,
+        val floors: Int,
+        val elevationMeters: Double
+    )
 
     data class Snapshot(
         val enabled: Boolean,
@@ -44,6 +52,11 @@ object PhoneFloorStore {
         )
     }
 
+    fun history(context: Context): List<HistoryPoint> {
+        ensureToday(context)
+        return decodeHistory(prefs(context).getString(KEY_HISTORY, null))
+    }
+
     fun addDetection(context: Context, detection: FloorDetection): Snapshot {
         ensureToday(context)
         val p = prefs(context)
@@ -51,13 +64,21 @@ object PhoneFloorStore {
         val currentElevation = java.lang.Double.longBitsToDouble(
             p.getLong(KEY_ELEVATION_METERS, java.lang.Double.doubleToRawLongBits(0.0))
         )
+        val newFloors = currentFloors + detection.floors
+        val newElevation = currentElevation + detection.elevationMeters
+        val newHistory = (decodeHistory(p.getString(KEY_HISTORY, null)) +
+            HistoryPoint(
+                timestampEpochMs = detection.endedAtEpochMs,
+                floors = newFloors,
+                elevationMeters = newElevation
+            ))
+            .takeLast(MAX_HISTORY_POINTS)
+
         p.edit()
-            .putInt(KEY_FLOORS, currentFloors + detection.floors)
-            .putLong(
-                KEY_ELEVATION_METERS,
-                java.lang.Double.doubleToRawLongBits(currentElevation + detection.elevationMeters)
-            )
+            .putInt(KEY_FLOORS, newFloors)
+            .putLong(KEY_ELEVATION_METERS, java.lang.Double.doubleToRawLongBits(newElevation))
             .putLong(KEY_LAST_DETECTION_AT, detection.endedAtEpochMs)
+            .putString(KEY_HISTORY, encodeHistory(newHistory))
             .apply()
         return snapshot(context)
     }
@@ -75,6 +96,7 @@ object PhoneFloorStore {
             .putInt(KEY_FLOORS, 0)
             .putLong(KEY_ELEVATION_METERS, java.lang.Double.doubleToRawLongBits(0.0))
             .putLong(KEY_LAST_DETECTION_AT, 0L)
+            .remove(KEY_HISTORY)
             .remove(KEY_LAST_HEALTH_CONNECT_ERROR)
             .apply()
     }
@@ -98,9 +120,28 @@ object PhoneFloorStore {
                 .putInt(KEY_FLOORS, 0)
                 .putLong(KEY_ELEVATION_METERS, java.lang.Double.doubleToRawLongBits(0.0))
                 .putLong(KEY_LAST_DETECTION_AT, 0L)
+                .remove(KEY_HISTORY)
                 .remove(KEY_LAST_HEALTH_CONNECT_ERROR)
                 .apply()
         }
+    }
+
+    private fun encodeHistory(points: List<HistoryPoint>): String =
+        points.joinToString(";") { point ->
+            "${point.timestampEpochMs},${point.floors},${point.elevationMeters}"
+        }
+
+    private fun decodeHistory(raw: String?): List<HistoryPoint> {
+        if (raw.isNullOrBlank()) return emptyList()
+        return raw.split(';').mapNotNull { entry ->
+            val parts = entry.split(',')
+            if (parts.size != 3) return@mapNotNull null
+            val timestamp = parts[0].toLongOrNull() ?: return@mapNotNull null
+            val floors = parts[1].toIntOrNull() ?: return@mapNotNull null
+            val elevation = parts[2].toDoubleOrNull() ?: return@mapNotNull null
+            if (timestamp <= 0L || floors < 0 || !elevation.isFinite() || elevation < 0.0) return@mapNotNull null
+            HistoryPoint(timestamp, floors, elevation)
+        }.sortedBy { it.timestampEpochMs }.takeLast(MAX_HISTORY_POINTS)
     }
 
     private fun today(): LocalDate = LocalDate.now(ZoneId.systemDefault())
