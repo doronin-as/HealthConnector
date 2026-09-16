@@ -49,6 +49,14 @@ class BackgroundSyncWorker(
                 saveBackgroundStatus("Не удалось проверить разрешения Health Connect")
                 return Result.retry()
             }
+        val missingReadPermissions = HealthConnectPermissionSet.readPermissions - granted
+        if (missingReadPermissions.isNotEmpty()) {
+            saveBackgroundStatus(
+                "Фоновая синхронизация остановлена: не хватает разрешений Health Connect " +
+                    "(${missingReadPermissions.size}). Данные Dashboard не изменены."
+            )
+            return Result.success()
+        }
         if (HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND !in granted) {
             saveBackgroundStatus("Нужно разрешить Health Connect читать данные в фоне")
             return Result.success()
