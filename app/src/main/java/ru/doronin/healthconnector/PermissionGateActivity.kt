@@ -9,6 +9,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.PermissionController
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 
 class PermissionGateActivity : AppCompatActivity() {
 
@@ -47,11 +49,11 @@ class PermissionGateActivity : AppCompatActivity() {
             return
         }
         val client = HealthConnectClient.getOrCreate(this)
-        lifecycleScope.launchWhenStarted {
+        lifecycleScope.launch {
             val granted = runCatching { client.permissionController.getGrantedPermissions() }
                 .getOrElse {
                     continueLaunch()
-                    return@launchWhenStarted
+                    return@launch
                 }
             val requested = HealthConnectPermissionSet.requestPermissions(client)
             val missing = requested - granted
