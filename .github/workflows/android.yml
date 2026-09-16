@@ -49,6 +49,13 @@ jobs:
           test ! -e .github/signing/healthconnector-dev.keystore.b64
       - name: Run unit tests
         run: gradle :app:testReleaseUnitTest --stacktrace
+      - name: Build installable TEST APK
+        run: gradle :app:assembleDebug --stacktrace
+      - name: Upload TEST APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-connector-test-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
       - name: Restore stable release signing key
         if: env.HC_SIGNING_KEY_B64 != ''
         run: |
@@ -68,7 +75,7 @@ jobs:
           grep -F "319c0e1944727ba1128e6a8340bd68123b9e8b2cf328b0443e1e4a0387a85a80" /tmp/apk-certs.txt
       - name: Explain unsigned CI build
         if: env.HC_SIGNING_KEY_B64 == ''
-        run: echo 'Stable signing secret is not configured; release compile/tests passed but no installable stable artifact will be published.'
+        run: echo 'Stable signing secret is not configured; release compile/tests passed. Use the side-by-side TEST APK artifact.'
       - name: Upload stable release APK
         if: env.HC_SIGNING_KEY_B64 != ''
         uses: actions/upload-artifact@v4

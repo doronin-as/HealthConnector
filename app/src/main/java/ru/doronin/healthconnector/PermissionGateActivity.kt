@@ -7,13 +7,23 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.PermissionController
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 
 class PermissionGateActivity : AppCompatActivity() {
+
+    private val healthPermissionLauncher = registerForActivityResult(
+        PermissionController.createRequestPermissionResultContract()
+    ) {
+        continueLaunch()
+    }
 
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        continueLaunch()
+        requestHealthPermissionsAndContinue()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -26,7 +36,29 @@ class PermissionGateActivity : AppCompatActivity() {
                 if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) add(permission)
             }
         }
-        if (missing.isNotEmpty()) permissionsLauncher.launch(missing.toTypedArray()) else continueLaunch()
+        if (missing.isNotEmpty()) {
+            permissionsLauncher.launch(missing.toTypedArray())
+        } else {
+            requestHealthPermissionsAndContinue()
+        }
+    }
+
+    private fun requestHealthPermissionsAndContinue() {
+        if (HealthConnectClient.getSdkStatus(this) != HealthConnectClient.SDK_AVAILABLE) {
+            continueLaunch()
+            return
+        }
+        val client = HealthConnectClient.getOrCreate(this)
+        lifecycleScope.launch {
+            val granted = runCatching { client.permissionController.getGrantedPermissions() }
+                .getOrElse {
+                    continueLaunch()
+                    return@launch
+                }
+            val requested = HealthConnectPermissionSet.requestPermissions(client)
+            val missing = requested - granted
+            if (missing.isEmpty()) continueLaunch() else healthPermissionLauncher.launch(missing)
+        }
     }
 
     private fun continueLaunch() {
