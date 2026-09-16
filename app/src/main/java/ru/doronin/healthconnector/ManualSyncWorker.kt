@@ -21,6 +21,16 @@ class ManualSyncWorker(appContext: Context, workerParams: WorkerParameters) : Co
         val safeEndpoint=runCatching { EndpointSecurity.requireHttps(endpoint) }.getOrElse { return failure(it.message ?: "Некорректный URL Apps Script") }
         if (HealthConnectClient.getSdkStatus(applicationContext)!=HealthConnectClient.SDK_AVAILABLE) return failure("Health Connect недоступен")
         val client=HealthConnectClient.getOrCreate(applicationContext)
+
+        val missingReadPermissions = runCatching { HealthConnectPermissionSet.missingReadPermissions(client) }
+            .getOrElse { return failure("Не удалось проверить разрешения Health Connect") }
+        if (missingReadPermissions.isNotEmpty()) {
+            return failure(
+                "Синхронизация остановлена: не выданы все разрешения Health Connect " +
+                    "(${missingReadPermissions.size}). Открой приложение и выдай разрешения, чтобы не потерять данные Dashboard."
+            )
+        }
+
         val bgFeature=client.features.getFeatureStatus(HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND)
         if (bgFeature==HealthConnectFeatures.FEATURE_STATUS_AVAILABLE) {
             val granted=runCatching { client.permissionController.getGrantedPermissions() }.getOrElse { return failure("Не удалось проверить разрешения Health Connect") }
