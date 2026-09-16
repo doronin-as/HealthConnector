@@ -35,6 +35,11 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            applicationIdSuffix = ".test"
+            versionNameSuffix = "-test"
+            manifestPlaceholders["appLabel"] = "HC 1.6.24 TEST"
+        }
         getByName("release") {
             isDebuggable = false
             isMinifyEnabled = true
