@@ -9,6 +9,7 @@ import android.provider.MediaStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
@@ -250,9 +251,17 @@ object ConfigAutoRestore {
 
     private fun readUriText(context: Context, uri: Uri): String? = runCatching {
         context.contentResolver.openInputStream(uri)?.use { input ->
-            val bytes = input.readNBytes(MAX_CONFIG_BYTES + 1)
-            if (bytes.size > MAX_CONFIG_BYTES) return@runCatching null
-            bytes.toString(Charsets.UTF_8)
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(8 * 1024)
+            var total = 0
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > MAX_CONFIG_BYTES) return@runCatching null
+                output.write(buffer, 0, read)
+            }
+            output.toByteArray().toString(Charsets.UTF_8)
         }
     }.getOrNull()
 
