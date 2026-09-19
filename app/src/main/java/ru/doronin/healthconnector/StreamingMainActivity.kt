@@ -735,40 +735,29 @@ class StreamingMainActivity : AppCompatActivity() {
 
     private fun importConfig(uri: Uri) {
         runCatching {
-            val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                ?: error("Не удалось прочитать файл")
-            val json = JSONObject(text)
-            require(json.optString("format") == "HealthConnectorConfig") {
-                "Это не файл настроек HealthConnector"
-            }
-            val endpoint = json.optString("endpoint").trim()
-            val importedToken = json.optString("token").trim()
-            val days = json.optInt("days", 7).coerceIn(1, 30)
-            val backgroundSync = json.optBoolean("backgroundSync", true)
-            require(endpoint.isNotBlank()) { "В файле нет URL Apps Script" }
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
 
-            binding.endpoint.setText(endpoint)
-            if (importedToken.isNotBlank()) {
-                secureTokenStore.setToken(importedToken)
-                binding.token.setText(importedToken)
-            } else {
-                binding.token.setText(secureTokenStore.getToken())
+        lifecycleScope.launch {
+            val result = ConfigAutoRestore.importFromUri(this@StreamingMainActivity, uri)
+            if (!result.restored) {
+                binding.status.text = "Ошибка импорта настроек: ${result.message}"
+                return@launch
             }
+
+            val endpoint = prefs.getString("endpoint", "").orEmpty()
+            val days = prefs.getInt("days", 7)
+            val backgroundSync = prefs.getBoolean(BackgroundSyncScheduler.PREF_ENABLED, true)
+            binding.endpoint.setText(endpoint)
+            binding.token.setText(secureTokenStore.getToken())
             binding.days.setText(days.toString())
-            prefs.edit()
-                .putString("endpoint", endpoint)
-                .putInt("days", days)
-                .putBoolean(BackgroundSyncScheduler.PREF_ENABLED, backgroundSync)
-                .remove("token")
-                .apply()
             backgroundSwitch?.isChecked = backgroundSync
-            BackgroundSyncScheduler.apply(this)
-        }.onSuccess {
-            binding.status.text = "Настройки восстановлены"
+            binding.status.text = result.message
             refreshBackgroundInfo()
             refreshDashboardSnapshot()
-        }.onFailure {
-            binding.status.text = "Ошибка импорта настроек: ${it.message}"
         }
     }
 
