@@ -40,9 +40,9 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 
 - [x] Restore manual Health Connect reads to foreground Activity to avoid background callers losing other-app records.
 
-- [ ] Remove hard-coded Xiaomi > Google Fit > all-others source priority.
+- [x] Remove broad/hard-coded Xiaomi/Google/Fitbit substring source matching; canonical packages are now centralized and matched exactly.
 - [ ] Define metric-specific source policy; cumulative metrics should prefer Health Connect Aggregate API.
-- [~] Treat Fitbit as a first-class source: interim Fitbit-first priority is implemented; metric-specific policy still remains.
+- [~] Treat Fitbit as a first-class source: canonical Fitbit-first priority and explicit origin probing are implemented; metric-specific policy still remains.
 - [ ] Split core vs optional Health Connect permissions; optional metrics must not block steps/sleep/heart synchronization.
 - [ ] Replace `safeReadAll(): List<T>` with structured result: Success(records), PermissionDenied, Error.
 - [~] Improve sleep diagnostics: raw record count, post-filter count and source packages are implemented; record offsets still remain.
@@ -75,7 +75,7 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 - [ ] Health Connect: empty vs permission denied vs real zero.
 - [ ] Health Connect: expired changes token triggers reconciliation.
 - [ ] Health Connect: deletion changes clear/recompute affected day.
-- [ ] Multiple sources: Fitbit + Google Fit + Xiaomi without data loss.
+- [~] Multiple sources: canonical Fitbit + Google Fit + Mi Fitness package mapping and sleep-origin merge are unit-covered; full end-to-end no-loss validation still required.
 - [ ] Sleep: 30-second stage segments aggregate correctly.
 - [ ] Sleep: overnight session and DST/travel timezone cases.
 - [ ] Config recovery: newest valid JSON wins when multiple readable candidates exist.
