@@ -276,7 +276,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // (main sleep, nap, additional sleep) without splitting them at midnight.
             onProgress("[$date] Этап 3/8 · читаю сон…")
             val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
-            val rawSleepRecords = readSleepRecordsWithFitbitFallback(sleepQueryStart, dayEnd)
+            val rawSleepRecords = readSleepRecordsWithKnownOriginsFallback(sleepQueryStart, dayEnd)
             val records = rawSleepRecords
                 .filter { it.endTime.atZone(zone).toLocalDate() == date }
                 .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
@@ -1167,17 +1167,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     private fun measurementId(record: Record, suffix: String): String =
         stableRecordId(record, "${record.javaClass.simpleName}|${record.hashCode()}") + suffix
 
-    private fun sourcePriority(packageName: String): Int {
-        val value = packageName.lowercase()
-        return when {
-            // 1.6.26: Fitbit is the primary wearable source in the current setup.
-            // This is an interim policy until source selection becomes metric-specific.
-            value.contains("fitbit") -> 0
-            value == "com.google.android.apps.fitness" || (value.contains("google") && value.contains("fitness")) -> 1
-            value.contains("xiaomi") || value.contains("mifitness") || value.contains("mi.health") || value.contains("wearable") -> 2
-            else -> 3
-        }
-    }
+    private fun sourcePriority(packageName: String): Int =
+        HealthSourceCatalog.priority(packageName)
 
     private fun sourceName(packageName: String): String {
         if (packageName.isBlank()) return "Неизвестный источник"
@@ -1187,15 +1178,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }.getOrNull()
         if (!installed.isNullOrBlank()) return installed
 
-        val value = packageName.lowercase()
-        return when {
-            value.contains("xiaomi") || value.contains("mifitness") || value.contains("mi.health") -> "Mi Fitness"
-            value.contains("fitbit") -> "Fitbit"
-            value.contains("shealth") || (value.contains("samsung") && value.contains("health")) -> "Samsung Health"
-            value.contains("garmin") -> "Garmin Connect"
-            value == "com.google.android.apps.fitness" || (value.contains("google") && value.contains("fitness")) -> "Google Fit"
-            else -> packageName
-        }
+        return HealthSourceCatalog.displayName(packageName)
     }
 
     private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
@@ -1228,7 +1211,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
      * Keep this concrete and out of syncDay so the Kotlin compiler does not inline
      * a large generic probe for every record type.
      */
-    private suspend fun readSleepRecordsWithFitbitFallback(
+    private suspend fun readSleepRecordsWithKnownOriginsFallback(
         start: Instant,
         end: Instant
     ): List<SleepSessionRecord> {
@@ -1238,27 +1221,32 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             return base
         }
 
-        val fitbit = try {
-            readAll<SleepSessionRecord>(
-                start = start,
-                end = end,
-                dataOriginFilter = setOf(DataOrigin(FITBIT_DATA_ORIGIN))
-            )
-        } catch (error: Exception) {
-            sleepOriginProbeDiagnostic =
-                "origin probe: all=${base.size}; fitbit=ERROR(${error.javaClass.simpleName})"
-            return base
+        val merged = LinkedHashMap<String, SleepSessionRecord>()
+        fun merge(records: List<SleepSessionRecord>) {
+            records.forEach { record ->
+                val key = record.metadata.id.takeIf { it.isNotBlank() }
+                    ?: "${record.metadata.dataOrigin.packageName}|${record.startTime}|${record.endTime}"
+                merged[key] = record
+            }
+        }
+        merge(base)
+
+        val diagnostics = mutableListOf("all=${base.size}")
+        for (origin in HealthSourceCatalog.KNOWN_ORIGINS) {
+            try {
+                val records = readAll<SleepSessionRecord>(
+                    start = start,
+                    end = end,
+                    dataOriginFilter = setOf(DataOrigin(origin.packageName))
+                )
+                merge(records)
+                diagnostics += "${origin.displayName}=${records.size}"
+            } catch (error: Exception) {
+                diagnostics += "${origin.displayName}=ERROR(${error.javaClass.simpleName})"
+            }
         }
 
-        sleepOriginProbeDiagnostic = "origin probe: all=${base.size}; fitbit=${fitbit.size}"
-        if (fitbit.isEmpty()) return base
-
-        val merged = LinkedHashMap<String, SleepSessionRecord>(base.size + fitbit.size)
-        (base + fitbit).forEach { record ->
-            val key = record.metadata.id.takeIf { it.isNotBlank() }
-                ?: "${record.metadata.dataOrigin.packageName}|${record.startTime}|${record.endTime}"
-            merged[key] = record
-        }
+        sleepOriginProbeDiagnostic = "origin probe: " + diagnostics.joinToString("; ")
         return merged.values.toList()
     }
 
@@ -1415,7 +1403,6 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     }
 
     companion object {
-        private const val FITBIT_DATA_ORIGIN = "com.fitbit.FitbitMobile"
         private const val MAX_SLEEP_HOURS_PER_DAY = 16.0
         private const val HEALTH_CONNECT_PAGE_SIZE = 200
         private const val MAX_MEASUREMENTS_PER_REQUEST = 2000
