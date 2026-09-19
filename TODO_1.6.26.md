@@ -1,4 +1,4 @@
-# HealthConnector 1.6.27 — TODO / Integrity Recovery
+# HealthConnector 1.6.28 — TODO / Integrity Recovery
 
 Release goal: make synchronization loss-resistant, diagnosable and recoverable before adding new metrics.
 
@@ -21,6 +21,20 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 - [x] On Android scoped-storage denial after reinstall, open `ACTION_OPEN_DOCUMENT` once as a fallback instead of requesting broad all-files access.
 - [ ] Add an optional encrypted recovery package for endpoint + API token that can survive reinstall without plaintext secrets.
 - [ ] Add a visible first-launch report showing where the config was found and which fields were restored.
+
+## P0 — stable Fitbit source architecture
+
+- [x] Confirm from current Google Health documentation which Fitbit metrics are actually written to Health Connect.
+- [x] Keep Health Connect as primary for cumulative local/system metrics.
+- [x] Add explicit Fitbit DataOrigin sleep recovery after reinstall/device migration.
+- [x] Add dormant Fitbit Web API cloud channel for HR, resting HR, HRV, SpO2, respiratory rate and sleep fallback.
+- [x] Store Fitbit OAuth client credentials/tokens only in Apps Script Script Properties.
+- [x] Implement refresh-token rotation, one 401 refresh retry, and rate-limit-safe 429 handling.
+- [x] Make Fitbit cloud enrichment additive-only and independent of Health Connect SyncComplete.
+- [x] Add scheduled 3-day repair every 6 hours plus manual 1–30 day backfill.
+- [ ] Authorize a Personal Fitbit Developer app and validate real API responses from Fitbit Air.
+- [ ] Verify two consecutive cloud syncs are idempotent in HC_Дни / HC_Сон / HC_Измерения.
+- [ ] Add source/freshness status to the in-app Dashboard.
 
 ## P1 — Health Connect correctness
 
