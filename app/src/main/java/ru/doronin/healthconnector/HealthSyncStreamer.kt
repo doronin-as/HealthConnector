@@ -274,12 +274,23 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // (main sleep, nap, additional sleep) without splitting them at midnight.
             onProgress("[$date] Этап 3/8 · читаю сон…")
             val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
-            val records = safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd)
+            val rawSleepRecords = safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd)
+            val records = rawSleepRecords
                 .filter { it.endTime.atZone(zone).toLocalDate() == date }
                 .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
             addSources(records, sources)
             sleepSummary = aggregateSleep(records)
-            onProgress("[$date] Сон · ${records.size} сесс. · ${sleepSummary.stageCount} стадий · ${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч")
+            val sleepSources = rawSleepRecords.asSequence()
+                .map { it.sourcePackage() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .joinToString(", ")
+                .ifBlank { "—" }
+            onProgress(
+                "[$date] Сон · raw ${rawSleepRecords.size} · после фильтра ${records.size} · " +
+                    "источники $sleepSources · ${sleepSummary.stageCount} стадий · " +
+                    "${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч"
+            )
             for (r in records) {
                 val stageTotals = stageTotals(r.stages, r.startTime, r.endTime)
                 sleepSessions.put(JSONObject().apply {
@@ -1058,10 +1069,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         if (segments.isEmpty()) return StageTotals(0, 0, 0, 0)
 
         val boundaries = segments.flatMap { listOf(it.start, it.end) }.distinct().sorted()
-        var deep = 0L
-        var light = 0L
-        var rem = 0L
-        var awake = 0L
+        var deepMillis = 0L
+        var lightMillis = 0L
+        var remMillis = 0L
+        var awakeMillis = 0L
         for (index in 0 until boundaries.lastIndex) {
             val start = boundaries[index]
             val end = boundaries[index + 1]
@@ -1070,17 +1081,22 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 .filter { it.start < end && it.end > start }
                 .minWithOrNull(compareBy<Segment> { it.priority }.thenBy { it.source })
                 ?: continue
-            val minutes = Duration.between(start, end).toMinutes()
+            val millis = Duration.between(start, end).toMillis().coerceAtLeast(0L)
             when (chosen.type) {
-                SleepSessionRecord.STAGE_TYPE_DEEP -> deep += minutes
-                SleepSessionRecord.STAGE_TYPE_LIGHT -> light += minutes
-                SleepSessionRecord.STAGE_TYPE_REM -> rem += minutes
+                SleepSessionRecord.STAGE_TYPE_DEEP -> deepMillis += millis
+                SleepSessionRecord.STAGE_TYPE_LIGHT -> lightMillis += millis
+                SleepSessionRecord.STAGE_TYPE_REM -> remMillis += millis
                 SleepSessionRecord.STAGE_TYPE_AWAKE,
                 SleepSessionRecord.STAGE_TYPE_AWAKE_IN_BED,
-                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awake += minutes
+                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awakeMillis += millis
             }
         }
-        return StageTotals(deep, light, rem, awake)
+        return StageTotals(
+            deepMinutes = deepMillis / 60_000L,
+            lightMinutes = lightMillis / 60_000L,
+            remMinutes = remMillis / 60_000L,
+            awakeMinutes = awakeMillis / 60_000L
+        )
     }
 
     private fun stageTotals(
@@ -1088,25 +1104,30 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         rangeStart: Instant,
         rangeEnd: Instant
     ): StageTotals {
-        var deep = 0L
-        var light = 0L
-        var rem = 0L
-        var awake = 0L
+        var deepMillis = 0L
+        var lightMillis = 0L
+        var remMillis = 0L
+        var awakeMillis = 0L
         for (stage in stages) {
             val start = maxOf(stage.startTime, rangeStart)
             val end = minOf(stage.endTime, rangeEnd)
             if (start >= end) continue
-            val minutes = Duration.between(start, end).toMinutes()
+            val millis = Duration.between(start, end).toMillis().coerceAtLeast(0L)
             when (stage.stage) {
-                SleepSessionRecord.STAGE_TYPE_DEEP -> deep += minutes
-                SleepSessionRecord.STAGE_TYPE_LIGHT -> light += minutes
-                SleepSessionRecord.STAGE_TYPE_REM -> rem += minutes
+                SleepSessionRecord.STAGE_TYPE_DEEP -> deepMillis += millis
+                SleepSessionRecord.STAGE_TYPE_LIGHT -> lightMillis += millis
+                SleepSessionRecord.STAGE_TYPE_REM -> remMillis += millis
                 SleepSessionRecord.STAGE_TYPE_AWAKE,
                 SleepSessionRecord.STAGE_TYPE_AWAKE_IN_BED,
-                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awake += minutes
+                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awakeMillis += millis
             }
         }
-        return StageTotals(deep, light, rem, awake)
+        return StageTotals(
+            deepMinutes = deepMillis / 60_000L,
+            lightMinutes = lightMillis / 60_000L,
+            remMinutes = remMillis / 60_000L,
+            awakeMinutes = awakeMillis / 60_000L
+        )
     }
 
     private fun sleepStageName(stage: Int): String = when (stage) {
@@ -1146,9 +1167,12 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     private fun sourcePriority(packageName: String): Int {
         val value = packageName.lowercase()
         return when {
-            value.contains("xiaomi") || value.contains("mifitness") || value.contains("mi.health") || value.contains("wearable") -> 0
+            // 1.6.26: Fitbit is the primary wearable source in the current setup.
+            // This is an interim policy until source selection becomes metric-specific.
+            value.contains("fitbit") -> 0
             value == "com.google.android.apps.fitness" || (value.contains("google") && value.contains("fitness")) -> 1
-            else -> 2
+            value.contains("xiaomi") || value.contains("mifitness") || value.contains("mi.health") || value.contains("wearable") -> 2
+            else -> 3
         }
     }
 
