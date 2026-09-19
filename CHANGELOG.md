@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.27 — Foreground manual sync
+
+- Restored user-triggered Health Connect reads to the foreground Activity, matching the original 1.0 architecture.
+- Reserved WorkManager for real background synchronization only.
+- Fixed ManualSyncWorker so it refuses to read Health Connect when Background Read capability is unavailable instead of continuing with a partial view of records.
+- This targets the regression where third-party Fitbit/Google Health records disappear while system/on-device and HealthConnector-owned records remain visible.
+
 ## 1.6.26 — Auto Config Recovery and Health Connect diagnostics
 
 - Added first-launch automatic discovery of `healthconnector-config*.json` in storage locations readable by the current Android installation.
