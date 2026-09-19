@@ -15,18 +15,18 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
   - search existing keyless rows by stable signature before appending a new row;
   - replace a recovered synthetic key with the real incoming Health Connect record ID when the same row appears again;
   - never pretend a synthetic recovery key is an original Health Connect record ID.
-- [ ] Add an authenticated integrity-repair action and diagnostics report for manual repair runs.
-- [ ] Add bounded automatic integrity repair before Health Connect V3 writes.
+- [x] Add an authenticated integrity-repair action and diagnostics report for manual repair runs.
+- [x] Add bounded automatic integrity repair during internal HC table upserts.
 
 ## P1 — Health Connect correctness
 
 - [ ] Remove hard-coded Xiaomi > Google Fit > all-others source priority.
 - [ ] Define metric-specific source policy; cumulative metrics should prefer Health Connect Aggregate API.
-- [ ] Treat Fitbit as a first-class source for sleep/heart/SpO2 when present.
+- [~] Treat Fitbit as a first-class source: interim Fitbit-first priority is implemented; metric-specific policy still remains.
 - [ ] Split core vs optional Health Connect permissions; optional metrics must not block steps/sleep/heart synchronization.
 - [ ] Replace `safeReadAll(): List<T>` with structured result: Success(records), PermissionDenied, Error.
-- [ ] Improve sleep diagnostics: raw record count, post-filter count, source package, start/end and zone offsets.
-- [ ] Fix sleep-stage aggregation: accumulate duration at millisecond/second precision and round only after summation.
+- [~] Improve sleep diagnostics: raw record count, post-filter count and source packages are implemented; record offsets still remain.
+- [x] Fix sleep-stage aggregation: accumulate duration at millisecond precision and round only after summation.
 - [ ] Review historical date attribution against record zone offsets and DST/travel cases.
 - [ ] Remove duplicate permission definitions from `StreamingMainActivity`.
 - [ ] Remove dead direct `synchronize()` path from `StreamingMainActivity`.
