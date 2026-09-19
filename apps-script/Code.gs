@@ -1102,6 +1102,7 @@ function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
     const dateKey = String(day.date || '').trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return;
     const available = Array.isArray(day.availableFields) ? new Set(day.availableFields) : new Set(Object.keys(day));
+    const clearFields = Array.isArray(day.clearFields) ? new Set(day.clearFields) : new Set();
     let rowNumber = existing.get(dateKey);
     let row;
 
@@ -1124,9 +1125,26 @@ function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
       if (!header || !headerIndex.has(header)) return;
       const index = headerIndex.get(header);
       const raw = day[key];
-      row[index] = key === 'sourcePackages' && Array.isArray(raw)
-        ? raw.join(', ')
-        : nullable_(raw);
+      const shouldClear = clearFields.has(key);
+      const isEmpty = raw === null || raw === undefined || raw === '' ||
+        (Array.isArray(raw) && raw.length === 0);
+
+      // Partial syncs are additive. A readable Health Connect type may temporarily
+      // return no records while the source app is still catching up. Never let that
+      // transient absence erase a value already stored for the day. A caller that
+      // truly needs to remove a value must opt in through clearFields.
+      if (isEmpty && !shouldClear) return;
+
+      if (key === 'sourcePackages' && Array.isArray(raw) && !shouldClear) {
+        const previous = String(row[index] || '')
+          .split(',')
+          .map(value => value.trim())
+          .filter(Boolean);
+        const incoming = raw.map(String).map(value => value.trim()).filter(Boolean);
+        row[index] = Array.from(new Set(previous.concat(incoming))).join(', ');
+      } else {
+        row[index] = shouldClear && isEmpty ? '' : nullable_(raw);
+      }
     });
 
     row[headerIndex.get('SyncedAt')] = syncedAt;
@@ -1165,12 +1183,21 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
   const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, DAY_HEADERS_V3.length).getValues();
   const rows = [];
 
+  const coreIndexes = ['Steps', 'SleepHours', 'AvgHeartRate', 'ActiveCaloriesKcal']
+    .map(name => headers.indexOf(name))
+    .filter(index => index >= 0);
+
   values.forEach(row => {
     const date = normalizeDateWithTz_(row[dateIndex], tz);
     if (!date || date < oldestRepairable || date > today) return;
+    const coreCoverage = coreIndexes.reduce((count, index) => {
+      const value = row[index];
+      return count + (value !== '' && value !== null && value !== undefined ? 1 : 0);
+    }, 0);
     rows.push({
       date,
-      complete: completeIndex >= 0 ? booleanCellV3_(row[completeIndex]) : null
+      complete: completeIndex >= 0 ? booleanCellV3_(row[completeIndex]) : null,
+      coreCoverage
     });
   });
 
@@ -1208,6 +1235,20 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
       }
       cursor = addDaysToDateKeyV3_(cursor, 1, tz);
     }
+  }
+
+  // A recent day marked complete can still be sparse when Mi Fitness/Health Connect
+  // delivered records late. Re-read the earliest sparse day inside the normal
+  // fallback window so newly arrived sleep/heart/activity data can repair it.
+  const sparseRecent = dates.find(date =>
+    date >= fallbackStart &&
+    date < today &&
+    byDate.get(date).complete === true &&
+    byDate.get(date).coreCoverage <= 1
+  );
+  if (sparseRecent && (!startDate || sparseRecent < startDate)) {
+    startDate = sparseRecent;
+    reason = 'sparse-recent-day';
   }
 
   // Legacy rows do not have SyncComplete. Re-read the latest legacy day once.
