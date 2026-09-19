@@ -107,12 +107,16 @@ function setup() {
   return result;
 }
 
-function doGet() {
+function doGet(e) {
+  if (e && e.parameter && e.parameter.fitbit === 'callback') {
+    return fitbitHandleOAuthCallbackV1_(e);
+  }
   return json_({
     ok: true,
     service: 'Health Dashboard Sync',
     schemaVersion: 3,
-    time: new Date().toISOString()
+    time: new Date().toISOString(),
+    fitbit: fitbitStatusV1_()
   });
 }
 
@@ -1359,4 +1363,594 @@ function isoDateKeyV3_(value, tz) {
   if (iso) return iso[1];
   const d = new Date(text);
   return isNaN(d) ? '' : Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+}
+
+
+// ===== Fitbit Web API connector v1 =====
+//
+// Google Health currently writes sleep to Health Connect but does not write
+// heart rate, HRV, SpO2, respiratory rate or resting heart rate there.
+// This server-side connector is therefore an additive, independent source for
+// Fitbit vitals. It remains dormant until OAuth credentials are configured.
+const FITBIT_V1 = Object.freeze({
+  AUTH_URL: 'https://www.fitbit.com/oauth2/authorize',
+  TOKEN_URL: 'https://api.fitbit.com/oauth2/token',
+  API_BASE: 'https://api.fitbit.com',
+  SOURCE_PACKAGE: 'fitbit.webapi',
+  SOURCE_NAME: 'Fitbit Web API',
+  SCHEDULED_DAYS: 3,
+  MAX_MANUAL_DAYS: 30,
+  TOKEN_SKEW_MS: 120000,
+  OAUTH_STATE_TTL_MS: 20 * 60 * 1000,
+  SCOPES: [
+    'activity',
+    'heartrate',
+    'sleep',
+    'oxygen_saturation',
+    'respiratory_rate',
+    'profile'
+  ]
+});
+
+const FITBIT_PROP = Object.freeze({
+  CLIENT_ID: 'FITBIT_CLIENT_ID',
+  CLIENT_SECRET: 'FITBIT_CLIENT_SECRET',
+  REDIRECT_URI: 'FITBIT_REDIRECT_URI',
+  ACCESS_TOKEN: 'FITBIT_ACCESS_TOKEN',
+  REFRESH_TOKEN: 'FITBIT_REFRESH_TOKEN',
+  EXPIRES_AT: 'FITBIT_TOKEN_EXPIRES_AT',
+  USER_ID: 'FITBIT_USER_ID',
+  SCOPE: 'FITBIT_SCOPE',
+  OAUTH_STATE: 'FITBIT_OAUTH_STATE',
+  OAUTH_STATE_AT: 'FITBIT_OAUTH_STATE_AT',
+  LAST_SYNC_AT: 'FITBIT_LAST_SYNC_AT',
+  LAST_STATUS: 'FITBIT_LAST_STATUS'
+});
+
+/**
+ * Run once from the Apps Script editor after creating a Personal Fitbit app.
+ * The returned redirectUri must be registered EXACTLY in the Fitbit developer app.
+ * Client secrets remain only in Script Properties and never go to Android/Sheets.
+ */
+function configureFitbitOAuthV1(clientId, clientSecret) {
+  const id = String(clientId || '').trim();
+  const secret = String(clientSecret || '').trim();
+  if (!id || !secret) throw new Error('Нужны Fitbit clientId и clientSecret');
+
+  const serviceUrl = String(ScriptApp.getService().getUrl() || '').trim();
+  if (!/^https:\/\//i.test(serviceUrl)) {
+    throw new Error('Сначала разверни Apps Script как Web App');
+  }
+  const redirectUri = serviceUrl + '?fitbit=callback';
+
+  const props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    [FITBIT_PROP.CLIENT_ID]: id,
+    [FITBIT_PROP.CLIENT_SECRET]: secret,
+    [FITBIT_PROP.REDIRECT_URI]: redirectUri
+  }, false);
+
+  return {
+    ok: true,
+    redirectUri,
+    authorizationUrl: getFitbitAuthorizationUrlV1(),
+    message: 'Добавь redirectUri в Fitbit Developer App, затем открой authorizationUrl'
+  };
+}
+
+function getFitbitAuthorizationUrlV1() {
+  const props = PropertiesService.getScriptProperties();
+  const clientId = String(props.getProperty(FITBIT_PROP.CLIENT_ID) || '').trim();
+  const redirectUri = String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || '').trim();
+  if (!clientId || !redirectUri) {
+    throw new Error('Сначала вызови configureFitbitOAuthV1(clientId, clientSecret)');
+  }
+
+  const state = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
+  props.setProperty(FITBIT_PROP.OAUTH_STATE, state);
+  props.setProperty(FITBIT_PROP.OAUTH_STATE_AT, String(Date.now()));
+
+  const query = [
+    ['response_type', 'code'],
+    ['client_id', clientId],
+    ['redirect_uri', redirectUri],
+    ['scope', FITBIT_V1.SCOPES.join(' ')],
+    ['state', state]
+  ].map(pair => encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1])).join('&');
+
+  return FITBIT_V1.AUTH_URL + '?' + query;
+}
+
+function fitbitHandleOAuthCallbackV1_(e) {
+  const params = e && e.parameter || {};
+  if (params.error) {
+    return json_({ ok: false, fitbit: true, error: String(params.error), message: String(params.error_description || params.error) });
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  const expectedState = String(props.getProperty(FITBIT_PROP.OAUTH_STATE) || '');
+  const stateAt = Number(props.getProperty(FITBIT_PROP.OAUTH_STATE_AT) || 0);
+  const receivedState = String(params.state || '');
+  if (!expectedState || !receivedState || expectedState !== receivedState ||
+      !stateAt || Date.now() - stateAt > FITBIT_V1.OAUTH_STATE_TTL_MS) {
+    return json_({ ok: false, fitbit: true, error: 'oauth_state_invalid', message: 'Fitbit OAuth state недействителен или устарел' });
+  }
+
+  const code = String(params.code || '').trim();
+  if (!code) {
+    return json_({ ok: false, fitbit: true, error: 'oauth_code_missing', message: 'Fitbit не вернул authorization code' });
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    return json_({ ok: false, fitbit: true, error: 'lock_busy', message: 'Сервер занят; повтори авторизацию' });
+  }
+  try {
+    fitbitExchangeTokenV1_({
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || '')
+    });
+    props.deleteProperty(FITBIT_PROP.OAUTH_STATE);
+    props.deleteProperty(FITBIT_PROP.OAUTH_STATE_AT);
+    fitbitInstallTriggerV1();
+    props.setProperty(FITBIT_PROP.LAST_STATUS, 'OAuth подключён; ожидается синхронизация');
+    return json_({
+      ok: true,
+      fitbit: true,
+      message: 'Fitbit подключён. Автосинхронизация установлена.',
+      status: fitbitStatusV1_()
+    });
+  } catch (error) {
+    return json_({
+      ok: false,
+      fitbit: true,
+      error: String(error && error.message || error),
+      message: String(error && error.message || error)
+    });
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+function fitbitStatusV1_() {
+  const props = PropertiesService.getScriptProperties();
+  const expiresAt = Number(props.getProperty(FITBIT_PROP.EXPIRES_AT) || 0);
+  return {
+    configured: Boolean(props.getProperty(FITBIT_PROP.CLIENT_ID) && props.getProperty(FITBIT_PROP.CLIENT_SECRET)),
+    authorized: Boolean(props.getProperty(FITBIT_PROP.REFRESH_TOKEN) || props.getProperty(FITBIT_PROP.ACCESS_TOKEN)),
+    userId: props.getProperty(FITBIT_PROP.USER_ID) || '',
+    scope: props.getProperty(FITBIT_PROP.SCOPE) || '',
+    tokenExpiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+    lastSyncAt: props.getProperty(FITBIT_PROP.LAST_SYNC_AT) || null,
+    lastStatus: props.getProperty(FITBIT_PROP.LAST_STATUS) || ''
+  };
+}
+
+function fitbitExchangeTokenV1_(grantPayload) {
+  const props = PropertiesService.getScriptProperties();
+  const clientId = String(props.getProperty(FITBIT_PROP.CLIENT_ID) || '').trim();
+  const clientSecret = String(props.getProperty(FITBIT_PROP.CLIENT_SECRET) || '').trim();
+  if (!clientId || !clientSecret) throw new Error('Fitbit OAuth credentials не настроены');
+
+  const payload = Object.assign({ client_id: clientId }, grantPayload || {});
+  const response = UrlFetchApp.fetch(FITBIT_V1.TOKEN_URL, {
+    method: 'post',
+    contentType: 'application/x-www-form-urlencoded',
+    headers: {
+      Authorization: 'Basic ' + Utilities.base64Encode(clientId + ':' + clientSecret)
+    },
+    payload: payload,
+    muteHttpExceptions: true
+  });
+  const code = response.getResponseCode();
+  const text = response.getContentText();
+  let json = {};
+  try { json = JSON.parse(text || '{}'); } catch (_) {}
+  if (code < 200 || code >= 300 || !json.access_token) {
+    throw new Error('Fitbit OAuth HTTP ' + code + ': ' + fitbitSafeErrorV1_(json, text));
+  }
+
+  const expiresIn = Math.max(60, Number(json.expires_in || 28800));
+  const values = {};
+  values[FITBIT_PROP.ACCESS_TOKEN] = String(json.access_token);
+  values[FITBIT_PROP.EXPIRES_AT] = String(Date.now() + expiresIn * 1000);
+  if (json.refresh_token) values[FITBIT_PROP.REFRESH_TOKEN] = String(json.refresh_token);
+  if (json.user_id) values[FITBIT_PROP.USER_ID] = String(json.user_id);
+  if (json.scope) values[FITBIT_PROP.SCOPE] = Array.isArray(json.scope) ? json.scope.join(' ') : String(json.scope);
+  props.setProperties(values, false);
+  return json;
+}
+
+function fitbitRefreshAccessTokenV1_() {
+  const props = PropertiesService.getScriptProperties();
+  const refreshToken = String(props.getProperty(FITBIT_PROP.REFRESH_TOKEN) || '').trim();
+  if (!refreshToken) throw new Error('Нет Fitbit refresh token; нужна повторная OAuth-авторизация');
+  return fitbitExchangeTokenV1_({
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken
+  });
+}
+
+function fitbitAccessTokenV1_() {
+  const props = PropertiesService.getScriptProperties();
+  let token = String(props.getProperty(FITBIT_PROP.ACCESS_TOKEN) || '').trim();
+  const expiresAt = Number(props.getProperty(FITBIT_PROP.EXPIRES_AT) || 0);
+  if (!token || !expiresAt || Date.now() + FITBIT_V1.TOKEN_SKEW_MS >= expiresAt) {
+    const refreshed = fitbitRefreshAccessTokenV1_();
+    token = String(refreshed.access_token || '');
+  }
+  if (!token) throw new Error('Fitbit access token отсутствует');
+  return token;
+}
+
+function fitbitFetchJsonV1_(path, allowRefresh) {
+  const token = fitbitAccessTokenV1_();
+  const response = UrlFetchApp.fetch(FITBIT_V1.API_BASE + path, {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      Accept: 'application/json'
+    },
+    muteHttpExceptions: true
+  });
+  const code = response.getResponseCode();
+  const text = response.getContentText();
+  let json = {};
+  try { json = JSON.parse(text || '{}'); } catch (_) {}
+
+  if (code === 401 && allowRefresh !== false) {
+    fitbitRefreshAccessTokenV1_();
+    return fitbitFetchJsonV1_(path, false);
+  }
+  if (code === 429) {
+    const headers = response.getAllHeaders ? response.getAllHeaders() : {};
+    const reset = headers['fitbit-rate-limit-reset'] || headers['Fitbit-Rate-Limit-Reset'] || '';
+    throw new Error('Fitbit API rate limit' + (reset ? '; retry через ' + reset + ' сек.' : ''));
+  }
+  if (code === 404) return null;
+  if (code < 200 || code >= 300) {
+    throw new Error('Fitbit API HTTP ' + code + ' ' + path + ': ' + fitbitSafeErrorV1_(json, text));
+  }
+  return json;
+}
+
+function fitbitSafeErrorV1_(json, text) {
+  const errors = json && Array.isArray(json.errors) ? json.errors : [];
+  if (errors.length) {
+    return errors.map(item => String(item.message || item.errorType || 'Fitbit error')).join('; ').slice(0, 500);
+  }
+  return String(text || 'unknown error').replace(/[\r\n]+/g, ' ').slice(0, 500);
+}
+
+function fitbitTryFetchV1_(path, warnings, label) {
+  try {
+    return fitbitFetchJsonV1_(path, true);
+  } catch (error) {
+    warnings.push(label + ': ' + String(error && error.message || error));
+    return null;
+  }
+}
+
+function fitbitInstallTriggerV1() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === 'fitbitScheduledSyncV1')
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  ScriptApp.newTrigger('fitbitScheduledSyncV1').timeBased().everyHours(6).create();
+  return { ok: true, message: 'Fitbit sync trigger: каждые 6 часов' };
+}
+
+function fitbitRemoveTriggerV1() {
+  let removed = 0;
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === 'fitbitScheduledSyncV1')
+    .forEach(trigger => { ScriptApp.deleteTrigger(trigger); removed++; });
+  return { ok: true, removed };
+}
+
+function fitbitScheduledSyncV1() {
+  try {
+    return fitbitSyncRecentV1(FITBIT_V1.SCHEDULED_DAYS);
+  } catch (error) {
+    PropertiesService.getScriptProperties().setProperty(
+      FITBIT_PROP.LAST_STATUS,
+      'ERROR: ' + String(error && error.message || error)
+    );
+    throw error;
+  }
+}
+
+/**
+ * Public manual repair entry point. Safe to run repeatedly: all writes are
+ * idempotent and additive. It never clears a Health Connect value merely because
+ * Fitbit did not return a metric.
+ */
+function fitbitSyncRecentV1(days) {
+  const safeDays = Math.max(1, Math.min(FITBIT_V1.MAX_MANUAL_DAYS, Number(days || 3)));
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) throw new Error('Fitbit sync: сервер занят другой синхронизацией');
+
+  try {
+    // Force token validation/refresh before mutating Sheets.
+    fitbitAccessTokenV1_();
+
+    const spreadsheet = getSpreadsheet_();
+    const logSheet = ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS);
+    const tz = spreadsheet.getSpreadsheetTimeZone();
+    const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+    const results = [];
+
+    for (let offset = safeDays - 1; offset >= 0; offset--) {
+      const date = addDaysToDateKeyV3_(today, -offset, tz);
+      results.push(fitbitSyncDateV1_(spreadsheet, logSheet, date));
+      if (offset > 0) Utilities.sleep(150);
+    }
+
+    const warnings = results.reduce((sum, item) => sum + item.warnings.length, 0);
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty(FITBIT_PROP.LAST_SYNC_AT, new Date().toISOString());
+    props.setProperty(
+      FITBIT_PROP.LAST_STATUS,
+      'OK: ' + results.length + ' дн.; предупреждений ' + warnings
+    );
+    return { ok: true, days: results.length, warnings, results };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+function fitbitSyncDateV1_(spreadsheet, logSheet, date) {
+  const warnings = [];
+  const day = { date: date, availableFields: [], sourcePackages: [FITBIT_V1.SOURCE_PACKAGE] };
+  const fields = new Set();
+  const measurements = [];
+  const sleepSessions = [];
+  const syncedAt = new Date().toISOString();
+
+  function field(name, value) {
+    if (value === null || value === undefined || value === '' ||
+        (typeof value === 'number' && !Number.isFinite(value))) return;
+    day[name] = value;
+    fields.add(name);
+  }
+
+  // Heart rate: daily summary + 1-minute intraday. Google Health does not write
+  // this Fitbit vital back into Health Connect, so Fitbit Web API is authoritative.
+  const heart = fitbitTryFetchV1_(
+    '/1/user/-/activities/heart/date/' + encodeURIComponent(date) + '/1d/1min.json',
+    warnings,
+    'heart'
+  );
+  if (heart) {
+    const heartSummary = Array.isArray(heart['activities-heart']) ? heart['activities-heart'][0] : null;
+    const heartValue = heartSummary && heartSummary.value || {};
+    const dataset = heart['activities-heart-intraday'] && Array.isArray(heart['activities-heart-intraday'].dataset)
+      ? heart['activities-heart-intraday'].dataset : [];
+    const values = dataset.map(item => Number(item && item.value)).filter(Number.isFinite);
+    const stats = fitbitStatsV1_(values);
+    field('averageHeartRate', stats.avg);
+    field('minimumHeartRate', stats.min);
+    field('maximumHeartRate', stats.max);
+    field('heartRateSamples', stats.count);
+    field('restingHeartRate', fitbitFiniteNumberV1_(heartValue.restingHeartRate));
+    if (stats.avg != null) {
+      measurements.push(fitbitDailyMeasurementV1_(date, 'HeartRateDailyAvg', stats.avg, 'bpm', syncedAt));
+    }
+    if (fitbitFiniteNumberV1_(heartValue.restingHeartRate) != null) {
+      measurements.push(fitbitDailyMeasurementV1_(date, 'RestingHeartRate', Number(heartValue.restingHeartRate), 'bpm', syncedAt));
+    }
+  }
+
+  const hrv = fitbitTryFetchV1_(
+    '/1/user/-/hrv/date/' + encodeURIComponent(date) + '.json',
+    warnings,
+    'hrv'
+  );
+  if (hrv && Array.isArray(hrv.hrv) && hrv.hrv.length) {
+    const values = hrv.hrv
+      .map(item => fitbitFiniteNumberV1_(item && item.value && item.value.dailyRmssd))
+      .filter(value => value != null);
+    const stats = fitbitStatsV1_(values);
+    field('averageHrvRmssdMs', stats.avg);
+    field('minimumHrvRmssdMs', stats.min);
+    field('maximumHrvRmssdMs', stats.max);
+    field('hrvSamples', stats.count);
+    if (stats.avg != null) {
+      measurements.push(fitbitDailyMeasurementV1_(date, 'HRV_RMSSD_Daily', stats.avg, 'ms', syncedAt));
+    }
+  }
+
+  const spo2 = fitbitTryFetchV1_(
+    '/1/user/-/spo2/date/' + encodeURIComponent(date) + '.json',
+    warnings,
+    'spo2'
+  );
+  if (spo2 && spo2.value) {
+    const avg = fitbitFiniteNumberV1_(spo2.value.avg);
+    const min = fitbitFiniteNumberV1_(spo2.value.min);
+    const max = fitbitFiniteNumberV1_(spo2.value.max);
+    field('averageSpO2', avg);
+    field('minimumSpO2', min);
+    field('maximumSpO2', max);
+    field('spO2Samples', avg != null ? 1 : null);
+    if (avg != null) measurements.push(fitbitDailyMeasurementV1_(date, 'SpO2DailyAvg', avg, '%', syncedAt));
+  }
+
+  const breathing = fitbitTryFetchV1_(
+    '/1/user/-/br/date/' + encodeURIComponent(date) + '.json',
+    warnings,
+    'respiratory'
+  );
+  if (breathing && Array.isArray(breathing.br) && breathing.br.length) {
+    const rates = breathing.br
+      .map(item => fitbitFiniteNumberV1_(item && item.value && item.value.breathingRate))
+      .filter(value => value != null);
+    const stats = fitbitStatsV1_(rates);
+    field('averageRespiratoryRate', stats.avg);
+    field('minimumRespiratoryRate', stats.min);
+    field('maximumRespiratoryRate', stats.max);
+    field('respiratorySamples', stats.count);
+    if (stats.avg != null) {
+      measurements.push(fitbitDailyMeasurementV1_(date, 'RespiratoryRateDaily', stats.avg, 'breaths/min', syncedAt));
+    }
+  }
+
+  // Cloud sleep is a fallback/repair path for Health Connect and also gives us
+  // the original Fitbit logId, which makes repeated imports idempotent.
+  const sleep = fitbitTryFetchV1_(
+    '/1.2/user/-/sleep/date/' + encodeURIComponent(date) + '.json',
+    warnings,
+    'sleep'
+  );
+  if (sleep && Array.isArray(sleep.sleep) && sleep.sleep.length) {
+    const logs = sleep.sleep.filter(Boolean);
+    let deep = 0, light = 0, rem = 0, awake = 0, stageCount = 0;
+    let earliestStart = null, latestEnd = null;
+    let mainMinutes = null, napMinutes = 0, napCount = 0;
+
+    logs.forEach(log => {
+      const levelSummary = log.levels && log.levels.summary || {};
+      const d = fitbitFiniteNumberV1_(levelSummary.deep && levelSummary.deep.minutes) || 0;
+      const l = fitbitFiniteNumberV1_(levelSummary.light && levelSummary.light.minutes) || 0;
+      const r = fitbitFiniteNumberV1_(levelSummary.rem && levelSummary.rem.minutes) || 0;
+      const w = fitbitFiniteNumberV1_(levelSummary.wake && levelSummary.wake.minutes);
+      const awakeMinutes = w != null ? w : (fitbitFiniteNumberV1_(log.minutesAwake) || 0);
+      deep += d; light += l; rem += r; awake += awakeMinutes;
+
+      const stages = log.levels && Array.isArray(log.levels.data) ? log.levels.data : [];
+      stageCount += stages.length;
+      const start = String(log.startTime || '');
+      const end = String(log.endTime || '');
+      if (start && (!earliestStart || start < earliestStart)) earliestStart = start;
+      if (end && (!latestEnd || end > latestEnd)) latestEnd = end;
+
+      const asleepMinutes = fitbitFiniteNumberV1_(log.minutesAsleep);
+      const durationMinutes = fitbitFiniteNumberV1_(log.duration) != null
+        ? Number(log.duration) / 60000
+        : fitbitFiniteNumberV1_(log.timeInBed);
+      if (log.isMainSleep === true) {
+        if (asleepMinutes != null && (mainMinutes == null || asleepMinutes > mainMinutes)) mainMinutes = asleepMinutes;
+      } else {
+        napCount++;
+        napMinutes += asleepMinutes != null ? asleepMinutes : (durationMinutes || 0);
+      }
+
+      const logId = String(log.logId || (start + '|' + end));
+      sleepSessions.push({
+        id: 'fitbit-web|sleep|' + logId,
+        start: start,
+        end: end,
+        durationMinutes: durationMinutes,
+        title: log.isMainSleep === true ? 'Main sleep' : 'Nap',
+        notes: '',
+        deepSleepMinutes: d,
+        lightSleepMinutes: l,
+        remSleepMinutes: r,
+        awakeMinutes: awakeMinutes,
+        stageCount: stages.length,
+        stagesJson: JSON.stringify(stages),
+        sourcePackage: FITBIT_V1.SOURCE_PACKAGE,
+        sourceName: FITBIT_V1.SOURCE_NAME
+      });
+    });
+
+    const totalMinutes = fitbitFiniteNumberV1_(sleep.summary && sleep.summary.totalMinutesAsleep);
+    const fallbackTotal = logs.reduce((sum, log) => sum + (fitbitFiniteNumberV1_(log.minutesAsleep) || 0), 0);
+    const sleepMinutes = totalMinutes != null ? totalMinutes : fallbackTotal;
+    field('sleepHours', sleepMinutes / 60);
+    field('deepSleepMinutes', deep);
+    field('lightSleepMinutes', light);
+    field('remSleepMinutes', rem);
+    field('awakeMinutes', awake);
+    field('sleepStart', earliestStart);
+    field('sleepEnd', latestEnd);
+    field('sleepSessionCount', logs.length);
+    field('sleepStageCount', stageCount);
+    field('mainSleepHours', mainMinutes != null ? mainMinutes / 60 : null);
+    field('napCount', napCount);
+    field('napMinutes', napMinutes);
+  }
+
+  fields.add('sourcePackages');
+  day.availableFields = Array.from(fields);
+
+  const payload = {
+    action: 'healthSyncV3',
+    deviceId: 'FitbitWebAPI',
+    rangeStart: date,
+    rangeEnd: date,
+    syncedAt: syncedAt,
+    days: [day],
+    workouts: [],
+    sleepSessions: sleepSessions,
+    measurements: measurements,
+    sources: [{ packageName: FITBIT_V1.SOURCE_PACKAGE, name: FITBIT_V1.SOURCE_NAME }]
+    // Deliberately omit dayComplete: cloud enrichment must not change the
+    // Health Connect reconciliation state of the day.
+  };
+  const imported = importHealthPayloadV3_(spreadsheet, logSheet, payload);
+  if (warnings.length) {
+    logSheet.appendRow([
+      new Date(), 'FitbitWebAPI', date, date, 1, 0, 'WARNING',
+      sheetSafeExternalText_('Fitbit partial: ' + warnings.join(' | ').slice(0, 1500))
+    ]);
+  }
+  return {
+    date: date,
+    fields: day.availableFields.length,
+    sleepSessions: sleepSessions.length,
+    measurements: measurements.length,
+    warnings: warnings,
+    imported: imported && imported.ok === true
+  };
+}
+
+function fitbitDailyMeasurementV1_(date, type, value, unit, syncedAt) {
+  return {
+    id: 'fitbit-web|' + type + '|' + date,
+    time: date + 'T12:00:00',
+    start: null,
+    end: null,
+    type: type,
+    value: value,
+    unit: unit,
+    sourcePackage: FITBIT_V1.SOURCE_PACKAGE,
+    sourceName: FITBIT_V1.SOURCE_NAME,
+    syncedAt: syncedAt
+  };
+}
+
+function fitbitFiniteNumberV1_(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function fitbitStatsV1_(values) {
+  const clean = (values || []).map(Number).filter(Number.isFinite);
+  if (!clean.length) return { count: 0, avg: null, min: null, max: null };
+  const sum = clean.reduce((a, b) => a + b, 0);
+  return {
+    count: clean.length,
+    avg: sum / clean.length,
+    min: Math.min.apply(null, clean),
+    max: Math.max.apply(null, clean)
+  };
+}
+
+function disconnectFitbitOAuthV1() {
+  fitbitRemoveTriggerV1();
+  const props = PropertiesService.getScriptProperties();
+  [
+    FITBIT_PROP.ACCESS_TOKEN,
+    FITBIT_PROP.REFRESH_TOKEN,
+    FITBIT_PROP.EXPIRES_AT,
+    FITBIT_PROP.USER_ID,
+    FITBIT_PROP.SCOPE,
+    FITBIT_PROP.OAUTH_STATE,
+    FITBIT_PROP.OAUTH_STATE_AT,
+    FITBIT_PROP.LAST_SYNC_AT,
+    FITBIT_PROP.LAST_STATUS
+  ].forEach(key => props.deleteProperty(key));
+  return { ok: true, message: 'Fitbit OAuth tokens удалены; client credentials сохранены' };
 }
