@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.29 — canonical Health Connect origins
+
+- Canonicalized the three active Health Connect source packages: `com.fitbit.FitbitMobile` (Fitbit), `com.google.android.apps.fitness` (Google Fit), and `com.xiaomi.wearable` (Mi Fitness).
+- Source priority now uses exact package matching instead of broad substring matching, preventing unrelated apps from becoming a preferred source.
+- Centralized source labels and priority in `HealthSourceCatalog` and added unit tests for exact IDs and lookalike packages.
+- Expanded sleep origin recovery/diagnostics to probe all three canonical origins independently and merge results idempotently.
+- Sleep diagnostics now report `all=N; Fitbit=N; Google Fit=N; Mi Fitness=N` (or an origin-specific error) for each day.
+- Version `1.6.29`, versionCode `43`.
+
+
 ## 1.6.28 — Fitbit origin recovery and stable dual-source sync
 
 - Added an explicit Health Connect `DataOrigin("com.fitbit.FitbitMobile")` fallback for sleep after reinstall/device migration.
