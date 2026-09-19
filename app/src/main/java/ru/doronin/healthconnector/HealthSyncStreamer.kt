@@ -23,6 +23,7 @@ import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
 import androidx.health.connect.client.records.Vo2MaxRecord
 import androidx.health.connect.client.records.WeightRecord
+import androidx.health.connect.client.records.metadata.DataOrigin
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.Dispatchers
@@ -52,6 +53,7 @@ class HealthSyncStreamer(
     private val aggregateReader = HealthAggregateReader(client)
     private val changesTracker = HealthChangesTracker(context, client)
     private val permissionDeniedTypes = linkedSetOf<String>()
+    private val originProbeDiagnostics = linkedMapOf<String, String>()
 
     suspend fun sync(
         endpoint: String,
@@ -288,7 +290,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 .ifBlank { "—" }
             onProgress(
                 "[$date] Сон · raw ${rawSleepRecords.size} · после фильтра ${records.size} · " +
-                    "источники $sleepSources · ${sleepSummary.stageCount} стадий · " +
+                    "источники $sleepSources${originProbeSummary<SleepSessionRecord>()} · " +
+                    "${sleepSummary.stageCount} стадий · " +
                     "${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч"
             )
             for (r in records) {
@@ -378,7 +381,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             onProgress("[$date] Этап 5/8 · читаю пульс…")
             workoutDayRecords.heartRate = safeReadAll<HeartRateRecord>(dayStart, dayEnd)
             val records = preferBestSource(workoutDayRecords.heartRate)
-            onProgress("[$date] Пульс · ${records.size} серий · ${records.sumOf { it.samples.size }} отсчётов")
+            onProgress(
+                "[$date] Пульс · ${records.size} серий · ${records.sumOf { it.samples.size }} отсчётов" +
+                    originProbeSummary<HeartRateRecord>()
+            )
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -1196,6 +1202,41 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     }
 
     private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
+        val base = safeReadAllUnfiltered<T>(start, end)
+        if (!shouldProbeFitbitOrigin<T>() || typeKey<T>() in permissionDeniedTypes) return base
+
+        // Android's current Health Connect guidance explicitly recommends a
+        // DataOrigin filter when re-reading records that were written before a
+        // reinstall/migration. Probe Fitbit/Google Health explicitly and merge
+        // it with the ordinary read instead of trusting one path exclusively.
+        val fitbit = runCatching {
+            readAll<T>(
+                start = start,
+                end = end,
+                dataOriginFilter = setOf(DataOrigin(FITBIT_DATA_ORIGIN))
+            )
+        }.getOrElse { error ->
+            originProbeDiagnostics[typeKey<T>()] =
+                "all=${base.size}; fitbit=ERROR(${error.javaClass.simpleName})"
+            emptyList()
+        }
+
+        originProbeDiagnostics[typeKey<T>()] = "all=${base.size}; fitbit=${fitbit.size}"
+        if (fitbit.isEmpty()) return base
+
+        val merged = LinkedHashMap<String, T>(base.size + fitbit.size)
+        (base + fitbit).forEach { record ->
+            val key = record.metadata.id.takeIf { it.isNotBlank() }
+                ?: "${record.metadata.dataOrigin.packageName}|${record.hashCode()}"
+            merged[key] = record
+        }
+        return merged.values.toList()
+    }
+
+    private suspend inline fun <reified T : Record> safeReadAllUnfiltered(
+        start: Instant,
+        end: Instant
+    ): List<T> {
         var lastError: Exception? = null
         repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
             try {
@@ -1205,6 +1246,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 // Missing permission for an optional metric must not abort the whole sync.
                 if (HealthConnectErrorUtils.isPermissionFailure(error)) {
                     permissionDeniedTypes += typeKey<T>()
+                    originProbeDiagnostics[typeKey<T>()] =
+                        "all=PERMISSION_DENIED(${error.javaClass.simpleName})"
                     return emptyList()
                 }
 
@@ -1219,6 +1262,20 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             lastError
         )
     }
+
+    private inline fun <reified T : Record> shouldProbeFitbitOrigin(): Boolean = when (T::class) {
+        SleepSessionRecord::class,
+        HeartRateRecord::class,
+        RestingHeartRateRecord::class,
+        HeartRateVariabilityRmssdRecord::class,
+        OxygenSaturationRecord::class,
+        RespiratoryRateRecord::class,
+        ExerciseSessionRecord::class -> true
+        else -> false
+    }
+
+    private inline fun <reified T : Record> originProbeSummary(): String =
+        originProbeDiagnostics[typeKey<T>()]?.let { " · origin probe: $it" }.orEmpty()
 
     private inline fun <reified T : Record> typeKey(): String =
         T::class.qualifiedName ?: T::class.simpleName ?: "unknown"
@@ -1235,7 +1292,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     }
 
 
-    private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {
+    private suspend inline fun <reified T : Record> readAll(
+        start: Instant,
+        end: Instant,
+        dataOriginFilter: Set<DataOrigin> = emptySet()
+    ): List<T> {
         val all = ArrayList<T>()
         var pageToken: String? = null
         do {
@@ -1243,6 +1304,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 ReadRecordsRequest(
                     recordType = T::class,
                     timeRangeFilter = TimeRangeFilter.between(start, end),
+                    dataOriginFilter = dataOriginFilter,
                     pageSize = HEALTH_CONNECT_PAGE_SIZE,
                     pageToken = pageToken
                 )
@@ -1363,6 +1425,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         val awakeMinutes: Long
     ) {
         companion object {
+        private const val FITBIT_DATA_ORIGIN = "com.fitbit.FitbitMobile"
             fun empty() = SleepAggregation(null, false, 0.0, 0, 0, null, null, null, 0, 0, 0, 0, 0, 0)
         }
     }
