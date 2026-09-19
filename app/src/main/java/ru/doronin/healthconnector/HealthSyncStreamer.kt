@@ -528,8 +528,84 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         batcher.flush()
         onProgress("[$date] ✓ Все измерения отправлены · ${batcher.totalCount} изм. · $sentBatches пачек")
 
+        val dayObject = buildDaySummaryObject(
+            date = date,
+            aggregates = aggregates,
+            stepsTotal = stepsTotal,
+            distanceKm = distanceKm,
+            activeCaloriesKcal = activeCaloriesKcal,
+            totalCaloriesKcal = totalCaloriesKcal,
+            elevationGainedM = elevationGainedM,
+            floorsClimbed = floorsClimbed,
+            sleepSummary = sleepSummary,
+            heartStats = heartStats,
+            restingHeartRate = restingHeartRate,
+            spo2Stats = spo2Stats,
+            hrvStats = hrvStats,
+            respiratoryStats = respiratoryStats,
+            vo2Max = vo2Max,
+            skinTempBaselineC = skinTempBaselineC,
+            skinDeltaStats = skinDeltaStats,
+            speedStats = speedStats,
+            stepCadenceStats = stepCadenceStats,
+            cyclingCadenceStats = cyclingCadenceStats,
+            powerStats = powerStats,
+            weightKg = weightKg,
+            workoutRecords = workoutRecords,
+            sources = sources
+        )
+
+        onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
+        postHealthPayload(
+            endpoint = endpoint,
+            token = token,
+            syncedAt = syncedAt,
+            rangeDate = date,
+            days = JSONArray().put(dayObject),
+            workouts = workouts,
+            sleepSessions = sleepSessions,
+            measurements = JSONArray(),
+            sources = sources,
+            dayComplete = date.isBefore(LocalDate.now(zone)) && permissionDeniedTypes.isEmpty()
+        )
+        onProgress("[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен.")
+
+        return DayResult(
+            workouts = workoutRecords.size,
+            measurements = batcher.totalCount,
+            sources = sources
+        )
+    }
+
+    private fun buildDaySummaryObject(
+        date: LocalDate,
+        aggregates: HealthAggregateReader.DayAggregates,
+        stepsTotal: Long?,
+        distanceKm: Double?,
+        activeCaloriesKcal: Double?,
+        totalCaloriesKcal: Double?,
+        elevationGainedM: Double?,
+        floorsClimbed: Double?,
+        sleepSummary: SleepAggregation,
+        heartStats: Stats,
+        restingHeartRate: Double?,
+        spo2Stats: Stats,
+        hrvStats: Stats,
+        respiratoryStats: Stats,
+        vo2Max: Double?,
+        skinTempBaselineC: Double?,
+        skinDeltaStats: Stats,
+        speedStats: Stats,
+        stepCadenceStats: Stats,
+        cyclingCadenceStats: Stats,
+        powerStats: Stats,
+        weightKg: Double?,
+        workoutRecords: List<ExerciseSessionRecord>,
+        sources: Set<String>
+    ): JSONObject {
         val dayObject = JSONObject().apply { put("date", date.toString()) }
         val availableFields = linkedSetOf<String>()
+
         fun putField(key: String, value: Any?) {
             dayObject.put(key, value ?: JSONObject.NULL)
             availableFields += key
@@ -610,29 +686,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             putField("workoutCount", workoutRecords.size)
             putField("workoutMinutes", workoutRecords.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() })
         }
+
         putField("sourcePackages", jsonStringArray(sources))
         dayObject.put("availableFields", JSONArray(availableFields.toList()))
-
-        onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
-        postHealthPayload(
-            endpoint = endpoint,
-            token = token,
-            syncedAt = syncedAt,
-            rangeDate = date,
-            days = JSONArray().put(dayObject),
-            workouts = workouts,
-            sleepSessions = sleepSessions,
-            measurements = JSONArray(),
-            sources = sources,
-            dayComplete = date.isBefore(LocalDate.now(zone)) && permissionDeniedTypes.isEmpty()
-        )
-        onProgress("[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен.")
-
-        return DayResult(
-            workouts = workoutRecords.size,
-            measurements = batcher.totalCount,
-            sources = sources
-        )
+        return dayObject
     }
 
     private suspend fun buildWorkoutJson(
