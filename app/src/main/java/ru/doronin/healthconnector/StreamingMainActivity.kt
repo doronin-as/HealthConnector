@@ -167,8 +167,10 @@ class StreamingMainActivity : AppCompatActivity() {
             if (settings.endpoint.isBlank() || settings.token.isBlank()) {
                 binding.status.text = "Укажи URL Apps Script и токен"
             } else {
-                ManualSyncScheduler.enqueue(this)
-                binding.status.text = "Синхронизация запущена в фоне · приложение можно свернуть"
+                // Manual sync must read Health Connect while the app is in the
+                // foreground. WorkManager is reserved for periodic background
+                // syncs that have explicit Background Read capability/grant.
+                lifecycleScope.launch { synchronize(settings) }
             }
         }
         setupManualSyncObserver()
@@ -638,6 +640,22 @@ class StreamingMainActivity : AppCompatActivity() {
             return
         }
 
+        val safeEndpoint = runCatching { EndpointSecurity.requireHttps(settings.endpoint) }
+            .getOrElse {
+                binding.status.text = it.message ?: "Некорректный URL Apps Script"
+                return
+            }
+        val missingReadPermissions = runCatching { HealthConnectPermissionSet.missingReadPermissions(client) }
+            .getOrElse {
+                binding.status.text = "Не удалось проверить разрешения Health Connect"
+                return
+            }
+        if (missingReadPermissions.isNotEmpty()) {
+            binding.status.text =
+                "Не выданы все разрешения Health Connect (${missingReadPermissions.size})"
+            return
+        }
+
         runCatching {
             SyncRunGate.runManual(
                 onWaiting = { running ->
@@ -657,7 +675,7 @@ class StreamingMainActivity : AppCompatActivity() {
                 try {
                     val streamer = HealthSyncStreamer(this, client)
                     val result = streamer.sync(
-                        settings.endpoint,
+                        safeEndpoint,
                         settings.token,
                         settings.days,
                         includeHistoricalChanges = true
