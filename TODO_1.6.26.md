@@ -10,13 +10,17 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 - [ ] On expired Health Connect changes token, mark the readable lookback window for reconciliation instead of silently starting a new token.
 - [ ] Add generation/reconciliation metadata so a completed day can prove which record types were read.
 - [ ] Rework deletion reconciliation so stale raw rows and day aggregates are repaired together.
-- [x] Add server-side key recovery for internal HC tables:
-  - recover missing synthetic row keys from stable row signatures;
-  - search existing keyless rows by stable signature before appending a new row;
-  - replace a recovered synthetic key with the real incoming Health Connect record ID when the same row appears again;
-  - never pretend a synthetic recovery key is an original Health Connect record ID.
-- [x] Add an authenticated integrity-repair action and diagnostics report for manual repair runs.
-- [x] Add bounded automatic integrity repair during internal HC table upserts.
+## P0 — configuration recovery
+
+- [x] Add first-launch automatic search for `healthconnector-config*.json` in locations readable by the current Android installation.
+- [x] Search persisted document URIs, app-accessible directories, legacy readable Downloads/Documents paths, and MediaStore Downloads.
+- [x] Select the newest valid config candidate and validate `format`, `version`, HTTPS endpoint, sync window, and background-sync flag before applying it.
+- [x] Reuse the same parser for manual config import.
+- [x] Preserve secure token storage; modern exported JSON does not write the API token in plaintext.
+- [x] Support legacy/user-created config JSON containing `token` and migrate it into `SecureTokenStore`.
+- [x] On Android scoped-storage denial after reinstall, open `ACTION_OPEN_DOCUMENT` once as a fallback instead of requesting broad all-files access.
+- [ ] Add an optional encrypted recovery package for endpoint + API token that can survive reinstall without plaintext secrets.
+- [ ] Add a visible first-launch report showing where the config was found and which fields were restored.
 
 ## P1 — Health Connect correctness
 
@@ -58,8 +62,10 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 - [ ] Multiple sources: Fitbit + Google Fit + Xiaomi without data loss.
 - [ ] Sleep: 30-second stage segments aggregate correctly.
 - [ ] Sleep: overnight session and DST/travel timezone cases.
-- [ ] Apps Script: missing row ID recovery.
-- [ ] Apps Script: recovered synthetic ID is replaced by real incoming record ID by signature.
+- [ ] Config recovery: newest valid JSON wins when multiple readable candidates exist.
+- [ ] Config recovery: invalid/malformed/wrong-format JSON is ignored safely.
+- [ ] Config recovery: legacy token is migrated to `SecureTokenStore`.
+- [ ] Config recovery: existing configured installation is never overwritten automatically.
 - [ ] Apps Script: formula-injection strings remain literal.
 - [ ] Apps Script: large raw table performance regression test.
 - [ ] End-to-end: sparse day is repaired without erasing previously good values.
