@@ -1425,12 +1425,12 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         val awakeMinutes: Long
     ) {
         companion object {
-        private const val FITBIT_DATA_ORIGIN = "com.fitbit.FitbitMobile"
             fun empty() = SleepAggregation(null, false, 0.0, 0, 0, null, null, null, 0, 0, 0, 0, 0, 0)
         }
     }
 
     companion object {
+        private const val FITBIT_DATA_ORIGIN = "com.fitbit.FitbitMobile"
         private const val MAX_SLEEP_HOURS_PER_DAY = 16.0
         private const val HEALTH_CONNECT_PAGE_SIZE = 200
         private const val MAX_MEASUREMENTS_PER_REQUEST = 2000
