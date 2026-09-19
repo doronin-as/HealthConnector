@@ -1489,7 +1489,8 @@ function fitbitHandleOAuthCallbackV1_(e) {
     fitbitExchangeTokenV1_({
       grant_type: 'authorization_code',
       code: code,
-      redirect_uri: String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || '')
+      redirect_uri: String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || ''),
+      state: receivedState
     });
     props.deleteProperty(FITBIT_PROP.OAUTH_STATE);
     props.deleteProperty(FITBIT_PROP.OAUTH_STATE_AT);
