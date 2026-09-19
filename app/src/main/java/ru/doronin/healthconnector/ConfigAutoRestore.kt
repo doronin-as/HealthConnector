@@ -139,6 +139,9 @@ object ConfigAutoRestore {
 
     private fun apply(context: Context, config: ParsedConfig) {
         val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val previousEndpoint = prefs.getString("endpoint", "").orEmpty().trim()
+        val endpointChanged = previousEndpoint.isNotBlank() && previousEndpoint != config.endpoint
+
         prefs.edit()
             .putString("endpoint", config.endpoint)
             .putInt("days", config.days)
@@ -147,8 +150,10 @@ object ConfigAutoRestore {
             .remove("token")
             .apply()
 
-        if (!config.token.isNullOrBlank()) {
-            SecureTokenStore(context).setToken(config.token)
+        val tokenStore = SecureTokenStore(context)
+        when {
+            !config.token.isNullOrBlank() -> tokenStore.setToken(config.token)
+            endpointChanged -> tokenStore.clear()
         }
         BackgroundSyncScheduler.apply(context)
     }
