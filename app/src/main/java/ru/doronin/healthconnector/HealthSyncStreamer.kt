@@ -320,14 +320,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 checkpointFields += key
             }
 
-            if (aggregates.steps is MetricRead.Available) checkpointField("steps", stepsTotal)
-            if (aggregates.distance is MetricRead.Available) checkpointField("distanceKm", distanceKm)
-            if (aggregates.activeCalories is MetricRead.Available) checkpointField("activeCaloriesKcal", activeCaloriesKcal)
-            if (aggregates.totalCalories is MetricRead.Available) checkpointField("totalCaloriesKcal", totalCaloriesKcal)
-            if (aggregates.elevation is MetricRead.Available) checkpointField("elevationGainedM", elevationGainedM)
-            if (aggregates.floors is MetricRead.Available) checkpointField("floorsClimbed", floorsClimbed)
+            if (aggregates.steps is MetricRead.Available && stepsTotal != null) checkpointField("steps", stepsTotal)
+            if (aggregates.distance is MetricRead.Available && distanceKm != null) checkpointField("distanceKm", distanceKm)
+            if (aggregates.activeCalories is MetricRead.Available && activeCaloriesKcal != null) checkpointField("activeCaloriesKcal", activeCaloriesKcal)
+            if (aggregates.totalCalories is MetricRead.Available && totalCaloriesKcal != null) checkpointField("totalCaloriesKcal", totalCaloriesKcal)
+            if (aggregates.elevation is MetricRead.Available && elevationGainedM != null) checkpointField("elevationGainedM", elevationGainedM)
+            if (aggregates.floors is MetricRead.Available && floorsClimbed != null) checkpointField("floorsClimbed", floorsClimbed)
 
-            if (isTypeReadable<SleepSessionRecord>()) {
+            if (isTypeReadable<SleepSessionRecord>() && sleepSummary.sessionCount > 0) {
                 checkpointField("sleepHours", sleepSummary.hours)
                 checkpointField("deepSleepMinutes", sleepSummary.deepMinutes)
                 checkpointField("lightSleepMinutes", sleepSummary.lightMinutes)
@@ -535,14 +535,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             availableFields += key
         }
 
-        if (aggregates.steps is MetricRead.Available) putField("steps", stepsTotal)
-        if (aggregates.distance is MetricRead.Available) putField("distanceKm", distanceKm)
-        if (aggregates.activeCalories is MetricRead.Available) putField("activeCaloriesKcal", activeCaloriesKcal)
-        if (aggregates.totalCalories is MetricRead.Available) putField("totalCaloriesKcal", totalCaloriesKcal)
-        if (aggregates.elevation is MetricRead.Available) putField("elevationGainedM", elevationGainedM)
-        if (aggregates.floors is MetricRead.Available) putField("floorsClimbed", floorsClimbed)
+        if (aggregates.steps is MetricRead.Available && stepsTotal != null) putField("steps", stepsTotal)
+        if (aggregates.distance is MetricRead.Available && distanceKm != null) putField("distanceKm", distanceKm)
+        if (aggregates.activeCalories is MetricRead.Available && activeCaloriesKcal != null) putField("activeCaloriesKcal", activeCaloriesKcal)
+        if (aggregates.totalCalories is MetricRead.Available && totalCaloriesKcal != null) putField("totalCaloriesKcal", totalCaloriesKcal)
+        if (aggregates.elevation is MetricRead.Available && elevationGainedM != null) putField("elevationGainedM", elevationGainedM)
+        if (aggregates.floors is MetricRead.Available && floorsClimbed != null) putField("floorsClimbed", floorsClimbed)
 
-        if (isTypeReadable<SleepSessionRecord>()) {
+        if (isTypeReadable<SleepSessionRecord>() && sleepSummary.sessionCount > 0) {
             putField("sleepHours", sleepSummary.hours)
             putField("deepSleepMinutes", sleepSummary.deepMinutes)
             putField("lightSleepMinutes", sleepSummary.lightMinutes)
@@ -556,57 +556,57 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             putField("napCount", sleepSummary.napCount)
             putField("napMinutes", sleepSummary.napMinutes)
         }
-        if (isTypeReadable<HeartRateRecord>()) {
+        if (isTypeReadable<HeartRateRecord>() && heartStats.count > 0) {
             putField("averageHeartRate", heartStats.average())
             putField("minimumHeartRate", heartStats.min)
             putField("maximumHeartRate", heartStats.max)
             putField("heartRateSamples", heartStats.count)
         }
-        if (isTypeReadable<RestingHeartRateRecord>()) putField("restingHeartRate", restingHeartRate)
-        if (isTypeReadable<OxygenSaturationRecord>()) {
+        if (isTypeReadable<RestingHeartRateRecord>() && restingHeartRate != null) putField("restingHeartRate", restingHeartRate)
+        if (isTypeReadable<OxygenSaturationRecord>() && spo2Stats.count > 0) {
             putField("averageSpO2", spo2Stats.average())
             putField("minimumSpO2", spo2Stats.min)
             putField("maximumSpO2", spo2Stats.max)
             putField("spO2Samples", spo2Stats.count)
         }
-        if (isTypeReadable<HeartRateVariabilityRmssdRecord>()) {
+        if (isTypeReadable<HeartRateVariabilityRmssdRecord>() && hrvStats.count > 0) {
             putField("averageHrvRmssdMs", hrvStats.average())
             putField("minimumHrvRmssdMs", hrvStats.min)
             putField("maximumHrvRmssdMs", hrvStats.max)
             putField("hrvSamples", hrvStats.count)
         }
-        if (isTypeReadable<RespiratoryRateRecord>()) {
+        if (isTypeReadable<RespiratoryRateRecord>() && respiratoryStats.count > 0) {
             putField("averageRespiratoryRate", respiratoryStats.average())
             putField("minimumRespiratoryRate", respiratoryStats.min)
             putField("maximumRespiratoryRate", respiratoryStats.max)
             putField("respiratorySamples", respiratoryStats.count)
         }
-        if (isTypeReadable<Vo2MaxRecord>()) putField("vo2Max", vo2Max)
-        if (isTypeReadable<SkinTemperatureRecord>()) {
+        if (isTypeReadable<Vo2MaxRecord>() && vo2Max != null) putField("vo2Max", vo2Max)
+        if (isTypeReadable<SkinTemperatureRecord>() && (skinTempBaselineC != null || skinDeltaStats.count > 0)) {
             putField("skinTempBaselineC", skinTempBaselineC)
             putField("averageSkinTempDeltaC", skinDeltaStats.average())
             putField("minimumSkinTempDeltaC", skinDeltaStats.min)
             putField("maximumSkinTempDeltaC", skinDeltaStats.max)
             putField("skinTempSamples", skinDeltaStats.count)
         }
-        if (isTypeReadable<SpeedRecord>()) {
+        if (isTypeReadable<SpeedRecord>() && speedStats.count > 0) {
             putField("averageSpeedKmh", speedStats.average())
             putField("maximumSpeedKmh", speedStats.max)
         }
-        if (isTypeReadable<StepsCadenceRecord>()) {
+        if (isTypeReadable<StepsCadenceRecord>() && stepCadenceStats.count > 0) {
             putField("averageStepCadence", stepCadenceStats.average())
             putField("maximumStepCadence", stepCadenceStats.max)
         }
-        if (isTypeReadable<CyclingPedalingCadenceRecord>()) {
+        if (isTypeReadable<CyclingPedalingCadenceRecord>() && cyclingCadenceStats.count > 0) {
             putField("averageCyclingCadence", cyclingCadenceStats.average())
             putField("maximumCyclingCadence", cyclingCadenceStats.max)
         }
-        if (isTypeReadable<PowerRecord>()) {
+        if (isTypeReadable<PowerRecord>() && powerStats.count > 0) {
             putField("averagePowerW", powerStats.average())
             putField("maximumPowerW", powerStats.max)
         }
-        if (isTypeReadable<WeightRecord>()) putField("weightKg", weightKg)
-        if (isTypeReadable<ExerciseSessionRecord>()) {
+        if (isTypeReadable<WeightRecord>() && weightKg != null) putField("weightKg", weightKg)
+        if (isTypeReadable<ExerciseSessionRecord>() && workoutRecords.isNotEmpty()) {
             putField("workoutCount", workoutRecords.size)
             putField("workoutMinutes", workoutRecords.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() })
         }
@@ -780,17 +780,22 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         recordIds: Set<String>
     ): Set<LocalDate> {
         if (recordIds.isEmpty()) return emptySet()
-        val body = JSONObject().apply {
-            put("token", token)
-            put("action", "healthChangesV3")
-            put("schemaVersion", 3)
-            put("deletedRecordIds", JSONArray(recordIds.toList()))
-        }
-        val response = postBody(endpoint, body) ?: return emptySet()
+
+        // Apps Script caps one deletion request at 10k IDs. Use smaller chunks so
+        // a large Health Connect change log cannot abort the whole synchronization.
         val result = linkedSetOf<LocalDate>()
-        val dates = response.optJSONArray("affectedDates") ?: return result
-        for (i in 0 until dates.length()) {
-            runCatching { LocalDate.parse(dates.getString(i)) }.getOrNull()?.let(result::add)
+        for (chunk in recordIds.toList().chunked(5_000)) {
+            val body = JSONObject().apply {
+                put("token", token)
+                put("action", "healthChangesV3")
+                put("schemaVersion", 3)
+                put("deletedRecordIds", JSONArray(chunk))
+            }
+            val response = postBody(endpoint, body) ?: continue
+            val dates = response.optJSONArray("affectedDates") ?: continue
+            for (i in 0 until dates.length()) {
+                runCatching { LocalDate.parse(dates.getString(i)) }.getOrNull()?.let(result::add)
+            }
         }
         return result
     }
