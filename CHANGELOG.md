@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.6.26 — Auto Config Recovery and Health Connect diagnostics
+
+- Added first-launch automatic discovery of `healthconnector-config*.json` in storage locations readable by the current Android installation.
+- Added safe one-time `ACTION_OPEN_DOCUMENT` fallback when Android scoped storage hides a surviving config after reinstall.
+- Unified automatic and manual JSON config import through one validated parser.
+- Preserved secure token handling: modern exports do not include the API token in plaintext; legacy JSON tokens are migrated into Android Keystore.
+- Added richer sleep diagnostics with raw-vs-filtered `SleepSessionRecord` counts and detected source packages.
+- Fixed loss of short Fitbit sleep-stage intervals by summing duration in milliseconds before converting to minutes.
+- Updated interim source priority to prefer Fitbit over Google Fit and legacy Xiaomi/Mi Fitness records for metrics that still use source selection.
+- Added `TODO_1.6.26.md` with the remaining integrity/refactoring backlog.
+- Bumped Android version to `1.6.26` / versionCode `40`.
+
+
 ## 1.6.22 — BLE zero-result diagnostics and scanner ownership
 
 - Fixed the manual Xiaomi scale finder so it stops the persistent PendingIntent BLE scan before starting its foreground high-power scan.
