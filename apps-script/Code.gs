@@ -153,9 +153,6 @@ function doPost(e) {
     if (payload.action === 'bodyCompositionV1') {
       return json_(importBodyCompositionV1_(spreadsheet, logSheet, payload));
     }
-    if (payload.action === 'integrityRepairV1') {
-      return json_(repairInternalTableKeysV1_(spreadsheet, logSheet));
-    }
 
     validateHealthPayload_(payload);
     if (payload.action === 'healthSyncV3') {
@@ -890,240 +887,32 @@ function ensureSheet_(spreadsheet, name, headers) {
 
 function upsertByKey_(sheet, rows, keyColumnOneBased) {
   if (!rows.length) return;
-
-  // 1.6.26 integrity recovery: a partially edited/corrupted HC sheet can lose
-  // the technical Id in column A while retaining the actual record payload.
-  // Repair those keyless rows from a deterministic payload signature before
-  // normal upsert. The generated key is explicitly synthetic and is replaced
-  // by the real incoming Health Connect record Id when the same signature is
-  // observed again.
-  repairMissingTableKeysV1_(sheet, keyColumnOneBased);
-
   const lastRow = sheet.getLastRow();
   const keyIndex = keyColumnOneBased - 1;
   const existing = new Map();
-  const recoveredRows = [];
   if (lastRow >= 2) {
     const keys = sheet.getRange(2, keyColumnOneBased, lastRow - 1, 1).getDisplayValues();
     keys.forEach((row, index) => {
       const key = String(row[0] || '').trim();
-      if (!key) return;
-      const rowNumber = index + 2;
-      existing.set(key, rowNumber);
-      if (key.startsWith('recovered:v1:')) recoveredRows.push(rowNumber);
+      if (key) existing.set(key, index + 2);
     });
   }
 
-  // Only recovered rows need signature matching. This keeps normal large raw
-  // measurement upserts O(number-of-keys + incoming rows) instead of scanning
-  // every historical row for every 2k-record batch.
-  const recoveredBySignature = buildRecoveredSignatureIndexV1_(sheet, recoveredRows);
   const appends = [];
-  const appendIndexByKey = new Map();
-
-  rows.forEach(sourceRow => {
-    const row = sourceRow.slice();
-    let key = String(row[keyIndex] || '').trim();
-    if (!key) {
-      const signature = recoverySignatureForRowV1_(sheet.getName(), row);
-      if (!signature) return;
-      key = recoverySyntheticKeyV1_(sheet.getName(), signature);
-      row[keyIndex] = key;
-    }
-
-    let targetRow = existing.get(key);
-    if (!targetRow) {
-      const signature = recoverySignatureForRowV1_(sheet.getName(), row);
-      const recoveredRow = signature ? recoveredBySignature.get(signature) : null;
-      if (recoveredRow) {
-        // Writing the complete incoming row replaces the synthetic key in col A
-        // with the authoritative real key supplied by the client.
-        targetRow = recoveredRow;
-        existing.set(key, targetRow);
-        recoveredBySignature.delete(signature);
-      }
-    }
-
-    if (targetRow) {
-      sheet.getRange(targetRow, 1, 1, row.length).setValues([row]);
-      return;
-    }
-
-    if (appendIndexByKey.has(key)) {
-      appends[appendIndexByKey.get(key)] = row;
+  rows.forEach(row => {
+    const key = String(row[keyIndex] || '').trim();
+    if (!key) return;
+    const existingRow = existing.get(key);
+    if (existingRow) {
+      sheet.getRange(existingRow, 1, 1, row.length).setValues([row]);
     } else {
-      appendIndexByKey.set(key, appends.length);
       appends.push(row);
     }
   });
-
   if (appends.length) {
     sheet.getRange(sheet.getLastRow() + 1, 1, appends.length, appends[0].length)
       .setValues(appends);
   }
-}
-
-function recoverySpecForSheetV1_(sheetName) {
-  if (sheetName === MEASUREMENTS_SHEET) {
-    return { kind: 'measurement', columns: [1, 2, 3, 4, 5, 6, 7] };
-  }
-  if (sheetName === SLEEP_SHEET) {
-    return { kind: 'sleep', columns: [1, 2, 3, 12] };
-  }
-  if (sheetName === WORKOUTS_SHEET) {
-    return { kind: 'workout', columns: [1, 2, 3, 6] };
-  }
-  if (sheetName === BODY_COMPOSITION_SHEET) {
-    return { kind: 'body', columns: [1, 3, 4, 5] };
-  }
-  return null;
-}
-
-function recoveryCanonicalValueV1_(value) {
-  if (value instanceof Date && !isNaN(value)) return value.toISOString();
-  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '';
-  if (typeof value === 'boolean') return value ? '1' : '0';
-
-  const text = String(value == null ? '' : value).trim();
-  if (!text) return '';
-  if (/^\d{4}-\d{2}-\d{2}T/.test(text)) {
-    const parsed = new Date(text);
-    if (!isNaN(parsed)) return parsed.toISOString();
-  }
-  return text.replace(/\s+/g, ' ');
-}
-
-function recoverySignatureForRowV1_(sheetName, row) {
-  const spec = recoverySpecForSheetV1_(sheetName);
-  if (!spec) return '';
-  const parts = spec.columns.map(index => recoveryCanonicalValueV1_(row[index]));
-  // At least a timestamp/range plus another identifying field must exist.
-  const populated = parts.filter(Boolean).length;
-  if (populated < 2) return '';
-  return spec.kind + '|' + parts.join('|');
-}
-
-function recoverySyntheticKeyV1_(sheetName, signature) {
-  const spec = recoverySpecForSheetV1_(sheetName);
-  if (!spec || !signature) return '';
-  const digest = Utilities.computeDigest(
-    Utilities.DigestAlgorithm.SHA_256,
-    signature,
-    Utilities.Charset.UTF_8
-  );
-  const hex = digest.map(value => ((value & 0xff).toString(16).padStart(2, '0'))).join('');
-  return 'recovered:v1:' + spec.kind + ':' + hex;
-}
-
-function repairMissingTableKeysV1_(sheet, keyColumnOneBased) {
-  const spec = recoverySpecForSheetV1_(sheet.getName());
-  const lastRow = sheet.getLastRow();
-  if (!spec || lastRow < 2) return { repaired: 0, unresolved: 0, collisions: 0 };
-
-  const keyValues = sheet.getRange(2, keyColumnOneBased, lastRow - 1, 1).getDisplayValues();
-  const used = new Set();
-  const missingRows = [];
-  keyValues.forEach((row, index) => {
-    const key = String(row[0] || '').trim();
-    if (key) used.add(key);
-    else missingRows.push(index + 2);
-  });
-  if (!missingRows.length) return { repaired: 0, unresolved: 0, collisions: 0 };
-
-  let repaired = 0;
-  let unresolved = 0;
-  let collisions = 0;
-  const width = sheet.getLastColumn();
-
-  missingRows.forEach(rowNumber => {
-    const row = sheet.getRange(rowNumber, 1, 1, width).getValues()[0];
-    const signature = recoverySignatureForRowV1_(sheet.getName(), row);
-    if (!signature) {
-      unresolved++;
-      return;
-    }
-    let key = recoverySyntheticKeyV1_(sheet.getName(), signature);
-    if (!key) {
-      unresolved++;
-      return;
-    }
-    if (used.has(key)) {
-      // Do not merge ambiguous physical rows automatically. Keep both rows
-      // identifiable and require the real upstream Id to resolve them later.
-      collisions++;
-      key += ':row' + rowNumber;
-    }
-    sheet.getRange(rowNumber, keyColumnOneBased).setValue(key);
-    used.add(key);
-    repaired++;
-  });
-
-  return { repaired, unresolved, collisions };
-}
-
-function buildRecoveredSignatureIndexV1_(sheet, rowNumbers) {
-  const result = new Map();
-  const ambiguous = new Set();
-  if (!rowNumbers.length) return result;
-  const width = sheet.getLastColumn();
-
-  rowNumbers.forEach(rowNumber => {
-    const row = sheet.getRange(rowNumber, 1, 1, width).getValues()[0];
-    const signature = recoverySignatureForRowV1_(sheet.getName(), row);
-    if (!signature || ambiguous.has(signature)) return;
-    if (result.has(signature)) {
-      result.delete(signature);
-      ambiguous.add(signature);
-    } else {
-      result.set(signature, rowNumber);
-    }
-  });
-  return result;
-}
-
-function repairInternalTableKeysV1_(spreadsheet, logSheet) {
-  const targets = [
-    [MEASUREMENTS_SHEET, MEASUREMENT_HEADERS],
-    [SLEEP_SHEET, SLEEP_HEADERS],
-    [WORKOUTS_SHEET, WORKOUT_HEADERS],
-    [BODY_COMPOSITION_SHEET, BODY_COMPOSITION_HEADERS]
-  ];
-  const details = [];
-  let repaired = 0;
-  let unresolved = 0;
-  let collisions = 0;
-
-  targets.forEach(([name, headers]) => {
-    const sheet = ensureSheet_(spreadsheet, name, headers);
-    const result = repairMissingTableKeysV1_(sheet, 1);
-    repaired += result.repaired;
-    unresolved += result.unresolved;
-    collisions += result.collisions;
-    details.push({
-      sheet: name,
-      repaired: result.repaired,
-      unresolved: result.unresolved,
-      collisions: result.collisions
-    });
-  });
-
-  logSheet.appendRow([
-    new Date(), 'IntegrityRepairV1', '', '', repaired, 0,
-    unresolved || collisions ? 'WARNING' : 'OK',
-    'Ключи: восстановлено ' + repaired + '; не восстановлено ' + unresolved +
-      '; коллизии ' + collisions
-  ]);
-
-  return {
-    ok: true,
-    schemaVersion: 1,
-    repaired,
-    unresolved,
-    collisions,
-    details,
-    message: 'Восстановлено ключей: ' + repaired +
-      '; не восстановлено: ' + unresolved + '; коллизии: ' + collisions
-  };
 }
 
 function findHeader_(sheet) {
