@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.30 — per-type Health Connect diagnostics
+
+- Updated the app header to show the real multi-source path: Fitbit · Google Fit · Mi Fitness → Health Connect → Google Sheets.
+- Added an end-of-day Health Connect read inventory for every synchronized record type.
+- The inventory reports raw record count, selected record count after source resolution, sample/stage counts where relevant, and every actual `DataOrigin.packageName`.
+- Permission-denied record types are explicitly marked instead of being indistinguishable from a genuine zero-record day.
+- Diagnostics cover steps, distance, calories, sleep, heart rate, resting HR, HRV, SpO₂, respiratory rate, VO₂ max, skin temperature, elevation, floors, speed, cadences, power, weight and workouts.
+- Version `1.6.30`, versionCode `44`.
+
+
 ## 1.6.29 — canonical Health Connect origins
 
 - Canonicalized the three active Health Connect source packages: `com.fitbit.FitbitMobile` (Fitbit), `com.google.android.apps.fitness` (Google Fit), and `com.xiaomi.wearable` (Mi Fitness).
