@@ -32,9 +32,16 @@ class ManualSyncWorker(appContext: Context, workerParams: WorkerParameters) : Co
         }
 
         val bgFeature=client.features.getFeatureStatus(HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND)
-        if (bgFeature==HealthConnectFeatures.FEATURE_STATUS_AVAILABLE) {
-            val granted=runCatching { client.permissionController.getGrantedPermissions() }.getOrElse { return failure("Не удалось проверить разрешения Health Connect") }
-            if (HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND !in granted) return failure("Разреши Health Connect чтение данных в фоне")
+        if (bgFeature != HealthConnectFeatures.FEATURE_STATUS_AVAILABLE) {
+            return failure(
+                "Фоновое чтение Health Connect не поддерживается на этом устройстве. " +
+                    "Запусти ручную синхронизацию из открытого приложения."
+            )
+        }
+        val granted=runCatching { client.permissionController.getGrantedPermissions() }
+            .getOrElse { return failure("Не удалось проверить разрешения Health Connect") }
+        if (HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND !in granted) {
+            return failure("Разреши Health Connect чтение данных в фоне")
         }
         setForeground(SyncForeground.info(applicationContext,SyncForeground.MANUAL_NOTIFICATION_ID,"HealthConnector · синхронизация","Запуск… приложение можно свернуть"))
         val runId=SyncDiagnostics.begin(applicationContext,"manual")
