@@ -51,4 +51,4 @@ Public Apps Script helpers:
 - `fitbitRemoveTriggerV1()` — remove the trigger.
 - `disconnectFitbitOAuthV1()` — remove OAuth tokens while keeping client credentials.
 
-Android 1.6.28 additionally probes `DataOrigin("com.fitbit.FitbitMobile")` specifically for sleep after migration/reinstall and reports `all=N; fitbit=M` in live sync diagnostics.
+Android 1.6.29 uses a canonical origin registry for `com.fitbit.FitbitMobile` (Fitbit), `com.google.android.apps.fitness` (Google Fit), and `com.xiaomi.wearable` (Mi Fitness). Sleep recovery probes all three origins independently after migration/reinstall, merges records idempotently, and reports `all=N; Fitbit=N; Google Fit=N; Mi Fitness=N` in live sync diagnostics.
