@@ -23,6 +23,7 @@ import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
 import androidx.health.connect.client.records.Vo2MaxRecord
 import androidx.health.connect.client.records.WeightRecord
+import androidx.health.connect.client.records.metadata.DataOrigin
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.Dispatchers
@@ -52,6 +53,7 @@ class HealthSyncStreamer(
     private val aggregateReader = HealthAggregateReader(client)
     private val changesTracker = HealthChangesTracker(context, client)
     private val permissionDeniedTypes = linkedSetOf<String>()
+    private var sleepOriginProbeDiagnostic: String = "origin probe: не выполнялся"
 
     suspend fun sync(
         endpoint: String,
@@ -151,6 +153,7 @@ class HealthSyncStreamer(
         val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant()
         val syncedAt = Instant.now().toString()
         val sources = linkedSetOf<String>()
+        val readDiagnostics = DayReadDiagnostics()
 
         var restingHeartRate: Double? = null
         var vo2Max: Double? = null
@@ -239,6 +242,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             onProgress("[$date] Этап 2/8 · читаю интервалы шагов…")
             workoutDayRecords.steps = safeReadAll<StepsRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.steps
+            readDiagnostics.add("Шаги", records, records)
             onProgress("[$date] Шаги · найдено ${records.size} записей")
             addSources(records, sources)
             for (r in records) emit("Steps", null, r.startTime, r.endTime, r.count, "steps", r)
@@ -247,6 +251,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             onProgress("[$date] Читаю дистанцию…")
             workoutDayRecords.distance = safeReadAll<DistanceRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.distance
+            readDiagnostics.add("Дистанция", records, records)
             onProgress("[$date] Дистанция · найдено ${records.size} записей")
             addSources(records, sources)
             for (r in records) emit("Distance", null, r.startTime, r.endTime, r.distance.inKilometers, "km", r)
@@ -255,6 +260,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             onProgress("[$date] Читаю активные калории…")
             workoutDayRecords.activeCalories = safeReadAll<ActiveCaloriesBurnedRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.activeCalories
+            readDiagnostics.add("Активные калории", records, records)
             onProgress("[$date] Активные калории · найдено ${records.size} записей")
             addSources(records, sources)
             for (r in records) emit("ActiveCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
@@ -263,6 +269,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             onProgress("[$date] Читаю общие калории…")
             workoutDayRecords.totalCalories = safeReadAll<TotalCaloriesBurnedRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.totalCalories
+            readDiagnostics.add("Общие калории", records, records)
             onProgress("[$date] Общие калории · найдено ${records.size} записей")
             addSources(records, sources)
             for (r in records) emit("TotalCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
@@ -274,12 +281,30 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // (main sleep, nap, additional sleep) without splitting them at midnight.
             onProgress("[$date] Этап 3/8 · читаю сон…")
             val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
-            val records = safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd)
+            val rawSleepRecords = readSleepRecordsWithKnownOriginsFallback(sleepQueryStart, dayEnd)
+            val records = rawSleepRecords
                 .filter { it.endTime.atZone(zone).toLocalDate() == date }
                 .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
             addSources(records, sources)
+            readDiagnostics.add(
+                "Сон",
+                rawSleepRecords,
+                records,
+                "стадий ${records.sumOf { it.stages.size }}"
+            )
             sleepSummary = aggregateSleep(records)
-            onProgress("[$date] Сон · ${records.size} сесс. · ${sleepSummary.stageCount} стадий · ${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч")
+            val sleepSources = rawSleepRecords.asSequence()
+                .map { it.sourcePackage() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .joinToString(", ")
+                .ifBlank { "—" }
+            onProgress(
+                "[$date] Сон · raw ${rawSleepRecords.size} · после фильтра ${records.size} · " +
+                    "источники $sleepSources · $sleepOriginProbeDiagnostic · " +
+                    "${sleepSummary.stageCount} стадий · " +
+                    "${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч"
+            )
             for (r in records) {
                 val stageTotals = stageTotals(r.stages, r.startTime, r.endTime)
                 sleepSessions.put(JSONObject().apply {
@@ -366,7 +391,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         run {
             onProgress("[$date] Этап 5/8 · читаю пульс…")
             workoutDayRecords.heartRate = safeReadAll<HeartRateRecord>(dayStart, dayEnd)
-            val records = preferBestSource(workoutDayRecords.heartRate)
+            val rawRecords = workoutDayRecords.heartRate
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add(
+                "Пульс",
+                rawRecords,
+                records,
+                "отсчётов ${records.sumOf { it.samples.size }}"
+            )
             onProgress("[$date] Пульс · ${records.size} серий · ${records.sumOf { it.samples.size }} отсчётов")
             addSources(records, sources)
             for (r in records) {
@@ -380,7 +412,9 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         run {
             onProgress("[$date] Читаю пульс покоя…")
-            val records = preferBestSource(safeReadAll<RestingHeartRateRecord>(dayStart, dayEnd))
+            val rawRecords = safeReadAll<RestingHeartRateRecord>(dayStart, dayEnd)
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add("Пульс покоя", rawRecords, records)
             addSources(records, sources)
             val stats = Stats()
             for (r in records) {
@@ -391,7 +425,9 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         run {
             onProgress("[$date] Читаю HRV…")
-            val records = preferBestSource(safeReadAll<HeartRateVariabilityRmssdRecord>(dayStart, dayEnd))
+            val rawRecords = safeReadAll<HeartRateVariabilityRmssdRecord>(dayStart, dayEnd)
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add("HRV", rawRecords, records)
             addSources(records, sources)
             for (r in records) {
                 hrvStats.add(r.heartRateVariabilityMillis)
@@ -400,7 +436,9 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         run {
             onProgress("[$date] Читаю SpO₂…")
-            val records = preferBestSource(safeReadAll<OxygenSaturationRecord>(dayStart, dayEnd))
+            val rawRecords = safeReadAll<OxygenSaturationRecord>(dayStart, dayEnd)
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add("SpO₂", rawRecords, records)
             addSources(records, sources)
             for (r in records) {
                 spo2Stats.add(r.percentage.value)
@@ -409,7 +447,9 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         run {
             onProgress("[$date] Читаю частоту дыхания…")
-            val records = preferBestSource(safeReadAll<RespiratoryRateRecord>(dayStart, dayEnd))
+            val rawRecords = safeReadAll<RespiratoryRateRecord>(dayStart, dayEnd)
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add("Дыхание", rawRecords, records)
             addSources(records, sources)
             for (r in records) {
                 respiratoryStats.add(r.rate)
@@ -417,14 +457,23 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             }
         }
         run {
-            val records = preferBestSource(safeReadAll<Vo2MaxRecord>(dayStart, dayEnd))
+            val rawRecords = safeReadAll<Vo2MaxRecord>(dayStart, dayEnd)
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add("VO₂ max", rawRecords, records)
             addSources(records, sources)
             val latest = records.maxByOrNull { it.time }
             vo2Max = latest?.vo2MillilitersPerMinuteKilogram
             for (r in records) emit("VO2Max", r.time, null, null, r.vo2MillilitersPerMinuteKilogram, "ml/min/kg", r)
         }
         run {
-            val records = preferBestSource(safeReadAll<SkinTemperatureRecord>(dayStart, dayEnd))
+            val rawRecords = safeReadAll<SkinTemperatureRecord>(dayStart, dayEnd)
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add(
+                "Температура кожи",
+                rawRecords,
+                records,
+                "дельт ${records.sumOf { it.deltas.size }}"
+            )
             addSources(records, sources)
             skinTempBaselineC = records.maxByOrNull { it.endTime }?.baseline?.inCelsius
             for (r in records) {
@@ -442,19 +491,28 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         run {
             workoutDayRecords.elevation = safeReadAll<ElevationGainedRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.elevation
+            readDiagnostics.add("Набор высоты", records, records)
             addSources(records, sources)
             for (r in records) emit("ElevationGained", null, r.startTime, r.endTime, r.elevation.inMeters, "m", r)
         }
         run {
             workoutDayRecords.floors = safeReadAll<FloorsClimbedRecord>(dayStart, dayEnd)
             val records = workoutDayRecords.floors
+            readDiagnostics.add("Этажи", records, records)
             addSources(records, sources)
             for (r in records) emit("FloorsClimbed", null, r.startTime, r.endTime, r.floors, "floors", r)
         }
         run {
             onProgress("[$date] Этап 6/8 · читаю скорость и каденс…")
             workoutDayRecords.speed = safeReadAll<SpeedRecord>(dayStart, dayEnd)
-            val records = preferBestSource(workoutDayRecords.speed)
+            val rawRecords = workoutDayRecords.speed
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add(
+                "Скорость",
+                rawRecords,
+                records,
+                "отсчётов ${records.sumOf { it.samples.size }}"
+            )
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -468,7 +526,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         run {
             workoutDayRecords.stepCadence = safeReadAll<StepsCadenceRecord>(dayStart, dayEnd)
-            val records = preferBestSource(workoutDayRecords.stepCadence)
+            val rawRecords = workoutDayRecords.stepCadence
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add(
+                "Каденс шагов",
+                rawRecords,
+                records,
+                "отсчётов ${records.sumOf { it.samples.size }}"
+            )
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -481,7 +546,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         run {
             workoutDayRecords.cyclingCadence = safeReadAll<CyclingPedalingCadenceRecord>(dayStart, dayEnd)
-            val records = preferBestSource(workoutDayRecords.cyclingCadence)
+            val rawRecords = workoutDayRecords.cyclingCadence
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add(
+                "Каденс вело",
+                rawRecords,
+                records,
+                "отсчётов ${records.sumOf { it.samples.size }}"
+            )
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -494,7 +566,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         run {
             workoutDayRecords.power = safeReadAll<PowerRecord>(dayStart, dayEnd)
-            val records = preferBestSource(workoutDayRecords.power)
+            val rawRecords = workoutDayRecords.power
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add(
+                "Мощность",
+                rawRecords,
+                records,
+                "отсчётов ${records.sumOf { it.samples.size }}"
+            )
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -507,16 +586,24 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             }
         }
         run {
-            val records = preferBestSource(safeReadAll<WeightRecord>(dayStart, dayEnd))
+            val rawRecords = safeReadAll<WeightRecord>(dayStart, dayEnd)
+            val records = preferBestSource(rawRecords)
+            readDiagnostics.add("Вес", rawRecords, records)
             addSources(records, sources)
             weightKg = records.maxByOrNull { it.time }?.weight?.inKilograms
             for (r in records) emit("Weight", r.time, null, null, r.weight.inKilograms, "kg", r)
         }
 
         onProgress("[$date] Этап 7/8 · собираю тренировки…")
-        val workoutRecords = preferBestSource(safeReadAll<ExerciseSessionRecord>(dayStart, dayEnd))
+        val rawWorkoutRecords = safeReadAll<ExerciseSessionRecord>(dayStart, dayEnd)
+        val workoutRecords = preferBestSource(rawWorkoutRecords)
             .filter { it.startTime >= dayStart && it.startTime < dayEnd }
             .distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
+        readDiagnostics.add(
+            "Тренировки",
+            rawWorkoutRecords,
+            workoutRecords
+        )
         addSources(workoutRecords, sources)
 
         for (record in workoutRecords) {
@@ -527,6 +614,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         onProgress("[$date] Финализирую очередь измерений · накоплено ${batcher.totalCount}…")
         batcher.flush()
         onProgress("[$date] ✓ Все измерения отправлены · ${batcher.totalCount} изм. · $sentBatches пачек")
+
+        if (permissionDeniedTypes.isNotEmpty()) {
+            onProgress(
+                "[$date] Health Connect · отказ доступа: " +
+                    permissionDeniedTypes.joinToString(", ") { it.substringAfterLast('.') }
+            )
+        }
+        onProgress(readDiagnostics.render(date) { pkg -> sourceName(pkg) })
 
         val dayObject = buildDaySummaryObject(
             date = date,
@@ -1058,10 +1153,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         if (segments.isEmpty()) return StageTotals(0, 0, 0, 0)
 
         val boundaries = segments.flatMap { listOf(it.start, it.end) }.distinct().sorted()
-        var deep = 0L
-        var light = 0L
-        var rem = 0L
-        var awake = 0L
+        var deepMillis = 0L
+        var lightMillis = 0L
+        var remMillis = 0L
+        var awakeMillis = 0L
         for (index in 0 until boundaries.lastIndex) {
             val start = boundaries[index]
             val end = boundaries[index + 1]
@@ -1070,17 +1165,22 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 .filter { it.start < end && it.end > start }
                 .minWithOrNull(compareBy<Segment> { it.priority }.thenBy { it.source })
                 ?: continue
-            val minutes = Duration.between(start, end).toMinutes()
+            val millis = Duration.between(start, end).toMillis().coerceAtLeast(0L)
             when (chosen.type) {
-                SleepSessionRecord.STAGE_TYPE_DEEP -> deep += minutes
-                SleepSessionRecord.STAGE_TYPE_LIGHT -> light += minutes
-                SleepSessionRecord.STAGE_TYPE_REM -> rem += minutes
+                SleepSessionRecord.STAGE_TYPE_DEEP -> deepMillis += millis
+                SleepSessionRecord.STAGE_TYPE_LIGHT -> lightMillis += millis
+                SleepSessionRecord.STAGE_TYPE_REM -> remMillis += millis
                 SleepSessionRecord.STAGE_TYPE_AWAKE,
                 SleepSessionRecord.STAGE_TYPE_AWAKE_IN_BED,
-                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awake += minutes
+                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awakeMillis += millis
             }
         }
-        return StageTotals(deep, light, rem, awake)
+        return StageTotals(
+            deepMinutes = deepMillis / 60_000L,
+            lightMinutes = lightMillis / 60_000L,
+            remMinutes = remMillis / 60_000L,
+            awakeMinutes = awakeMillis / 60_000L
+        )
     }
 
     private fun stageTotals(
@@ -1088,25 +1188,30 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         rangeStart: Instant,
         rangeEnd: Instant
     ): StageTotals {
-        var deep = 0L
-        var light = 0L
-        var rem = 0L
-        var awake = 0L
+        var deepMillis = 0L
+        var lightMillis = 0L
+        var remMillis = 0L
+        var awakeMillis = 0L
         for (stage in stages) {
             val start = maxOf(stage.startTime, rangeStart)
             val end = minOf(stage.endTime, rangeEnd)
             if (start >= end) continue
-            val minutes = Duration.between(start, end).toMinutes()
+            val millis = Duration.between(start, end).toMillis().coerceAtLeast(0L)
             when (stage.stage) {
-                SleepSessionRecord.STAGE_TYPE_DEEP -> deep += minutes
-                SleepSessionRecord.STAGE_TYPE_LIGHT -> light += minutes
-                SleepSessionRecord.STAGE_TYPE_REM -> rem += minutes
+                SleepSessionRecord.STAGE_TYPE_DEEP -> deepMillis += millis
+                SleepSessionRecord.STAGE_TYPE_LIGHT -> lightMillis += millis
+                SleepSessionRecord.STAGE_TYPE_REM -> remMillis += millis
                 SleepSessionRecord.STAGE_TYPE_AWAKE,
                 SleepSessionRecord.STAGE_TYPE_AWAKE_IN_BED,
-                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awake += minutes
+                SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> awakeMillis += millis
             }
         }
-        return StageTotals(deep, light, rem, awake)
+        return StageTotals(
+            deepMinutes = deepMillis / 60_000L,
+            lightMinutes = lightMillis / 60_000L,
+            remMinutes = remMillis / 60_000L,
+            awakeMinutes = awakeMillis / 60_000L
+        )
     }
 
     private fun sleepStageName(stage: Int): String = when (stage) {
@@ -1143,14 +1248,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     private fun measurementId(record: Record, suffix: String): String =
         stableRecordId(record, "${record.javaClass.simpleName}|${record.hashCode()}") + suffix
 
-    private fun sourcePriority(packageName: String): Int {
-        val value = packageName.lowercase()
-        return when {
-            value.contains("xiaomi") || value.contains("mifitness") || value.contains("mi.health") || value.contains("wearable") -> 0
-            value == "com.google.android.apps.fitness" || (value.contains("google") && value.contains("fitness")) -> 1
-            else -> 2
-        }
-    }
+    private fun sourcePriority(packageName: String): Int =
+        HealthSourceCatalog.priority(packageName)
 
     private fun sourceName(packageName: String): String {
         if (packageName.isBlank()) return "Неизвестный источник"
@@ -1160,15 +1259,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }.getOrNull()
         if (!installed.isNullOrBlank()) return installed
 
-        val value = packageName.lowercase()
-        return when {
-            value.contains("xiaomi") || value.contains("mifitness") || value.contains("mi.health") -> "Mi Fitness"
-            value.contains("fitbit") -> "Fitbit"
-            value.contains("shealth") || (value.contains("samsung") && value.contains("health")) -> "Samsung Health"
-            value.contains("garmin") -> "Garmin Connect"
-            value == "com.google.android.apps.fitness" || (value.contains("google") && value.contains("fitness")) -> "Google Fit"
-            else -> packageName
-        }
+        return HealthSourceCatalog.displayName(packageName)
     }
 
     private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
@@ -1177,13 +1268,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             try {
                 return readAll(start, end)
             } catch (error: Exception) {
-                // Android may wrap SecurityException inside HealthConnectException.
-                // Missing permission for an optional metric must not abort the whole sync.
                 if (HealthConnectErrorUtils.isPermissionFailure(error)) {
                     permissionDeniedTypes += typeKey<T>()
                     return emptyList()
                 }
-
                 lastError = error
                 if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
                     delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))
@@ -1194,6 +1282,53 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
             lastError
         )
+    }
+
+    /**
+     * Sleep is special: Google Health is documented to write SleepSession/SleepStage
+     * records to Health Connect, and Android recommends a DataOrigin filter when
+     * re-reading previously written records after reinstall/migration.
+     *
+     * Keep this concrete and out of syncDay so the Kotlin compiler does not inline
+     * a large generic probe for every record type.
+     */
+    private suspend fun readSleepRecordsWithKnownOriginsFallback(
+        start: Instant,
+        end: Instant
+    ): List<SleepSessionRecord> {
+        val base = safeReadAll<SleepSessionRecord>(start, end)
+        if (typeKey<SleepSessionRecord>() in permissionDeniedTypes) {
+            sleepOriginProbeDiagnostic = "origin probe: permission denied"
+            return base
+        }
+
+        val merged = LinkedHashMap<String, SleepSessionRecord>()
+        fun merge(records: List<SleepSessionRecord>) {
+            records.forEach { record ->
+                val key = record.metadata.id.takeIf { it.isNotBlank() }
+                    ?: "${record.metadata.dataOrigin.packageName}|${record.startTime}|${record.endTime}"
+                merged[key] = record
+            }
+        }
+        merge(base)
+
+        val diagnostics = mutableListOf("all=${base.size}")
+        for (origin in HealthSourceCatalog.KNOWN_ORIGINS) {
+            try {
+                val records = readAll<SleepSessionRecord>(
+                    start = start,
+                    end = end,
+                    dataOriginFilter = setOf(DataOrigin(origin.packageName))
+                )
+                merge(records)
+                diagnostics += "${origin.displayName}=${records.size}"
+            } catch (error: Exception) {
+                diagnostics += "${origin.displayName}=ERROR(${error.javaClass.simpleName})"
+            }
+        }
+
+        sleepOriginProbeDiagnostic = "origin probe: " + diagnostics.joinToString("; ")
+        return merged.values.toList()
     }
 
     private inline fun <reified T : Record> typeKey(): String =
@@ -1211,7 +1346,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     }
 
 
-    private suspend inline fun <reified T : Record> readAll(start: Instant, end: Instant): List<T> {
+    private suspend inline fun <reified T : Record> readAll(
+        start: Instant,
+        end: Instant,
+        dataOriginFilter: Set<DataOrigin> = emptySet()
+    ): List<T> {
         val all = ArrayList<T>()
         var pageToken: String? = null
         do {
@@ -1219,6 +1358,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 ReadRecordsRequest(
                     recordType = T::class,
                     timeRangeFilter = TimeRangeFilter.between(start, end),
+                    dataOriginFilter = dataOriginFilter,
                     pageSize = HEALTH_CONNECT_PAGE_SIZE,
                     pageToken = pageToken
                 )
@@ -1250,6 +1390,68 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         val reason: String,
         val message: String
     )
+
+    private class DayReadDiagnostics {
+        private data class Entry(
+            val label: String,
+            val rawCount: Int,
+            val selectedCount: Int,
+            val sourcePackages: List<String>,
+            val details: String?
+        )
+
+        private val entries = mutableListOf<Entry>()
+
+        fun <T : Record> add(
+            label: String,
+            raw: List<T>,
+            selected: List<T> = raw,
+            details: String? = null
+        ) {
+            entries += Entry(
+                label = label,
+                rawCount = raw.size,
+                selectedCount = selected.size,
+                sourcePackages = raw.asSequence()
+                    .map { it.metadata.dataOrigin.packageName }
+                    .filter { it.isNotBlank() }
+                    .distinct()
+                    .sortedWith(compareBy<String> { HealthSourceCatalog.priority(it) }.thenBy { it })
+                    .toList(),
+                details = details
+            )
+        }
+
+        fun render(date: LocalDate, sourceLabel: (String) -> String): String = buildString {
+            append("[").append(date).append("] Health Connect · итог чтения")
+            if (entries.isEmpty()) {
+                append("\n— нет диагностических записей")
+                return@buildString
+            }
+            entries.forEach { entry ->
+                append("\n• ").append(entry.label).append(": ")
+                append(entry.rawCount)
+                if (entry.selectedCount != entry.rawCount) {
+                    append(" raw → ").append(entry.selectedCount).append(" выбрано")
+                } else {
+                    append(" запис.")
+                }
+                entry.details?.takeIf { it.isNotBlank() }?.let {
+                    append(" · ").append(it)
+                }
+                append(" · origin ")
+                if (entry.sourcePackages.isEmpty()) {
+                    append("—")
+                } else {
+                    append(
+                        entry.sourcePackages.joinToString(", ") { pkg ->
+                            "${sourceLabel(pkg)} [$pkg]"
+                        }
+                    )
+                }
+            }
+        }
+    }
 
     private class WorkoutDayRecords {
         var steps: List<StepsRecord> = emptyList()

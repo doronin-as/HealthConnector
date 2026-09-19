@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.6.30 — per-type Health Connect diagnostics
+
+- Updated the app header to show the real multi-source path: Fitbit · Google Fit · Mi Fitness → Health Connect → Google Sheets.
+- Added an end-of-day Health Connect read inventory for every synchronized record type.
+- The inventory reports raw record count, selected record count after source resolution, sample/stage counts where relevant, and every actual `DataOrigin.packageName`.
+- Permission-denied record types are explicitly marked instead of being indistinguishable from a genuine zero-record day.
+- Diagnostics cover steps, distance, calories, sleep, heart rate, resting HR, HRV, SpO₂, respiratory rate, VO₂ max, skin temperature, elevation, floors, speed, cadences, power, weight and workouts.
+- Version `1.6.30`, versionCode `44`.
+
+
+## 1.6.29 — canonical Health Connect origins
+
+- Canonicalized the three active Health Connect source packages: `com.fitbit.FitbitMobile` (Fitbit), `com.google.android.apps.fitness` (Google Fit), and `com.xiaomi.wearable` (Mi Fitness).
+- Source priority now uses exact package matching instead of broad substring matching, preventing unrelated apps from becoming a preferred source.
+- Centralized source labels and priority in `HealthSourceCatalog` and added unit tests for exact IDs and lookalike packages.
+- Expanded sleep origin recovery/diagnostics to probe all three canonical origins independently and merge results idempotently.
+- Sleep diagnostics now report `all=N; Fitbit=N; Google Fit=N; Mi Fitness=N` (or an origin-specific error) for each day.
+- Version `1.6.29`, versionCode `43`.
+
+
+## 1.6.28 — Fitbit origin recovery and stable dual-source sync
+
+- Added an explicit Health Connect `DataOrigin("com.fitbit.FitbitMobile")` fallback for sleep after reinstall/device migration.
+- Sleep diagnostics now report both unfiltered and explicit Fitbit-origin record counts.
+- Kept manual Health Connect reads in the foreground; WorkManager remains background-only.
+- Added a dormant server-side Fitbit Web API connector in Apps Script for heart rate, resting heart rate, HRV, SpO2, respiratory rate and cloud sleep fallback.
+- Fitbit OAuth access/refresh tokens and client credentials stay in Apps Script Script Properties, never in Android or the JSON backup.
+- OAuth tokens refresh automatically; 401 gets one refresh+retry and 429 respects the rate-limit failure instead of retrying aggressively.
+- Fitbit cloud enrichment is additive-only and does not alter Health Connect `SyncComplete`.
+- OAuth callback installs a 6-hour repair trigger for the last three days.
+- Added `docs/fitbit-stable-sync.md` with source policy and setup instructions.
+- Version `1.6.28`, versionCode `42`.
+
+## 1.6.27 — Foreground manual sync
+
+- Restored user-triggered Health Connect reads to the foreground Activity, matching the original 1.0 architecture.
+- Reserved WorkManager for real background synchronization only.
+- Fixed ManualSyncWorker so it refuses to read Health Connect when Background Read capability is unavailable instead of continuing with a partial view of records.
+- This targets the regression where third-party Fitbit/Google Health records disappear while system/on-device and HealthConnector-owned records remain visible.
+
+## 1.6.26 — Auto Config Recovery and Health Connect diagnostics
+
+- Added first-launch automatic discovery of `healthconnector-config*.json` in storage locations readable by the current Android installation.
+- Added safe one-time `ACTION_OPEN_DOCUMENT` fallback when Android scoped storage hides a surviving config after reinstall.
+- Unified automatic and manual JSON config import through one validated parser.
+- Preserved secure token handling: modern exports do not include the API token in plaintext; legacy JSON tokens are migrated into Android Keystore.
+- Added richer sleep diagnostics with raw-vs-filtered `SleepSessionRecord` counts and detected source packages.
+- Fixed loss of short Fitbit sleep-stage intervals by summing duration in milliseconds before converting to minutes.
+- Updated interim source priority to prefer Fitbit over Google Fit and legacy Xiaomi/Mi Fitness records for metrics that still use source selection.
+- Added `TODO_1.6.26.md` with the remaining integrity/refactoring backlog.
+- Bumped Android version to `1.6.26` / versionCode `40`.
+
+
 ## 1.6.22 — BLE zero-result diagnostics and scanner ownership
 
 - Fixed the manual Xiaomi scale finder so it stops the persistent PendingIntent BLE scan before starting its foreground high-power scan.
