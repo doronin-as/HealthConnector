@@ -1,4 +1,4 @@
-# HealthConnector 1.6.26 — TODO / Integrity Recovery
+# HealthConnector 1.6.27 — TODO / Integrity Recovery
 
 Release goal: make synchronization loss-resistant, diagnosable and recoverable before adding new metrics.
 
@@ -24,6 +24,8 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 
 ## P1 — Health Connect correctness
 
+- [x] Restore manual Health Connect reads to foreground Activity to avoid background callers losing other-app records.
+
 - [ ] Remove hard-coded Xiaomi > Google Fit > all-others source priority.
 - [ ] Define metric-specific source policy; cumulative metrics should prefer Health Connect Aggregate API.
 - [~] Treat Fitbit as a first-class source: interim Fitbit-first priority is implemented; metric-specific policy still remains.
@@ -33,7 +35,7 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 - [x] Fix sleep-stage aggregation: accumulate duration at millisecond precision and round only after summation.
 - [ ] Review historical date attribution against record zone offsets and DST/travel cases.
 - [ ] Remove duplicate permission definitions from `StreamingMainActivity`.
-- [ ] Remove dead direct `synchronize()` path from `StreamingMainActivity`.
+- [x] Reuse the Activity `synchronize()` path for user-triggered foreground Health Connect reads; WorkManager is background-only.
 
 ## P1 — backend / security
 
