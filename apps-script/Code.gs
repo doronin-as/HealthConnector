@@ -1132,8 +1132,16 @@ function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
       // Partial syncs are additive. A readable Health Connect type may temporarily
       // return no records while the source app is still catching up. Never let that
       // transient absence erase a value already stored for the day. A caller that
-      // truly needs to remove a value must opt in through clearFields.
+      // truly needs to remove/zero a value must opt in through clearFields.
       if (isEmpty && !shouldClear) return;
+
+      const previousNumber = Number(row[index]);
+      const incomingNumber = Number(raw);
+      if (!shouldClear &&
+          Number.isFinite(previousNumber) && previousNumber > 0 &&
+          Number.isFinite(incomingNumber) && incomingNumber === 0) {
+        return;
+      }
 
       if (key === 'sourcePackages' && Array.isArray(raw) && !shouldClear) {
         const previous = String(row[index] || '')
