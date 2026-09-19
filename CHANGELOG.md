@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.6.28 — Fitbit origin recovery and stable dual-source sync
+
+- Added an explicit Health Connect `DataOrigin("com.fitbit.FitbitMobile")` fallback for sleep after reinstall/device migration.
+- Sleep diagnostics now report both unfiltered and explicit Fitbit-origin record counts.
+- Kept manual Health Connect reads in the foreground; WorkManager remains background-only.
+- Added a dormant server-side Fitbit Web API connector in Apps Script for heart rate, resting heart rate, HRV, SpO2, respiratory rate and cloud sleep fallback.
+- Fitbit OAuth access/refresh tokens and client credentials stay in Apps Script Script Properties, never in Android or the JSON backup.
+- OAuth tokens refresh automatically; 401 gets one refresh+retry and 429 respects the rate-limit failure instead of retrying aggressively.
+- Fitbit cloud enrichment is additive-only and does not alter Health Connect `SyncComplete`.
+- OAuth callback installs a 6-hour repair trigger for the last three days.
+- Added `docs/fitbit-stable-sync.md` with source policy and setup instructions.
+- Version `1.6.28`, versionCode `42`.
+
 ## 1.6.27 — Foreground manual sync
 
 - Restored user-triggered Health Connect reads to the foreground Activity, matching the original 1.0 architecture.
