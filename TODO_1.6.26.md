@@ -45,7 +45,7 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 - [~] Treat Fitbit as a first-class source: canonical Fitbit-first priority and explicit origin probing are implemented; metric-specific policy still remains.
 - [ ] Split core vs optional Health Connect permissions; optional metrics must not block steps/sleep/heart synchronization.
 - [ ] Replace `safeReadAll(): List<T>` with structured result: Success(records), PermissionDenied, Error.
-- [~] Improve sleep diagnostics: raw record count, post-filter count and source packages are implemented; record offsets still remain.
+- [~] Improve diagnostics: per-type raw/selected counts, permission state and DataOrigin packages are now logged; record offsets/DST detail still remain.
 - [x] Fix sleep-stage aggregation: accumulate duration at millisecond precision and round only after summation.
 - [ ] Review historical date attribution against record zone offsets and DST/travel cases.
 - [ ] Remove duplicate permission definitions from `StreamingMainActivity`.
