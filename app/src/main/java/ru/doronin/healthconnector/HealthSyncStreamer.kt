@@ -53,7 +53,7 @@ class HealthSyncStreamer(
     private val aggregateReader = HealthAggregateReader(client)
     private val changesTracker = HealthChangesTracker(context, client)
     private val permissionDeniedTypes = linkedSetOf<String>()
-    private val originProbeDiagnostics = linkedMapOf<String, String>()
+    private var sleepOriginProbeDiagnostic: String = "origin probe: не выполнялся"
 
     suspend fun sync(
         endpoint: String,
@@ -276,7 +276,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // (main sleep, nap, additional sleep) without splitting them at midnight.
             onProgress("[$date] Этап 3/8 · читаю сон…")
             val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
-            val rawSleepRecords = safeReadAll<SleepSessionRecord>(sleepQueryStart, dayEnd)
+            val rawSleepRecords = readSleepRecordsWithFitbitFallback(sleepQueryStart, dayEnd)
             val records = rawSleepRecords
                 .filter { it.endTime.atZone(zone).toLocalDate() == date }
                 .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
@@ -290,7 +290,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 .ifBlank { "—" }
             onProgress(
                 "[$date] Сон · raw ${rawSleepRecords.size} · после фильтра ${records.size} · " +
-                    "источники $sleepSources${originProbeSummary<SleepSessionRecord>()} · " +
+                    "источники $sleepSources · $sleepOriginProbeDiagnostic · " +
                     "${sleepSummary.stageCount} стадий · " +
                     "${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч"
             )
@@ -381,10 +381,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             onProgress("[$date] Этап 5/8 · читаю пульс…")
             workoutDayRecords.heartRate = safeReadAll<HeartRateRecord>(dayStart, dayEnd)
             val records = preferBestSource(workoutDayRecords.heartRate)
-            onProgress(
-                "[$date] Пульс · ${records.size} серий · ${records.sumOf { it.samples.size }} отсчётов" +
-                    originProbeSummary<HeartRateRecord>()
-            )
+            onProgress("[$date] Пульс · ${records.size} серий · ${records.sumOf { it.samples.size }} отсчётов")
             addSources(records, sources)
             for (r in records) {
                 r.samples.forEachIndexed { index, sample ->
@@ -1202,55 +1199,15 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     }
 
     private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
-        val base = safeReadAllUnfiltered<T>(start, end)
-        if (!shouldProbeFitbitOrigin<T>() || typeKey<T>() in permissionDeniedTypes) return base
-
-        // Android's current Health Connect guidance explicitly recommends a
-        // DataOrigin filter when re-reading records that were written before a
-        // reinstall/migration. Probe Fitbit/Google Health explicitly and merge
-        // it with the ordinary read instead of trusting one path exclusively.
-        val fitbit = runCatching {
-            readAll<T>(
-                start = start,
-                end = end,
-                dataOriginFilter = setOf(DataOrigin(FITBIT_DATA_ORIGIN))
-            )
-        }.getOrElse { error ->
-            originProbeDiagnostics[typeKey<T>()] =
-                "all=${base.size}; fitbit=ERROR(${error.javaClass.simpleName})"
-            emptyList()
-        }
-
-        originProbeDiagnostics[typeKey<T>()] = "all=${base.size}; fitbit=${fitbit.size}"
-        if (fitbit.isEmpty()) return base
-
-        val merged = LinkedHashMap<String, T>(base.size + fitbit.size)
-        (base + fitbit).forEach { record ->
-            val key = record.metadata.id.takeIf { it.isNotBlank() }
-                ?: "${record.metadata.dataOrigin.packageName}|${record.hashCode()}"
-            merged[key] = record
-        }
-        return merged.values.toList()
-    }
-
-    private suspend inline fun <reified T : Record> safeReadAllUnfiltered(
-        start: Instant,
-        end: Instant
-    ): List<T> {
         var lastError: Exception? = null
         repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
             try {
                 return readAll(start, end)
             } catch (error: Exception) {
-                // Android may wrap SecurityException inside HealthConnectException.
-                // Missing permission for an optional metric must not abort the whole sync.
                 if (HealthConnectErrorUtils.isPermissionFailure(error)) {
                     permissionDeniedTypes += typeKey<T>()
-                    originProbeDiagnostics[typeKey<T>()] =
-                        "all=PERMISSION_DENIED(${error.javaClass.simpleName})"
                     return emptyList()
                 }
-
                 lastError = error
                 if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
                     delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))
@@ -1263,19 +1220,47 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         )
     }
 
-    private inline fun <reified T : Record> shouldProbeFitbitOrigin(): Boolean = when (T::class) {
-        SleepSessionRecord::class,
-        HeartRateRecord::class,
-        RestingHeartRateRecord::class,
-        HeartRateVariabilityRmssdRecord::class,
-        OxygenSaturationRecord::class,
-        RespiratoryRateRecord::class,
-        ExerciseSessionRecord::class -> true
-        else -> false
-    }
+    /**
+     * Sleep is special: Google Health is documented to write SleepSession/SleepStage
+     * records to Health Connect, and Android recommends a DataOrigin filter when
+     * re-reading previously written records after reinstall/migration.
+     *
+     * Keep this concrete and out of syncDay so the Kotlin compiler does not inline
+     * a large generic probe for every record type.
+     */
+    private suspend fun readSleepRecordsWithFitbitFallback(
+        start: Instant,
+        end: Instant
+    ): List<SleepSessionRecord> {
+        val base = safeReadAll<SleepSessionRecord>(start, end)
+        if (typeKey<SleepSessionRecord>() in permissionDeniedTypes) {
+            sleepOriginProbeDiagnostic = "origin probe: permission denied"
+            return base
+        }
 
-    private inline fun <reified T : Record> originProbeSummary(): String =
-        originProbeDiagnostics[typeKey<T>()]?.let { " · origin probe: $it" }.orEmpty()
+        val fitbit = try {
+            readAll<SleepSessionRecord>(
+                start = start,
+                end = end,
+                dataOriginFilter = setOf(DataOrigin(FITBIT_DATA_ORIGIN))
+            )
+        } catch (error: Exception) {
+            sleepOriginProbeDiagnostic =
+                "origin probe: all=${base.size}; fitbit=ERROR(${error.javaClass.simpleName})"
+            return base
+        }
+
+        sleepOriginProbeDiagnostic = "origin probe: all=${base.size}; fitbit=${fitbit.size}"
+        if (fitbit.isEmpty()) return base
+
+        val merged = LinkedHashMap<String, SleepSessionRecord>(base.size + fitbit.size)
+        (base + fitbit).forEach { record ->
+            val key = record.metadata.id.takeIf { it.isNotBlank() }
+                ?: "${record.metadata.dataOrigin.packageName}|${record.startTime}|${record.endTime}"
+            merged[key] = record
+        }
+        return merged.values.toList()
+    }
 
     private inline fun <reified T : Record> typeKey(): String =
         T::class.qualifiedName ?: T::class.simpleName ?: "unknown"
