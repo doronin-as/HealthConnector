@@ -213,7 +213,7 @@ object ConfigAutoRestore {
                     file.isFile &&
                     file.canRead() &&
                     looksLikeJsonName(file.name) &&
-                    file.length() in 1..MAX_CONFIG_BYTES.toLong()
+                    file.length() in 1L..MAX_CONFIG_BYTES.toLong()
                 ) {
                     result += Candidate(
                         label = file.absolutePath,
