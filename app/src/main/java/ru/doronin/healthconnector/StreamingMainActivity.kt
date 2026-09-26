@@ -67,6 +67,9 @@ class StreamingMainActivity : AppCompatActivity() {
     private var fitbitCloudStatusText: TextView? = null
     private var fitbitClientIdInput: android.widget.EditText? = null
     private var fitbitClientSecretInput: android.widget.EditText? = null
+    private var googleHealthStatusText: TextView? = null
+    private var googleHealthClientIdInput: android.widget.EditText? = null
+    private var googleHealthClientSecretInput: android.widget.EditText? = null
 
     private val recordPermissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
@@ -144,7 +147,7 @@ class StreamingMainActivity : AppCompatActivity() {
         setupDashboardPage()
         setupVersionBadge()
         setupMiScaleSettingsCard()
-        setupFitbitCloudCard()
+        setupGoogleHealthCloudCard()
 
         binding.endpoint.setText(prefs.getString("endpoint", ""))
         binding.token.setText(secureTokenStore.getToken())
@@ -257,7 +260,7 @@ class StreamingMainActivity : AppCompatActivity() {
         super.onResume()
         refreshBackgroundInfo()
         refreshDashboardSnapshot(showStatus = false)
-        refreshFitbitCloudStatus(showLoading = false)
+        refreshGoogleHealthStatus(showLoading = false)
     }
 
     private fun setupDashboardPage() {
@@ -462,6 +465,232 @@ class StreamingMainActivity : AppCompatActivity() {
             } else if (profile.sex == null) {
                 append(" Пол нужно один раз выбрать в настройках весов или добавить строку «Пол» в лист «Профиль».")
             }
+        }
+    }
+
+    private fun setupGoogleHealthCloudCard() {
+        val container = binding.settingsPage.getChildAt(0) as? LinearLayout ?: return
+        val card = MaterialCardView(this).apply {
+            radius = dp(20).toFloat()
+            strokeWidth = dp(1)
+            cardElevation = 0f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(18), dp(20), dp(18))
+        }
+
+        content.addView(TextView(this).apply {
+            text = "Google Health Cloud"
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        content.addView(TextView(this).apply {
+            text = "Основной облачный fallback для сна Fitbit/Google. Использует новый Google Health API и Google OAuth 2.0."
+            textSize = 13f
+            alpha = 0.72f
+            setPadding(0, dp(6), 0, dp(8))
+        })
+
+        googleHealthStatusText = TextView(this).apply {
+            text = "Проверяю Google Health…"
+            textSize = 13f
+            setLineSpacing(0f, 1.12f)
+            setTextIsSelectable(true)
+            setPadding(0, 0, 0, dp(10))
+        }.also(content::addView)
+
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Открыть настройку Google Health API"
+            setOnClickListener {
+                startActivity(
+                    Intent(Intent.ACTION_VIEW, Uri.parse("https://developers.google.com/health/setup"))
+                )
+            }
+        })
+
+        googleHealthClientIdInput = android.widget.EditText(this).apply {
+            hint = "Google OAuth Web Client ID"
+            isSingleLine = true
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        }.also(content::addView)
+
+        googleHealthClientSecretInput = android.widget.EditText(this).apply {
+            hint = "Google OAuth Client Secret"
+            isSingleLine = true
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
+        }.also(content::addView)
+
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Сохранить OAuth и открыть Google"
+            setOnClickListener { configureGoogleHealthAndAuthorize() }
+        })
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Авторизовать Google Health"
+            setOnClickListener { openGoogleHealthAuthorization() }
+        })
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Восстановить сон за 7 дней"
+            setOnClickListener { repairGoogleHealthSleep(days = 7) }
+        })
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Обновить статус Google Health"
+            setOnClickListener { refreshGoogleHealthStatus(showLoading = true) }
+        })
+
+        card.addView(content)
+        container.addView(card)
+        refreshGoogleHealthStatus(showLoading = true)
+    }
+
+    private fun googleHealthServerCredentials(): Pair<String, String>? {
+        val endpoint = if (::binding.isInitialized) {
+            binding.endpoint.text?.toString()?.trim().orEmpty().ifBlank {
+                prefs.getString("endpoint", "").orEmpty().trim()
+            }
+        } else {
+            prefs.getString("endpoint", "").orEmpty().trim()
+        }
+        val token = secureTokenStore.getToken().trim()
+        if (endpoint.isBlank() || token.isBlank()) {
+            googleHealthStatusText?.text =
+                "Сначала восстанови/укажи URL Apps Script и API-токен Health Connector."
+            return null
+        }
+        return endpoint to token
+    }
+
+    private fun refreshGoogleHealthStatus(showLoading: Boolean) {
+        val credentials = googleHealthServerCredentials() ?: return
+        if (showLoading) googleHealthStatusText?.text = "Проверяю Google Health…"
+        lifecycleScope.launch {
+            runCatching {
+                GoogleHealthCloudApi.status(credentials.first, credentials.second)
+            }.onSuccess(::renderGoogleHealthStatus)
+                .onFailure { error ->
+                    googleHealthStatusText?.text =
+                        "Google Health: ошибка статуса — ${error.message ?: error.javaClass.simpleName}"
+                }
+        }
+    }
+
+    private fun renderGoogleHealthStatus(status: GoogleHealthCloudApi.Status) {
+        googleHealthStatusText?.text = buildString {
+            when {
+                status.authorized -> append("● Google Health подключён")
+                status.configured -> append("○ OAuth сохранён, требуется авторизация Google")
+                else -> append("○ Google Health ещё не настроен")
+            }
+            status.redirectUri?.let {
+                append("\nAuthorized redirect URI:\n").append(it)
+            }
+            status.scope?.let { append("\nScope: ").append(it) }
+            status.lastSyncAt?.let { append("\nПоследняя cloud-синхронизация: ").append(it) }
+            status.lastStatus?.let { append("\nСтатус: ").append(it) }
+            if (!status.configured) {
+                append(
+                    "\n\nВ Google Cloud включи Google Health API, создай OAuth Client типа Web application " +
+                        "и добавь Redirect URI выше. В OAuth consent screen добавь себя как test user."
+                )
+            } else if (!status.authorized) {
+                append("\n\nНажми «Авторизовать Google Health» и разреши доступ к данным сна.")
+            }
+        }
+    }
+
+    private fun configureGoogleHealthAndAuthorize() {
+        val credentials = googleHealthServerCredentials() ?: return
+        val clientId = googleHealthClientIdInput?.text?.toString()?.trim().orEmpty()
+        val clientSecret = googleHealthClientSecretInput?.text?.toString()?.trim().orEmpty()
+        if (clientId.isBlank() || clientSecret.isBlank()) {
+            googleHealthStatusText?.text = "Введи Google OAuth Web Client ID и Client Secret."
+            return
+        }
+        googleHealthStatusText?.text = "Сохраняю Google Health OAuth…"
+        lifecycleScope.launch {
+            runCatching {
+                GoogleHealthCloudApi.configure(
+                    credentials.first,
+                    credentials.second,
+                    clientId,
+                    clientSecret
+                )
+            }.onSuccess { result ->
+                googleHealthClientSecretInput?.setText("")
+                renderGoogleHealthStatus(result.status)
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.authorizationUrl)))
+            }.onFailure { error ->
+                googleHealthStatusText?.text =
+                    "Google Health OAuth: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
+    }
+
+    private fun openGoogleHealthAuthorization() {
+        val credentials = googleHealthServerCredentials() ?: return
+        googleHealthStatusText?.text = "Готовлю Google OAuth…"
+        lifecycleScope.launch {
+            runCatching {
+                GoogleHealthCloudApi.authorizationUrl(credentials.first, credentials.second)
+            }.onSuccess { url ->
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            }.onFailure { error ->
+                googleHealthStatusText?.text =
+                    "Google Health OAuth: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
+    }
+
+    private fun repairGoogleHealthSleep(days: Int) {
+        val credentials = googleHealthServerCredentials() ?: return
+        val safeDays = days.coerceIn(1, 30)
+        lifecycleScope.launch {
+            val status = runCatching {
+                GoogleHealthCloudApi.status(credentials.first, credentials.second)
+            }.getOrElse { error ->
+                googleHealthStatusText?.text =
+                    "Google Health: ${error.message ?: error.javaClass.simpleName}"
+                return@launch
+            }
+            if (!status.authorized) {
+                renderGoogleHealthStatus(status)
+                return@launch
+            }
+
+            var repairedDays = 0
+            var sessions = 0
+            var failures = 0
+            var totalHours = 0.0
+            val today = java.time.LocalDate.now()
+            for (offset in (safeDays - 1) downTo 0) {
+                val date = today.minusDays(offset.toLong())
+                googleHealthStatusText?.text =
+                    "Google Health · восстанавливаю сон за $date…\n" +
+                        "Успешно: $repairedDays · ошибок: $failures"
+                runCatching {
+                    GoogleHealthCloudApi.repairSleep(credentials.first, credentials.second, date)
+                }.onSuccess {
+                    if (it.repaired) {
+                        repairedDays++
+                        sessions += it.sleepSessions
+                        totalHours += it.sleepHours ?: 0.0
+                    }
+                }.onFailure {
+                    failures++
+                }
+            }
+
+            googleHealthStatusText?.text =
+                "Google Health · восстановление завершено: дней $repairedDays/$safeDays, " +
+                    "сессий $sessions, сна %.1f ч, ошибок $failures.".format(totalHours)
+            refreshDashboardSnapshot(showStatus = false)
+            refreshGoogleHealthStatus(showLoading = false)
         }
     }
 

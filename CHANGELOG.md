@@ -1,3 +1,12 @@
+## 1.6.33
+
+- Новый основной cloud fallback сна переведён с legacy Fitbit Web API на Google Health API v4.
+- Добавлен Google OAuth 2.0 flow для Web application через Apps Script: Client ID/Secret хранятся только в Script Properties.
+- Запрашивается минимальный scope `googlehealth.sleep.readonly`; сон читается через `users/me/dataTypes/sleep/dataPoints`.
+- Сон привязывается к дню пробуждения через фильтр `sleep.interval.civil_end_time`, поддерживается пагинация до 25 сессий на страницу.
+- Добавлен раздел Google Health Cloud в настройках: Redirect URI, настройка OAuth, авторизация, статус и восстановление сна за 7 дней.
+- Автоматический fallback при `сон 0` теперь обращается к Google Health API. Legacy Fitbit-код сохранён только для совместимости и больше не показывается как основной путь настройки.
+
 ## 1.6.32
 
 - Добавлен встроенный раздел Fitbit Cloud: статус OAuth, Redirect URI, настройка Client ID/Secret и авторизация из приложения.

@@ -29,8 +29,8 @@ android {
         applicationId = "ru.doronin.healthconnector.stable"
         minSdk = 26
         targetSdk = 35
-        versionCode = 46
-        versionName = "1.6.32"
+        versionCode = 47
+        versionName = "1.6.33"
         manifestPlaceholders["appLabel"] = "Health Connector"
     }
 
@@ -38,7 +38,7 @@ android {
         getByName("debug") {
             applicationIdSuffix = ".test"
             versionNameSuffix = "-test"
-            manifestPlaceholders["appLabel"] = "HC 1.6.32 TEST"
+            manifestPlaceholders["appLabel"] = "HC 1.6.33 TEST"
         }
         getByName("release") {
             isDebuggable = false

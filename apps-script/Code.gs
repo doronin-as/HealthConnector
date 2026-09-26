@@ -111,12 +111,16 @@ function doGet(e) {
   if (e && e.parameter && e.parameter.fitbit === 'callback') {
     return fitbitHandleOAuthCallbackV1_(e);
   }
+  if (googleHealthIsOAuthCallbackV1_(e)) {
+    return googleHealthHandleOAuthCallbackV1_(e);
+  }
   return json_({
     ok: true,
     service: 'Health Dashboard Sync',
     schemaVersion: 3,
     time: new Date().toISOString(),
-    fitbit: fitbitStatusV1_()
+    googleHealth: googleHealthStatusV1_(),
+    fitbitLegacy: fitbitStatusV1_()
   });
 }
 
@@ -153,6 +157,22 @@ function doPost(e) {
     }
     if (payload.action === 'dashboardSnapshotV1') {
       return json_(getDashboardSnapshotV1_(spreadsheet));
+    }
+    if (payload.action === 'googleHealthStatusV1') {
+      return json_({ ok: true, status: googleHealthStatusV1_() });
+    }
+    if (payload.action === 'googleHealthConfigureV1') {
+      return json_(configureGoogleHealthOAuthV1_(payload.clientId, payload.clientSecret));
+    }
+    if (payload.action === 'googleHealthAuthorizationUrlV1') {
+      return json_({
+        ok: true,
+        authorizationUrl: getGoogleHealthAuthorizationUrlV1_(),
+        status: googleHealthStatusV1_()
+      });
+    }
+    if (payload.action === 'googleHealthRepairSleepV1') {
+      return json_(googleHealthRepairSleepV1_(spreadsheet, logSheet, payload));
     }
     if (payload.action === 'fitbitCloudStatusV1') {
       return json_({ ok: true, status: fitbitStatusV1_() });
@@ -1405,6 +1425,428 @@ function isoDateKeyV3_(value, tz) {
   return isNaN(d) ? '' : Utilities.formatDate(d, tz, 'yyyy-MM-dd');
 }
 
+
+// ===== Google Health API connector v1 =====
+//
+// Primary cloud fallback for new integrations. The legacy Fitbit Web API is
+// retained only for existing credentials during the migration window.
+const GOOGLE_HEALTH_V1 = Object.freeze({
+  AUTH_URL: 'https://accounts.google.com/o/oauth2/v2/auth',
+  TOKEN_URL: 'https://oauth2.googleapis.com/token',
+  API_BASE: 'https://health.googleapis.com/v4',
+  SOURCE_PACKAGE: 'google.health.api',
+  SOURCE_NAME: 'Google Health API',
+  SLEEP_SCOPE: 'https://www.googleapis.com/auth/googlehealth.sleep.readonly',
+  TOKEN_SKEW_MS: 120000,
+  OAUTH_STATE_TTL_MS: 20 * 60 * 1000
+});
+
+const GOOGLE_HEALTH_PROP = Object.freeze({
+  CLIENT_ID: 'GOOGLE_HEALTH_CLIENT_ID',
+  CLIENT_SECRET: 'GOOGLE_HEALTH_CLIENT_SECRET',
+  REDIRECT_URI: 'GOOGLE_HEALTH_REDIRECT_URI',
+  ACCESS_TOKEN: 'GOOGLE_HEALTH_ACCESS_TOKEN',
+  REFRESH_TOKEN: 'GOOGLE_HEALTH_REFRESH_TOKEN',
+  EXPIRES_AT: 'GOOGLE_HEALTH_TOKEN_EXPIRES_AT',
+  SCOPE: 'GOOGLE_HEALTH_SCOPE',
+  OAUTH_STATE: 'GOOGLE_HEALTH_OAUTH_STATE',
+  OAUTH_STATE_AT: 'GOOGLE_HEALTH_OAUTH_STATE_AT',
+  LAST_SYNC_AT: 'GOOGLE_HEALTH_LAST_SYNC_AT',
+  LAST_STATUS: 'GOOGLE_HEALTH_LAST_STATUS'
+});
+
+function googleHealthRedirectUriV1_() {
+  const serviceUrl = String(ScriptApp.getService().getUrl() || '').trim();
+  if (!/^https:\/\//i.test(serviceUrl)) {
+    throw new Error('Сначала разверни Apps Script как Web App');
+  }
+  return serviceUrl;
+}
+
+function configureGoogleHealthOAuthV1_(clientId, clientSecret) {
+  const id = String(clientId || '').trim();
+  const secret = String(clientSecret || '').trim();
+  if (!id || !secret) throw new Error('Нужны Google OAuth Client ID и Client Secret');
+  if (id.length > 512 || secret.length > 1024) throw new Error('Некорректные Google OAuth credentials');
+
+  const props = PropertiesService.getScriptProperties();
+  const previousId = String(props.getProperty(GOOGLE_HEALTH_PROP.CLIENT_ID) || '');
+  const previousSecret = String(props.getProperty(GOOGLE_HEALTH_PROP.CLIENT_SECRET) || '');
+  if ((previousId && previousId !== id) || (previousSecret && previousSecret !== secret)) {
+    [
+      GOOGLE_HEALTH_PROP.ACCESS_TOKEN,
+      GOOGLE_HEALTH_PROP.REFRESH_TOKEN,
+      GOOGLE_HEALTH_PROP.EXPIRES_AT,
+      GOOGLE_HEALTH_PROP.SCOPE,
+      GOOGLE_HEALTH_PROP.OAUTH_STATE,
+      GOOGLE_HEALTH_PROP.OAUTH_STATE_AT,
+      GOOGLE_HEALTH_PROP.LAST_SYNC_AT,
+      GOOGLE_HEALTH_PROP.LAST_STATUS
+    ].forEach(key => props.deleteProperty(key));
+  }
+
+  const redirectUri = googleHealthRedirectUriV1_();
+  props.setProperties({
+    [GOOGLE_HEALTH_PROP.CLIENT_ID]: id,
+    [GOOGLE_HEALTH_PROP.CLIENT_SECRET]: secret,
+    [GOOGLE_HEALTH_PROP.REDIRECT_URI]: redirectUri
+  }, false);
+
+  return {
+    ok: true,
+    redirectUri: redirectUri,
+    authorizationUrl: getGoogleHealthAuthorizationUrlV1_(),
+    status: googleHealthStatusV1_(),
+    message: 'Google Health OAuth сохранён. Открой authorizationUrl и разреши доступ ко сну.'
+  };
+}
+
+function getGoogleHealthAuthorizationUrlV1_() {
+  const props = PropertiesService.getScriptProperties();
+  const clientId = String(props.getProperty(GOOGLE_HEALTH_PROP.CLIENT_ID) || '').trim();
+  if (!clientId) throw new Error('Сначала настрой Google OAuth Client ID и Client Secret');
+  const redirectUri = String(props.getProperty(GOOGLE_HEALTH_PROP.REDIRECT_URI) || '').trim() || googleHealthRedirectUriV1_();
+
+  const state = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
+  props.setProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE, state);
+  props.setProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE_AT, String(Date.now()));
+
+  const query = [
+    ['client_id', clientId],
+    ['redirect_uri', redirectUri],
+    ['response_type', 'code'],
+    ['scope', GOOGLE_HEALTH_V1.SLEEP_SCOPE],
+    ['access_type', 'offline'],
+    ['prompt', 'consent'],
+    ['include_granted_scopes', 'true'],
+    ['state', state]
+  ].map(pair => encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1])).join('&');
+
+  return GOOGLE_HEALTH_V1.AUTH_URL + '?' + query;
+}
+
+function googleHealthIsOAuthCallbackV1_(e) {
+  const params = e && e.parameter || {};
+  if (!params.code || !params.state) return false;
+  const expected = String(PropertiesService.getScriptProperties().getProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE) || '');
+  return Boolean(expected && String(params.state) === expected);
+}
+
+function googleHealthHandleOAuthCallbackV1_(e) {
+  const params = e && e.parameter || {};
+  const props = PropertiesService.getScriptProperties();
+  const expectedState = String(props.getProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE) || '');
+  const receivedState = String(params.state || '');
+  const stateAt = Number(props.getProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE_AT) || 0);
+
+  if (params.error) {
+    return json_({ ok: false, googleHealth: true, error: String(params.error), message: String(params.error_description || params.error) });
+  }
+  if (!expectedState || !receivedState || expectedState !== receivedState ||
+      !stateAt || Date.now() - stateAt > GOOGLE_HEALTH_V1.OAUTH_STATE_TTL_MS) {
+    return json_({ ok: false, googleHealth: true, error: 'oauth_state_invalid', message: 'Google Health OAuth state недействителен или устарел' });
+  }
+
+  const code = String(params.code || '').trim();
+  if (!code) return json_({ ok: false, googleHealth: true, error: 'oauth_code_missing', message: 'Google OAuth не вернул authorization code' });
+
+  try {
+    googleHealthExchangeTokenV1_({
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: String(props.getProperty(GOOGLE_HEALTH_PROP.REDIRECT_URI) || googleHealthRedirectUriV1_())
+    });
+    props.deleteProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE);
+    props.deleteProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE_AT);
+    props.setProperty(GOOGLE_HEALTH_PROP.LAST_STATUS, 'OAuth подключён; Google Health готов к синхронизации сна');
+    return json_({
+      ok: true,
+      googleHealth: true,
+      message: 'Google Health подключён. Вернись в Health Connector и запусти восстановление сна.',
+      status: googleHealthStatusV1_()
+    });
+  } catch (error) {
+    return json_({
+      ok: false,
+      googleHealth: true,
+      error: String(error && error.message || error),
+      message: String(error && error.message || error)
+    });
+  }
+}
+
+function googleHealthStatusV1_() {
+  const props = PropertiesService.getScriptProperties();
+  const expiresAt = Number(props.getProperty(GOOGLE_HEALTH_PROP.EXPIRES_AT) || 0);
+  let redirectUri = '';
+  try {
+    redirectUri = String(props.getProperty(GOOGLE_HEALTH_PROP.REDIRECT_URI) || '').trim() || googleHealthRedirectUriV1_();
+  } catch (_) {}
+  return {
+    configured: Boolean(props.getProperty(GOOGLE_HEALTH_PROP.CLIENT_ID) && props.getProperty(GOOGLE_HEALTH_PROP.CLIENT_SECRET)),
+    authorized: Boolean(props.getProperty(GOOGLE_HEALTH_PROP.REFRESH_TOKEN) || props.getProperty(GOOGLE_HEALTH_PROP.ACCESS_TOKEN)),
+    redirectUri: redirectUri,
+    scope: props.getProperty(GOOGLE_HEALTH_PROP.SCOPE) || '',
+    tokenExpiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+    lastSyncAt: props.getProperty(GOOGLE_HEALTH_PROP.LAST_SYNC_AT) || null,
+    lastStatus: props.getProperty(GOOGLE_HEALTH_PROP.LAST_STATUS) || ''
+  };
+}
+
+function googleHealthExchangeTokenV1_(grantPayload) {
+  const props = PropertiesService.getScriptProperties();
+  const clientId = String(props.getProperty(GOOGLE_HEALTH_PROP.CLIENT_ID) || '').trim();
+  const clientSecret = String(props.getProperty(GOOGLE_HEALTH_PROP.CLIENT_SECRET) || '').trim();
+  if (!clientId || !clientSecret) throw new Error('Google Health OAuth credentials не настроены');
+
+  const response = UrlFetchApp.fetch(GOOGLE_HEALTH_V1.TOKEN_URL, {
+    method: 'post',
+    contentType: 'application/x-www-form-urlencoded',
+    payload: Object.assign({
+      client_id: clientId,
+      client_secret: clientSecret
+    }, grantPayload || {}),
+    muteHttpExceptions: true
+  });
+  const code = response.getResponseCode();
+  const text = response.getContentText();
+  let json = {};
+  try { json = JSON.parse(text || '{}'); } catch (_) {}
+  if (code < 200 || code >= 300 || !json.access_token) {
+    throw new Error('Google OAuth HTTP ' + code + ': ' + String(json.error_description || json.error || text || 'unknown error').slice(0, 500));
+  }
+
+  const values = {};
+  values[GOOGLE_HEALTH_PROP.ACCESS_TOKEN] = String(json.access_token);
+  values[GOOGLE_HEALTH_PROP.EXPIRES_AT] = String(Date.now() + Math.max(60, Number(json.expires_in || 3600)) * 1000);
+  if (json.refresh_token) values[GOOGLE_HEALTH_PROP.REFRESH_TOKEN] = String(json.refresh_token);
+  if (json.scope) values[GOOGLE_HEALTH_PROP.SCOPE] = String(json.scope);
+  props.setProperties(values, false);
+  return json;
+}
+
+function googleHealthAccessTokenV1_() {
+  const props = PropertiesService.getScriptProperties();
+  let token = String(props.getProperty(GOOGLE_HEALTH_PROP.ACCESS_TOKEN) || '').trim();
+  const expiresAt = Number(props.getProperty(GOOGLE_HEALTH_PROP.EXPIRES_AT) || 0);
+  if (!token || !expiresAt || Date.now() + GOOGLE_HEALTH_V1.TOKEN_SKEW_MS >= expiresAt) {
+    const refreshToken = String(props.getProperty(GOOGLE_HEALTH_PROP.REFRESH_TOKEN) || '').trim();
+    if (!refreshToken) throw new Error('Нет Google Health refresh token; нужна повторная авторизация');
+    const refreshed = googleHealthExchangeTokenV1_({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken
+    });
+    token = String(refreshed.access_token || '');
+  }
+  if (!token) throw new Error('Google Health access token отсутствует');
+  return token;
+}
+
+function googleHealthFetchJsonV1_(url, allowRefresh) {
+  const token = googleHealthAccessTokenV1_();
+  const response = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+    muteHttpExceptions: true
+  });
+  const code = response.getResponseCode();
+  const text = response.getContentText();
+  let json = {};
+  try { json = JSON.parse(text || '{}'); } catch (_) {}
+
+  if (code === 401 && allowRefresh !== false) {
+    PropertiesService.getScriptProperties().setProperty(GOOGLE_HEALTH_PROP.EXPIRES_AT, '0');
+    return googleHealthFetchJsonV1_(url, false);
+  }
+  if (code === 429) throw new Error('Google Health API rate limit');
+  if (code < 200 || code >= 300) {
+    const detail = json && json.error && (json.error.message || json.error.status) || text || 'unknown error';
+    throw new Error('Google Health API HTTP ' + code + ': ' + String(detail).slice(0, 700));
+  }
+  return json;
+}
+
+function googleHealthListSleepForDateV1_(date) {
+  const next = addDaysToDateKeyV3_(date, 1, Session.getScriptTimeZone());
+  const filter = 'sleep.interval.civil_end_time >= "' + date + '" AND sleep.interval.civil_end_time < "' + next + '"';
+  const base = GOOGLE_HEALTH_V1.API_BASE + '/users/me/dataTypes/sleep/dataPoints';
+  const all = [];
+  let pageToken = '';
+  let pages = 0;
+  do {
+    let url = base + '?pageSize=25&filter=' + encodeURIComponent(filter);
+    if (pageToken) url += '&pageToken=' + encodeURIComponent(pageToken);
+    const json = googleHealthFetchJsonV1_(url, true);
+    const points = Array.isArray(json.dataPoints) ? json.dataPoints : [];
+    points.forEach(point => all.push(point));
+    pageToken = String(json.nextPageToken || '');
+    pages++;
+  } while (pageToken && pages < 20);
+  return all;
+}
+
+function googleHealthRepairSleepV1_(spreadsheet, logSheet, payload) {
+  const date = String(payload && payload.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('googleHealthRepairSleepV1: некорректная дата');
+
+  const status = googleHealthStatusV1_();
+  if (!status.configured || !status.authorized) {
+    return {
+      ok: true,
+      attempted: false,
+      repaired: false,
+      date: date,
+      reason: !status.configured ? 'google-health-not-configured' : 'google-health-not-authorized',
+      message: 'Google Health Cloud пока не подключён'
+    };
+  }
+
+  const points = googleHealthListSleepForDateV1_(date);
+  const syncedAt = new Date().toISOString();
+  const sleepSessions = [];
+  let totalAsleepMinutes = 0;
+  let deep = 0, light = 0, rem = 0, awake = 0, stageCount = 0;
+  let earliestStart = null, latestEnd = null;
+  let mainMinutes = null, napMinutes = 0, napCount = 0;
+
+  points.forEach(point => {
+    const sleep = point && point.sleep || null;
+    const interval = sleep && sleep.interval || {};
+    const start = String(interval.startTime || '');
+    const end = String(interval.endTime || '');
+    if (!sleep || !start || !end) return;
+
+    const summary = sleep.summary || {};
+    const metadata = sleep.metadata || {};
+    const stages = Array.isArray(sleep.stages) ? sleep.stages : [];
+    const summaries = Array.isArray(summary.stagesSummary) ? summary.stagesSummary : [];
+
+    const perType = {};
+    summaries.forEach(item => {
+      const type = String(item && item.type || '').toUpperCase();
+      const minutes = Number(item && item.minutes || 0);
+      if (type && Number.isFinite(minutes)) perType[type] = (perType[type] || 0) + minutes;
+    });
+    if (!summaries.length && stages.length) {
+      stages.forEach(stage => {
+        const type = String(stage && stage.type || '').toUpperCase();
+        const a = Date.parse(String(stage && stage.startTime || ''));
+        const b = Date.parse(String(stage && stage.endTime || ''));
+        const minutes = Number.isFinite(a) && Number.isFinite(b) && b > a ? (b - a) / 60000 : 0;
+        if (type && minutes > 0) perType[type] = (perType[type] || 0) + minutes;
+      });
+    }
+
+    const asleepMinutesRaw = Number(summary.minutesAsleep);
+    const asleepMinutes = Number.isFinite(asleepMinutesRaw)
+      ? asleepMinutesRaw
+      : (perType.LIGHT || 0) + (perType.DEEP || 0) + (perType.REM || 0) + (perType.ASLEEP || 0);
+    const durationMinutes = (() => {
+      const a = Date.parse(start), b = Date.parse(end);
+      return Number.isFinite(a) && Number.isFinite(b) && b > a ? (b - a) / 60000 : null;
+    })();
+
+    totalAsleepMinutes += asleepMinutes;
+    deep += perType.DEEP || 0;
+    light += perType.LIGHT || 0;
+    rem += perType.REM || 0;
+    awake += Number.isFinite(Number(summary.minutesAwake)) ? Number(summary.minutesAwake) : (perType.AWAKE || 0);
+    stageCount += stages.length;
+
+    if (!earliestStart || start < earliestStart) earliestStart = start;
+    if (!latestEnd || end > latestEnd) latestEnd = end;
+
+    const isNap = metadata.nap === true;
+    if (isNap) {
+      napCount++;
+      napMinutes += asleepMinutes;
+    } else if (mainMinutes == null || asleepMinutes > mainMinutes) {
+      mainMinutes = asleepMinutes;
+    }
+
+    const pointName = String(point.name || metadata.externalId || (start + '|' + end));
+    sleepSessions.push({
+      id: 'google-health|sleep|' + Utilities.base64EncodeWebSafe(
+        Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, pointName)
+      ).replace(/=+$/g, '').slice(0, 40),
+      start: start,
+      end: end,
+      durationMinutes: durationMinutes,
+      title: isNap ? 'Nap' : 'Main sleep',
+      notes: metadata.processed === false ? 'Google Health: stages processing' : '',
+      deepSleepMinutes: deep === 0 && (perType.DEEP || 0) === 0 ? (perType.DEEP || 0) : (perType.DEEP || 0),
+      lightSleepMinutes: perType.LIGHT || 0,
+      remSleepMinutes: perType.REM || 0,
+      awakeMinutes: Number.isFinite(Number(summary.minutesAwake)) ? Number(summary.minutesAwake) : (perType.AWAKE || 0),
+      stageCount: stages.length,
+      stagesJson: JSON.stringify(stages.map(stage => ({
+        start: stage.startTime || '',
+        end: stage.endTime || '',
+        stageName: stage.type || ''
+      }))),
+      sourcePackage: GOOGLE_HEALTH_V1.SOURCE_PACKAGE,
+      sourceName: GOOGLE_HEALTH_V1.SOURCE_NAME
+    });
+  });
+
+  const repaired = sleepSessions.length > 0 && totalAsleepMinutes > 0;
+  if (sleepSessions.length) {
+    const day = {
+      date: date,
+      sleepHours: totalAsleepMinutes / 60,
+      deepSleepMinutes: deep,
+      lightSleepMinutes: light,
+      remSleepMinutes: rem,
+      awakeMinutes: awake,
+      sleepStart: earliestStart,
+      sleepEnd: latestEnd,
+      sleepSessionCount: sleepSessions.length,
+      sleepStageCount: stageCount,
+      mainSleepHours: mainMinutes != null ? mainMinutes / 60 : null,
+      napCount: napCount,
+      napMinutes: napMinutes,
+      sourcePackages: [GOOGLE_HEALTH_V1.SOURCE_PACKAGE],
+      availableFields: [
+        'sleepHours','deepSleepMinutes','lightSleepMinutes','remSleepMinutes','awakeMinutes',
+        'sleepStart','sleepEnd','sleepSessionCount','sleepStageCount','mainSleepHours',
+        'napCount','napMinutes','sourcePackages'
+      ]
+    };
+    importHealthPayloadV3_(spreadsheet, logSheet, {
+      action: 'healthSyncV3',
+      deviceId: 'GoogleHealthAPI',
+      rangeStart: date,
+      rangeEnd: date,
+      syncedAt: syncedAt,
+      days: [day],
+      workouts: [],
+      sleepSessions: sleepSessions,
+      measurements: [],
+      sources: [{ packageName: GOOGLE_HEALTH_V1.SOURCE_PACKAGE, name: GOOGLE_HEALTH_V1.SOURCE_NAME }]
+    });
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(GOOGLE_HEALTH_PROP.LAST_SYNC_AT, new Date().toISOString());
+  props.setProperty(
+    GOOGLE_HEALTH_PROP.LAST_STATUS,
+    repaired
+      ? 'OK: сон ' + date + '; сессий ' + sleepSessions.length
+      : 'Нет сна Google Health за ' + date
+  );
+
+  return {
+    ok: true,
+    attempted: true,
+    repaired: repaired,
+    date: date,
+    sleepSessions: sleepSessions.length,
+    sleepHours: repaired ? totalAsleepMinutes / 60 : null,
+    message: repaired
+      ? 'Сон восстановлен из Google Health API'
+      : 'Google Health API не вернул сон за эту дату'
+  };
+}
 
 // ===== Fitbit Web API connector v1 =====
 //
