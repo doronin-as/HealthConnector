@@ -490,7 +490,7 @@ class StreamingMainActivity : AppCompatActivity() {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         content.addView(TextView(this).apply {
-            text = "Основной облачный fallback для сна Fitbit/Google. Использует новый Google Health API и Google OAuth 2.0."
+            text = "Необязательный резервный источник сна. Обычно приложение сначала читает сон напрямую из Health Connect; Google Health используется только если локальные записи отсутствуют."
             textSize = 13f
             alpha = 0.72f
             setPadding(0, dp(6), 0, dp(8))
