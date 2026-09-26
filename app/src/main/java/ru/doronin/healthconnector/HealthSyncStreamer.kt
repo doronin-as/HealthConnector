@@ -333,6 +333,27 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                     put("sourceName", sourceName(r.sourcePackage()))
                 })
             }
+
+            if (records.isEmpty() && date.isBefore(LocalDate.now(zone))) {
+                onProgress("[$date] Health Connect не вернул сон · проверяю Fitbit Cloud fallback…")
+                val repaired = runCatching {
+                    requestFitbitSleepRepair(endpoint, token, date)
+                }.getOrElse { error ->
+                    SyncDiagnostics.server(
+                        context,
+                        "Fitbit sleep repair $date: ${error.message ?: error.javaClass.simpleName}",
+                        "WARNING"
+                    )
+                    false
+                }
+                onProgress(
+                    if (repaired) {
+                        "[$date] ✓ Сон восстановлен сервером из Fitbit Cloud; локальный день будет перепроверен при следующей синхронизации"
+                    } else {
+                        "[$date] Fitbit Cloud не восстановил сон; оставляю день на повторное чтение Health Connect"
+                    }
+                )
+            }
         }
 
         // Persist the dashboard-critical part of the day before processing high-frequency data.
@@ -924,6 +945,21 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             put("sourcePackage", record.sourcePackage())
             put("sourceName", sourceName(record.sourcePackage()))
         }
+    }
+
+    private suspend fun requestFitbitSleepRepair(
+        endpoint: String,
+        token: String,
+        date: LocalDate
+    ): Boolean {
+        val body = JSONObject().apply {
+            put("token", token)
+            put("action", "fitbitRepairSleepV1")
+            put("schemaVersion", 1)
+            put("date", date.toString())
+        }
+        val response = postBody(endpoint, body) ?: return false
+        return response.optBoolean("repaired", false)
     }
 
     private suspend fun fetchSyncPlan(
