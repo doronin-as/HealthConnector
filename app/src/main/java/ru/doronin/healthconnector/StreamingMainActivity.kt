@@ -64,6 +64,9 @@ class StreamingMainActivity : AppCompatActivity() {
     private var dashboardDevicesText: TextView? = null
     private var dashboardProfileText: TextView? = null
     private var dashboardGoogleUrl: String? = null
+    private var fitbitCloudStatusText: TextView? = null
+    private var fitbitClientIdInput: android.widget.EditText? = null
+    private var fitbitClientSecretInput: android.widget.EditText? = null
 
     private val recordPermissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
@@ -141,6 +144,7 @@ class StreamingMainActivity : AppCompatActivity() {
         setupDashboardPage()
         setupVersionBadge()
         setupMiScaleSettingsCard()
+        setupFitbitCloudCard()
 
         binding.endpoint.setText(prefs.getString("endpoint", ""))
         binding.token.setText(secureTokenStore.getToken())
@@ -253,6 +257,7 @@ class StreamingMainActivity : AppCompatActivity() {
         super.onResume()
         refreshBackgroundInfo()
         refreshDashboardSnapshot(showStatus = false)
+        refreshFitbitCloudStatus(showLoading = false)
     }
 
     private fun setupDashboardPage() {
@@ -457,6 +462,237 @@ class StreamingMainActivity : AppCompatActivity() {
             } else if (profile.sex == null) {
                 append(" Пол нужно один раз выбрать в настройках весов или добавить строку «Пол» в лист «Профиль».")
             }
+        }
+    }
+
+    private fun setupFitbitCloudCard() {
+        val container = binding.settingsPage.getChildAt(0) as? LinearLayout ?: return
+        val card = MaterialCardView(this).apply {
+            radius = dp(20).toFloat()
+            strokeWidth = dp(1)
+            cardElevation = 0f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(18), dp(20), dp(18))
+        }
+
+        content.addView(TextView(this).apply {
+            text = "Fitbit Cloud"
+            textSize = 18f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        content.addView(TextView(this).apply {
+            text = "Резервный источник сна и ночных показателей. Если Health Connect отдаёт «сон 0», приложение может восстановить данные напрямую из Fitbit Web API."
+            textSize = 13f
+            alpha = 0.72f
+            setPadding(0, dp(6), 0, dp(8))
+        })
+
+        fitbitCloudStatusText = TextView(this).apply {
+            text = "Проверяю Fitbit Cloud…"
+            textSize = 13f
+            setLineSpacing(0f, 1.12f)
+            setTextIsSelectable(true)
+            setPadding(0, 0, 0, dp(10))
+        }.also(content::addView)
+
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Открыть Fitbit Developer"
+            setOnClickListener {
+                startActivity(
+                    Intent(Intent.ACTION_VIEW, Uri.parse("https://dev.fitbit.com/apps"))
+                )
+            }
+        })
+
+        fitbitClientIdInput = android.widget.EditText(this).apply {
+            hint = "Fitbit Client ID"
+            isSingleLine = true
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        }.also(content::addView)
+
+        fitbitClientSecretInput = android.widget.EditText(this).apply {
+            hint = "Fitbit Client Secret"
+            isSingleLine = true
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
+        }.also(content::addView)
+
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Сохранить OAuth и открыть Fitbit"
+            setOnClickListener { configureFitbitCloudAndAuthorize() }
+        })
+
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Авторизовать Fitbit"
+            setOnClickListener { openFitbitAuthorization() }
+        })
+
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Восстановить сон за 7 дней"
+            setOnClickListener { repairFitbitSleep(days = 7) }
+        })
+
+        content.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Обновить статус Fitbit"
+            setOnClickListener { refreshFitbitCloudStatus(showLoading = true) }
+        })
+
+        card.addView(content)
+        container.addView(card)
+        refreshFitbitCloudStatus(showLoading = true)
+    }
+
+    private fun fitbitServerCredentials(): Pair<String, String>? {
+        val endpoint = if (::binding.isInitialized) {
+            binding.endpoint.text?.toString()?.trim().orEmpty().ifBlank {
+                prefs.getString("endpoint", "").orEmpty().trim()
+            }
+        } else {
+            prefs.getString("endpoint", "").orEmpty().trim()
+        }
+        val token = secureTokenStore.getToken().trim()
+        if (endpoint.isBlank() || token.isBlank()) {
+            fitbitCloudStatusText?.text =
+                "Сначала восстанови/укажи URL Apps Script и API-токен Health Connector."
+            return null
+        }
+        return endpoint to token
+    }
+
+    private fun refreshFitbitCloudStatus(showLoading: Boolean) {
+        val credentials = fitbitServerCredentials() ?: return
+        if (showLoading) fitbitCloudStatusText?.text = "Проверяю Fitbit Cloud…"
+        lifecycleScope.launch {
+            runCatching {
+                FitbitCloudApi.status(credentials.first, credentials.second)
+            }.onSuccess(::renderFitbitCloudStatus)
+                .onFailure { error ->
+                    fitbitCloudStatusText?.text =
+                        "Fitbit Cloud: ошибка статуса — ${error.message ?: error.javaClass.simpleName}"
+                }
+        }
+    }
+
+    private fun renderFitbitCloudStatus(status: FitbitCloudApi.Status) {
+        fitbitCloudStatusText?.text = buildString {
+            when {
+                status.authorized -> append("● Fitbit Cloud подключён")
+                status.configured -> append("○ OAuth сохранён, требуется авторизация Fitbit")
+                else -> append("○ Fitbit Cloud ещё не настроен")
+            }
+            status.redirectUri?.let {
+                append("\nRedirect URI для Fitbit Developer:\n").append(it)
+            }
+            status.userId?.let { append("\nFitbit user: ").append(it) }
+            status.scope?.let { append("\nScopes: ").append(it) }
+            status.lastSyncAt?.let { append("\nПоследняя cloud-синхронизация: ").append(it) }
+            status.lastStatus?.let { append("\nСтатус: ").append(it) }
+            if (!status.configured) {
+                append("\n\nСоздай Personal Fitbit app, укажи Redirect URI выше, затем введи Client ID и Client Secret.")
+            } else if (!status.authorized) {
+                append("\n\nНажми «Авторизовать Fitbit» и разреши доступ к данным.")
+            }
+        }
+    }
+
+    private fun configureFitbitCloudAndAuthorize() {
+        val credentials = fitbitServerCredentials() ?: return
+        val clientId = fitbitClientIdInput?.text?.toString()?.trim().orEmpty()
+        val clientSecret = fitbitClientSecretInput?.text?.toString()?.trim().orEmpty()
+        if (clientId.isBlank() || clientSecret.isBlank()) {
+            fitbitCloudStatusText?.text = "Введи Fitbit Client ID и Client Secret."
+            return
+        }
+        fitbitCloudStatusText?.text = "Сохраняю Fitbit OAuth…"
+        lifecycleScope.launch {
+            runCatching {
+                FitbitCloudApi.configure(
+                    credentials.first,
+                    credentials.second,
+                    clientId,
+                    clientSecret
+                )
+            }.onSuccess { result ->
+                fitbitClientSecretInput?.setText("")
+                renderFitbitCloudStatus(result.status)
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.authorizationUrl)))
+            }.onFailure { error ->
+                fitbitCloudStatusText?.text =
+                    "Fitbit OAuth: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
+    }
+
+    private fun openFitbitAuthorization() {
+        val credentials = fitbitServerCredentials() ?: return
+        fitbitCloudStatusText?.text = "Готовлю Fitbit OAuth…"
+        lifecycleScope.launch {
+            runCatching {
+                FitbitCloudApi.authorizationUrl(credentials.first, credentials.second)
+            }.onSuccess { url ->
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            }.onFailure { error ->
+                fitbitCloudStatusText?.text =
+                    "Fitbit OAuth: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
+    }
+
+    private fun repairFitbitSleep(days: Int) {
+        val credentials = fitbitServerCredentials() ?: return
+        val safeDays = days.coerceIn(1, 30)
+        lifecycleScope.launch {
+            val status = runCatching {
+                FitbitCloudApi.status(credentials.first, credentials.second)
+            }.getOrElse { error ->
+                fitbitCloudStatusText?.text =
+                    "Fitbit Cloud: ${error.message ?: error.javaClass.simpleName}"
+                return@launch
+            }
+            if (!status.authorized) {
+                renderFitbitCloudStatus(status)
+                return@launch
+            }
+
+            var repairedDays = 0
+            var sessions = 0
+            var failures = 0
+            val today = java.time.LocalDate.now()
+            for (offset in (safeDays - 1) downTo 0) {
+                val date = today.minusDays(offset.toLong())
+                fitbitCloudStatusText?.text =
+                    "Fitbit Cloud · восстанавливаю сон за $date…\n" +
+                        "Успешно: $repairedDays · ошибок: $failures"
+                val result = runCatching {
+                    FitbitCloudApi.repairSleep(credentials.first, credentials.second, date)
+                }
+                result.onSuccess {
+                    if (it.repaired) {
+                        repairedDays++
+                        sessions += it.sleepSessions
+                    }
+                }.onFailure {
+                    failures++
+                    SyncDiagnostics.server(
+                        this@StreamingMainActivity,
+                        "Fitbit manual sleep repair $date: ${it.message ?: it.javaClass.simpleName}",
+                        "WARNING"
+                    )
+                }
+            }
+
+            fitbitCloudStatusText?.text =
+                "Fitbit Cloud · восстановление завершено: дней $repairedDays/$safeDays, " +
+                    "сессий сна $sessions, ошибок $failures.\nОбновляю Dashboard…"
+            refreshDashboardSnapshot(showStatus = false)
+            refreshFitbitCloudStatus(showLoading = false)
         }
     }
 
