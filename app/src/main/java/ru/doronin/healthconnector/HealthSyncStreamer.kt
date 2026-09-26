@@ -328,7 +328,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             val records: List<SleepSessionRecord>
             val sleepReadPath: String
             if (wideRecords.isNotEmpty()) {
-                rawSleepRecords = wideRecords
+                rawSleepRecords = wideCandidates
                 records = wideRecords
                 sleepOriginProbeDiagnostic = "origin probe: не нужен"
                 sleepReadPath = "wide-range"
