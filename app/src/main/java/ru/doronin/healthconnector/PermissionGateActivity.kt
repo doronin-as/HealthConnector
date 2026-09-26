@@ -65,13 +65,18 @@ class PermissionGateActivity : AppCompatActivity() {
     private fun restoreConfigurationThenContinue() {
         val prefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
         val endpoint = prefs.getString("endpoint", "").orEmpty().trim()
+        val token = SecureTokenStore(this).getToken().trim()
         val attempted = prefs.getBoolean(ConfigAutoRestore.PREF_AUTO_RESTORE_ATTEMPTED, false)
 
-        if (endpoint.isNotBlank() || attempted) {
+        if (endpoint.isNotBlank() && token.isNotBlank()) {
             requestRuntimePermissionsAndContinue()
             return
         }
 
+        // Retry the silent lookup on every cold launch while configuration is
+        // incomplete. The picker itself is only shown once, so cancelling it
+        // cannot permanently disable automatic restore after the user later
+        // copies a JSON file into Downloads/Documents.
         lifecycleScope.launch {
             val result = ConfigAutoRestore.tryAutoRestore(this@PermissionGateActivity)
             if (result.restored) {
@@ -81,7 +86,7 @@ class PermissionGateActivity : AppCompatActivity() {
                     Toast.LENGTH_SHORT
                 ).show()
                 requestRuntimePermissionsAndContinue()
-            } else {
+            } else if (!attempted) {
                 // Scoped storage can hide a config that survived a reinstall.
                 // Mark the prompt before opening it so process recreation cannot
                 // create an endless picker loop.
@@ -90,12 +95,14 @@ class PermissionGateActivity : AppCompatActivity() {
                     .apply()
                 Toast.makeText(
                     this@PermissionGateActivity,
-                    "JSON автоматически не найден. Выбери healthconnector-config.json — это потребуется только один раз.",
+                    "Автопоиск JSON не нашёл доступный конфиг. Если Android скрывает Downloads, выбери JSON один раз — дальше доступ сохранится.",
                     Toast.LENGTH_LONG
                 ).show()
                 configPickerLauncher.launch(
                     arrayOf("application/json", "text/json", "text/plain")
                 )
+            } else {
+                requestRuntimePermissionsAndContinue()
             }
         }
     }
