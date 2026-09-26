@@ -168,7 +168,7 @@ object ConfigAutoRestore {
             if (!permission.isReadPermission) return@mapNotNull null
             val uri = permission.uri
             val name = queryDisplayName(context, uri) ?: uri.lastPathSegment.orEmpty()
-            if (!looksLikeConfigName(name)) return@mapNotNull null
+            if (!looksLikeJsonName(name)) return@mapNotNull null
             Candidate(
                 label = name.ifBlank { "сохранённый документ" },
                 modifiedAt = Long.MAX_VALUE - 1,
