@@ -403,6 +403,9 @@ class StreamingMainActivity : AppCompatActivity() {
             append("\nВес: ").append(number(summary.weightKg)).append(if (summary.weightKg != null) " кг" else "")
             append("\nШаги: ").append(summary.steps?.toString() ?: "—")
             append("\nСон: ").append(number(sleep)).append(if (sleep != null) " ч" else "")
+            if (sleep != null && !summary.sleepDate.isNullOrBlank() && summary.sleepDate != summary.date) {
+                append(" · ночь ").append(summary.sleepDate)
+            }
             append("\nПульс покоя: ").append(number(summary.restingHeartRate, 0)).append(if (summary.restingHeartRate != null) " уд/мин" else "")
             append("\nСредний пульс: ").append(number(summary.averageHeartRate, 0)).append(if (summary.averageHeartRate != null) " уд/мин" else "")
             append("\nSpO₂: ").append(number(summary.averageSpO2)).append(if (summary.averageSpO2 != null) "%" else "")
