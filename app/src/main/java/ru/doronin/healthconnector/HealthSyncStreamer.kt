@@ -650,6 +650,18 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             sources = sources
         )
 
+        val todayForCompletion = LocalDate.now(zone)
+        val recentHistoricalDay =
+            date.isBefore(todayForCompletion) && !date.isBefore(todayForCompletion.minusDays(7))
+        val sleepNeedsRepair =
+            recentHistoricalDay &&
+                isTypeReadable<SleepSessionRecord>() &&
+                (sleepSummary.sessionCount == 0 || sleepSummary.suspicious || sleepSummary.hours == null)
+        val dayComplete =
+            date.isBefore(todayForCompletion) &&
+                permissionDeniedTypes.isEmpty() &&
+                !sleepNeedsRepair
+
         onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
         postHealthPayload(
             endpoint = endpoint,
@@ -661,9 +673,19 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             sleepSessions = sleepSessions,
             measurements = JSONArray(),
             sources = sources,
-            dayComplete = date.isBefore(LocalDate.now(zone)) && permissionDeniedTypes.isEmpty()
+            dayComplete = dayComplete
         )
-        onProgress("[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен.")
+        when {
+            sleepNeedsRepair -> onProgress(
+                "[$date] ↻ День сохранён, но сон ещё не подтверждён Health Connect; оставляю его на повторное восстановление"
+            )
+            dayComplete -> onProgress(
+                "[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен."
+            )
+            else -> onProgress(
+                "[$date] ✓ Данные сохранены · день пока незавершён · ${batcher.totalCount} изм. · ${workoutRecords.size} трен."
+            )
+        }
 
         return DayResult(
             workouts = workoutRecords.size,
