@@ -154,6 +154,19 @@ function doPost(e) {
     if (payload.action === 'dashboardSnapshotV1') {
       return json_(getDashboardSnapshotV1_(spreadsheet));
     }
+    if (payload.action === 'fitbitCloudStatusV1') {
+      return json_({ ok: true, status: fitbitStatusV1_() });
+    }
+    if (payload.action === 'fitbitCloudConfigureV1') {
+      return json_(configureFitbitOAuthV1(payload.clientId, payload.clientSecret));
+    }
+    if (payload.action === 'fitbitCloudAuthorizationUrlV1') {
+      return json_({
+        ok: true,
+        authorizationUrl: getFitbitAuthorizationUrlV1(),
+        status: fitbitStatusV1_()
+      });
+    }
     if (payload.action === 'fitbitRepairSleepV1') {
       return json_(fitbitRepairSleepV1_(spreadsheet, logSheet, payload));
     }
@@ -1443,14 +1456,27 @@ function configureFitbitOAuthV1(clientId, clientSecret) {
   const id = String(clientId || '').trim();
   const secret = String(clientSecret || '').trim();
   if (!id || !secret) throw new Error('Нужны Fitbit clientId и clientSecret');
-
-  const serviceUrl = String(ScriptApp.getService().getUrl() || '').trim();
-  if (!/^https:\/\//i.test(serviceUrl)) {
-    throw new Error('Сначала разверни Apps Script как Web App');
-  }
-  const redirectUri = serviceUrl + '?fitbit=callback';
+  if (id.length > 128 || secret.length > 512) throw new Error('Некорректные Fitbit OAuth credentials');
 
   const props = PropertiesService.getScriptProperties();
+  const previousId = String(props.getProperty(FITBIT_PROP.CLIENT_ID) || '');
+  const previousSecret = String(props.getProperty(FITBIT_PROP.CLIENT_SECRET) || '');
+  const redirectUri = fitbitRedirectUriV1_();
+
+  if ((previousId && previousId !== id) || (previousSecret && previousSecret !== secret)) {
+    [
+      FITBIT_PROP.ACCESS_TOKEN,
+      FITBIT_PROP.REFRESH_TOKEN,
+      FITBIT_PROP.EXPIRES_AT,
+      FITBIT_PROP.USER_ID,
+      FITBIT_PROP.SCOPE,
+      FITBIT_PROP.OAUTH_STATE,
+      FITBIT_PROP.OAUTH_STATE_AT,
+      FITBIT_PROP.LAST_SYNC_AT,
+      FITBIT_PROP.LAST_STATUS
+    ].forEach(key => props.deleteProperty(key));
+  }
+
   props.setProperties({
     [FITBIT_PROP.CLIENT_ID]: id,
     [FITBIT_PROP.CLIENT_SECRET]: secret,
@@ -1461,16 +1487,25 @@ function configureFitbitOAuthV1(clientId, clientSecret) {
     ok: true,
     redirectUri,
     authorizationUrl: getFitbitAuthorizationUrlV1(),
-    message: 'Добавь redirectUri в Fitbit Developer App, затем открой authorizationUrl'
+    status: fitbitStatusV1_(),
+    message: 'Fitbit OAuth сохранён. Открой authorizationUrl и разреши доступ.'
   };
+}
+
+function fitbitRedirectUriV1_() {
+  const serviceUrl = String(ScriptApp.getService().getUrl() || '').trim();
+  if (!/^https:\/\//i.test(serviceUrl)) {
+    throw new Error('Сначала разверни Apps Script как Web App');
+  }
+  return serviceUrl + '?fitbit=callback';
 }
 
 function getFitbitAuthorizationUrlV1() {
   const props = PropertiesService.getScriptProperties();
   const clientId = String(props.getProperty(FITBIT_PROP.CLIENT_ID) || '').trim();
-  const redirectUri = String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || '').trim();
-  if (!clientId || !redirectUri) {
-    throw new Error('Сначала вызови configureFitbitOAuthV1(clientId, clientSecret)');
+  const redirectUri = String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || '').trim() || fitbitRedirectUriV1_();
+  if (!clientId) {
+    throw new Error('Сначала настрой Fitbit clientId и clientSecret');
   }
 
   const state = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
@@ -1516,8 +1551,7 @@ function fitbitHandleOAuthCallbackV1_(e) {
     fitbitExchangeTokenV1_({
       grant_type: 'authorization_code',
       code: code,
-      redirect_uri: String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || ''),
-      state: receivedState
+      redirect_uri: String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || '')
     });
     props.deleteProperty(FITBIT_PROP.OAUTH_STATE);
     props.deleteProperty(FITBIT_PROP.OAUTH_STATE_AT);
@@ -1544,9 +1578,14 @@ function fitbitHandleOAuthCallbackV1_(e) {
 function fitbitStatusV1_() {
   const props = PropertiesService.getScriptProperties();
   const expiresAt = Number(props.getProperty(FITBIT_PROP.EXPIRES_AT) || 0);
+  let redirectUri = '';
+  try {
+    redirectUri = String(props.getProperty(FITBIT_PROP.REDIRECT_URI) || '').trim() || fitbitRedirectUriV1_();
+  } catch (_) {}
   return {
     configured: Boolean(props.getProperty(FITBIT_PROP.CLIENT_ID) && props.getProperty(FITBIT_PROP.CLIENT_SECRET)),
     authorized: Boolean(props.getProperty(FITBIT_PROP.REFRESH_TOKEN) || props.getProperty(FITBIT_PROP.ACCESS_TOKEN)),
+    redirectUri: redirectUri,
     userId: props.getProperty(FITBIT_PROP.USER_ID) || '',
     scope: props.getProperty(FITBIT_PROP.SCOPE) || '',
     tokenExpiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
