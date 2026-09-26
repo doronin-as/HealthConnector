@@ -154,6 +154,9 @@ function doPost(e) {
     if (payload.action === 'dashboardSnapshotV1') {
       return json_(getDashboardSnapshotV1_(spreadsheet));
     }
+    if (payload.action === 'fitbitRepairSleepV1') {
+      return json_(fitbitRepairSleepV1_(spreadsheet, logSheet, payload));
+    }
     if (payload.action === 'bodyCompositionV1') {
       return json_(importBodyCompositionV1_(spreadsheet, logSheet, payload));
     }
@@ -1671,6 +1674,39 @@ function fitbitRemoveTriggerV1() {
     .filter(trigger => trigger.getHandlerFunction() === 'fitbitScheduledSyncV1')
     .forEach(trigger => { ScriptApp.deleteTrigger(trigger); removed++; });
   return { ok: true, removed };
+}
+
+function fitbitRepairSleepV1_(spreadsheet, logSheet, payload) {
+  const date = String(payload && payload.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error('fitbitRepairSleepV1: некорректная дата');
+  }
+
+  const status = fitbitStatusV1_();
+  if (!status.configured || !status.authorized) {
+    return {
+      ok: true,
+      attempted: false,
+      repaired: false,
+      date: date,
+      reason: !status.configured ? 'fitbit-not-configured' : 'fitbit-not-authorized',
+      message: 'Fitbit Cloud fallback пока не подключён'
+    };
+  }
+
+  const result = fitbitSyncDateV1_(spreadsheet, logSheet, date);
+  const repaired = Number(result && result.sleepSessions || 0) > 0;
+  return {
+    ok: true,
+    attempted: true,
+    repaired: repaired,
+    date: date,
+    sleepSessions: Number(result && result.sleepSessions || 0),
+    warnings: result && result.warnings || [],
+    message: repaired
+      ? 'Сон восстановлен из Fitbit Cloud'
+      : 'Fitbit Cloud не вернул сон за эту дату'
+  };
 }
 
 function fitbitScheduledSyncV1() {
