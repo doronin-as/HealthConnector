@@ -1,5 +1,6 @@
 package ru.doronin.healthconnector
 
+import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
@@ -166,8 +167,10 @@ class StreamingMainActivity : AppCompatActivity() {
             if (settings.endpoint.isBlank() || settings.token.isBlank()) {
                 binding.status.text = "Укажи URL Apps Script и токен"
             } else {
-                ManualSyncScheduler.enqueue(this)
-                binding.status.text = "Синхронизация запущена в фоне · приложение можно свернуть"
+                // Manual sync must read Health Connect while the app is in the
+                // foreground. WorkManager is reserved for periodic background
+                // syncs that have explicit Background Read capability/grant.
+                lifecycleScope.launch { synchronize(settings) }
             }
         }
         setupManualSyncObserver()
@@ -400,6 +403,9 @@ class StreamingMainActivity : AppCompatActivity() {
             append("\nВес: ").append(number(summary.weightKg)).append(if (summary.weightKg != null) " кг" else "")
             append("\nШаги: ").append(summary.steps?.toString() ?: "—")
             append("\nСон: ").append(number(sleep)).append(if (sleep != null) " ч" else "")
+            if (sleep != null && !summary.sleepDate.isNullOrBlank() && summary.sleepDate != summary.date) {
+                append(" · ночь ").append(summary.sleepDate)
+            }
             append("\nПульс покоя: ").append(number(summary.restingHeartRate, 0)).append(if (summary.restingHeartRate != null) " уд/мин" else "")
             append("\nСредний пульс: ").append(number(summary.averageHeartRate, 0)).append(if (summary.averageHeartRate != null) " уд/мин" else "")
             append("\nSpO₂: ").append(number(summary.averageSpO2)).append(if (summary.averageSpO2 != null) "%" else "")
@@ -637,6 +643,22 @@ class StreamingMainActivity : AppCompatActivity() {
             return
         }
 
+        val safeEndpoint = runCatching { EndpointSecurity.requireHttps(settings.endpoint) }
+            .getOrElse {
+                binding.status.text = it.message ?: "Некорректный URL Apps Script"
+                return
+            }
+        val missingReadPermissions = runCatching { HealthConnectPermissionSet.missingReadPermissions(client) }
+            .getOrElse {
+                binding.status.text = "Не удалось проверить разрешения Health Connect"
+                return
+            }
+        if (missingReadPermissions.isNotEmpty()) {
+            binding.status.text =
+                "Не выданы все разрешения Health Connect (${missingReadPermissions.size})"
+            return
+        }
+
         runCatching {
             SyncRunGate.runManual(
                 onWaiting = { running ->
@@ -656,7 +678,7 @@ class StreamingMainActivity : AppCompatActivity() {
                 try {
                     val streamer = HealthSyncStreamer(this, client)
                     val result = streamer.sync(
-                        settings.endpoint,
+                        safeEndpoint,
                         settings.token,
                         settings.days,
                         includeHistoricalChanges = true
@@ -735,40 +757,29 @@ class StreamingMainActivity : AppCompatActivity() {
 
     private fun importConfig(uri: Uri) {
         runCatching {
-            val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                ?: error("Не удалось прочитать файл")
-            val json = JSONObject(text)
-            require(json.optString("format") == "HealthConnectorConfig") {
-                "Это не файл настроек HealthConnector"
-            }
-            val endpoint = json.optString("endpoint").trim()
-            val importedToken = json.optString("token").trim()
-            val days = json.optInt("days", 7).coerceIn(1, 30)
-            val backgroundSync = json.optBoolean("backgroundSync", true)
-            require(endpoint.isNotBlank()) { "В файле нет URL Apps Script" }
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
 
-            binding.endpoint.setText(endpoint)
-            if (importedToken.isNotBlank()) {
-                secureTokenStore.setToken(importedToken)
-                binding.token.setText(importedToken)
-            } else {
-                binding.token.setText(secureTokenStore.getToken())
+        lifecycleScope.launch {
+            val result = ConfigAutoRestore.importFromUri(this@StreamingMainActivity, uri)
+            if (!result.restored) {
+                binding.status.text = "Ошибка импорта настроек: ${result.message}"
+                return@launch
             }
+
+            val endpoint = prefs.getString("endpoint", "").orEmpty()
+            val days = prefs.getInt("days", 7)
+            val backgroundSync = prefs.getBoolean(BackgroundSyncScheduler.PREF_ENABLED, true)
+            binding.endpoint.setText(endpoint)
+            binding.token.setText(secureTokenStore.getToken())
             binding.days.setText(days.toString())
-            prefs.edit()
-                .putString("endpoint", endpoint)
-                .putInt("days", days)
-                .putBoolean(BackgroundSyncScheduler.PREF_ENABLED, backgroundSync)
-                .remove("token")
-                .apply()
             backgroundSwitch?.isChecked = backgroundSync
-            BackgroundSyncScheduler.apply(this)
-        }.onSuccess {
-            binding.status.text = "Настройки восстановлены"
+            binding.status.text = result.message
             refreshBackgroundInfo()
             refreshDashboardSnapshot()
-        }.onFailure {
-            binding.status.text = "Ошибка импорта настроек: ${it.message}"
         }
     }
 
