@@ -255,34 +255,58 @@ function getDashboardLatestDayV1_(spreadsheet, tz) {
   const start = sheet.getLastRow() - count + 1;
   const rows = sheet.getRange(start, 1, count, width).getValues();
   const dateIndex = headers.indexOf('Date');
+  const sleepIndex = headers.indexOf('SleepHours');
+  const mainSleepIndex = headers.indexOf('MainSleepHours');
+
   let best = null;
   let bestDate = '';
+  let latestSleep = null;
+  let latestSleepDate = '';
+
   rows.forEach(row => {
     const date = dateIndex >= 0 ? normalizeDateWithTz_(row[dateIndex], tz) : '';
-    if (date && date >= bestDate) {
+    if (!date) return;
+
+    if (date >= bestDate) {
       bestDate = date;
       best = row;
     }
+
+    const sleepHours = sleepIndex >= 0 ? dashboardNumberV1_(row[sleepIndex]) : null;
+    const mainSleepHours = mainSleepIndex >= 0 ? dashboardNumberV1_(row[mainSleepIndex]) : null;
+    const hasUsefulSleep =
+      (sleepHours != null && sleepHours > 0) ||
+      (mainSleepHours != null && mainSleepHours > 0);
+    if (hasUsefulSleep && date >= latestSleepDate) {
+      latestSleepDate = date;
+      latestSleep = row;
+    }
   });
+
   if (!best) return {};
-  function value(name) {
+
+  function valueFrom(row, name) {
+    if (!row) return null;
     const index = headers.indexOf(name);
     if (index < 0) return null;
-    const raw = best[index];
+    const raw = row[index];
     return raw === '' || raw === null || raw === undefined ? null : raw;
   }
+
+  const sleepRow = latestSleep || best;
   return {
     date: bestDate,
-    steps: dashboardNumberV1_(value('Steps')),
-    weightKg: dashboardNumberV1_(value('WeightKg')),
-    sleepHours: dashboardNumberV1_(value('SleepHours')),
-    mainSleepHours: dashboardNumberV1_(value('MainSleepHours')),
-    restingHeartRate: dashboardNumberV1_(value('RestingHeartRate')),
-    averageHeartRate: dashboardNumberV1_(value('AvgHeartRate')),
-    averageSpO2: dashboardNumberV1_(value('AvgSpO2')),
-    activeCaloriesKcal: dashboardNumberV1_(value('ActiveCaloriesKcal')),
-    workoutCount: dashboardNumberV1_(value('WorkoutCount')),
-    syncedAt: dashboardIsoV1_(value('SyncedAt'))
+    steps: dashboardNumberV1_(valueFrom(best, 'Steps')),
+    weightKg: dashboardNumberV1_(valueFrom(best, 'WeightKg')),
+    sleepDate: latestSleep ? latestSleepDate : null,
+    sleepHours: dashboardNumberV1_(valueFrom(sleepRow, 'SleepHours')),
+    mainSleepHours: dashboardNumberV1_(valueFrom(sleepRow, 'MainSleepHours')),
+    restingHeartRate: dashboardNumberV1_(valueFrom(best, 'RestingHeartRate')),
+    averageHeartRate: dashboardNumberV1_(valueFrom(best, 'AvgHeartRate')),
+    averageSpO2: dashboardNumberV1_(valueFrom(best, 'AvgSpO2')),
+    activeCaloriesKcal: dashboardNumberV1_(valueFrom(best, 'ActiveCaloriesKcal')),
+    workoutCount: dashboardNumberV1_(valueFrom(best, 'WorkoutCount')),
+    syncedAt: dashboardIsoV1_(valueFrom(best, 'SyncedAt'))
   };
 }
 
