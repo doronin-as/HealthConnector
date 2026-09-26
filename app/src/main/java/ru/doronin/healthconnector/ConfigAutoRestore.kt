@@ -50,7 +50,8 @@ object ConfigAutoRestore {
         val app = context.applicationContext
         val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val existingEndpoint = prefs.getString("endpoint", "").orEmpty().trim()
-        if (existingEndpoint.isNotBlank()) {
+        val existingToken = SecureTokenStore(app).getToken().trim()
+        if (existingEndpoint.isNotBlank() && existingToken.isNotBlank()) {
             return@withContext RestoreResult(
                 restored = false,
                 message = "Конфигурация уже настроена"
@@ -106,27 +107,31 @@ object ConfigAutoRestore {
         require(raw.toByteArray(Charsets.UTF_8).size <= MAX_CONFIG_BYTES) {
             "JSON-конфиг слишком большой"
         }
-        val json = JSONObject(raw)
-        require(json.optString("format") == "HealthConnectorConfig") {
-            "Это не конфигурация HealthConnector"
-        }
+        val root = JSONObject(raw)
+        val json = findConfigObject(root)
+            ?: throw IllegalArgumentException("Это не конфигурация HealthConnector")
 
-        val version = json.optInt("version", 1).coerceAtLeast(1)
-        val endpoint = json.optString("endpoint").trim()
+        val version = firstInt(json, "version", "schemaVersion")?.coerceAtLeast(1) ?: 1
+        val endpoint = firstString(
+            json,
+            "endpoint",
+            "appsScriptUrl",
+            "scriptUrl",
+            "apiUrl",
+            "webAppUrl"
+        ).orEmpty().trim()
         require(endpoint.isNotBlank()) { "В конфигурации отсутствует endpoint" }
         val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
 
-        val days = json.optInt("days", 7).coerceIn(1, 30)
-        val backgroundSync = if (json.has("backgroundSync")) {
-            json.optBoolean("backgroundSync", true)
-        } else {
-            true
-        }
+        val days = (firstInt(json, "days", "syncDays", "historyDays") ?: 7).coerceIn(1, 30)
+        val backgroundSync = firstBoolean(json, "backgroundSync", "background", "autoSync") ?: true
 
         // Legacy/user-created configuration may contain a token. Modern exports
         // deliberately omit it; if absent, an already configured secure token is
         // preserved instead of being cleared.
-        val token = json.optString("token").trim().takeIf { it.isNotEmpty() }
+        val token = firstString(json, "token", "apiToken", "accessToken")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
 
         return ParsedConfig(
             endpoint = safeEndpoint,
@@ -178,7 +183,7 @@ object ConfigAutoRestore {
             context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS),
             context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         ).distinctBy { it.absolutePath }
-        return roots.flatMap(::scanReadableDirectory)
+        return roots.flatMap { scanReadableDirectory(it, maxDepth = 3) }
     }
 
     @Suppress("DEPRECATION")
@@ -187,28 +192,40 @@ object ConfigAutoRestore {
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
         )
-        return roots.flatMap(::scanReadableDirectory)
+        return roots.flatMap { scanReadableDirectory(it, maxDepth = 3) }
     }
 
-    private fun scanReadableDirectory(root: File): List<Candidate> {
+    private fun scanReadableDirectory(root: File, maxDepth: Int): List<Candidate> {
         if (!root.exists() || !root.canRead() || !root.isDirectory) return emptyList()
-        return runCatching {
-            root.listFiles()
-                .orEmpty()
-                .asSequence()
-                .filter { it.isFile && it.canRead() && looksLikeConfigName(it.name) }
-                .map { file ->
-                    Candidate(
+        val result = ArrayList<Candidate>()
+        val queue = ArrayDeque<Pair<File, Int>>()
+        queue.add(root to 0)
+        var visited = 0
+
+        while (queue.isNotEmpty() && visited < 500) {
+            val (dir, depth) = queue.removeFirst()
+            val children = runCatching { dir.listFiles().orEmpty().toList() }.getOrDefault(emptyList())
+            for (file in children) {
+                if (++visited > 500) break
+                if (file.isDirectory && depth < maxDepth && file.canRead()) {
+                    queue.add(file to depth + 1)
+                } else if (
+                    file.isFile &&
+                    file.canRead() &&
+                    looksLikeJsonName(file.name) &&
+                    file.length() in 1..MAX_CONFIG_BYTES.toLong()
+                ) {
+                    result += Candidate(
                         label = file.absolutePath,
                         modifiedAt = file.lastModified(),
                         readText = {
-                            if (file.length() > MAX_CONFIG_BYTES) null
-                            else file.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                            file.bufferedReader(Charsets.UTF_8).use { it.readText() }
                         }
                     )
                 }
-                .toList()
-        }.getOrDefault(emptyList())
+            }
+        }
+        return result
     }
 
     private fun mediaStoreDownloadCandidates(context: Context): List<Candidate> {
@@ -227,7 +244,7 @@ object ConfigAutoRestore {
                 collection,
                 projection,
                 "${MediaStore.Downloads.DISPLAY_NAME} LIKE ?",
-                arrayOf("healthconnector-config%.json"),
+                arrayOf("%.json"),
                 "${MediaStore.Downloads.DATE_MODIFIED} DESC"
             )?.use { cursor ->
                 val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID)
@@ -237,7 +254,7 @@ object ConfigAutoRestore {
                 buildList {
                     while (cursor.moveToNext()) {
                         val name = cursor.getString(nameIndex).orEmpty()
-                        if (!looksLikeConfigName(name)) continue
+                        if (!looksLikeJsonName(name)) continue
                         val size = cursor.getLong(sizeIndex)
                         if (size > MAX_CONFIG_BYTES) continue
                         val uri = ContentUris.withAppendedId(collection, cursor.getLong(idIndex))
@@ -287,5 +304,71 @@ object ConfigAutoRestore {
         val normalized = name.trim().lowercase()
         return normalized == DEFAULT_FILE_NAME ||
             (normalized.startsWith("healthconnector-config") && normalized.endsWith(".json"))
+    }
+
+    private fun looksLikeJsonName(name: String): Boolean =
+        name.trim().lowercase().endsWith(".json")
+
+    private fun findConfigObject(root: JSONObject): JSONObject? {
+        val queue = ArrayDeque<JSONObject>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited++ < 64) {
+            val current = queue.removeFirst()
+            val format = current.optString("format").trim()
+            val endpoint = firstString(
+                current,
+                "endpoint",
+                "appsScriptUrl",
+                "scriptUrl",
+                "apiUrl",
+                "webAppUrl"
+            )
+            if (format == "HealthConnectorConfig" || !endpoint.isNullOrBlank()) {
+                return current
+            }
+            val keys = current.keys()
+            while (keys.hasNext()) {
+                val value = current.opt(keys.next())
+                if (value is JSONObject) queue.add(value)
+            }
+        }
+        return null
+    }
+
+    private fun firstString(json: JSONObject, vararg keys: String): String? {
+        for (key in keys) {
+            if (!json.has(key) || json.isNull(key)) continue
+            val value = json.optString(key).trim()
+            if (value.isNotEmpty()) return value
+        }
+        return null
+    }
+
+    private fun firstInt(json: JSONObject, vararg keys: String): Int? {
+        for (key in keys) {
+            if (!json.has(key) || json.isNull(key)) continue
+            val raw = json.opt(key)
+            when (raw) {
+                is Number -> return raw.toInt()
+                is String -> raw.trim().toIntOrNull()?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun firstBoolean(json: JSONObject, vararg keys: String): Boolean? {
+        for (key in keys) {
+            if (!json.has(key) || json.isNull(key)) continue
+            when (val raw = json.opt(key)) {
+                is Boolean -> return raw
+                is Number -> return raw.toInt() != 0
+                is String -> when (raw.trim().lowercase()) {
+                    "true", "1", "yes", "да", "on" -> return true
+                    "false", "0", "no", "нет", "off" -> return false
+                }
+            }
+        }
+        return null
     }
 }
