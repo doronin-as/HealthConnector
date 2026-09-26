@@ -320,9 +320,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // (main sleep, nap, additional sleep) without splitting them at midnight.
             onProgress("[$date] Этап 3/8 · читаю сон…")
             val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
-            val wideRecords = wideSleepRecords
+            val wideCandidates = wideSleepRecords
                 .filter { it.endTime.atZone(zone).toLocalDate() == date }
                 .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
+            val wideRecords = preferBestSource(wideCandidates)
             val rawSleepRecords: List<SleepSessionRecord>
             val records: List<SleepSessionRecord>
             val sleepReadPath: String
@@ -334,9 +335,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             } else {
                 val targeted = readSleepRecordsWithKnownOriginsFallback(sleepQueryStart, dayEnd)
                 rawSleepRecords = targeted
-                records = targeted
-                    .filter { it.endTime.atZone(zone).toLocalDate() == date }
-                    .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
+                records = preferBestSource(
+                    targeted
+                        .filter { it.endTime.atZone(zone).toLocalDate() == date }
+                        .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
+                )
                 sleepReadPath = "targeted-origin-fallback"
             }
             addSources(records, sources)
