@@ -120,13 +120,51 @@ class HealthSyncStreamer(
             .distinct()
             .sorted()
 
+        // Restore the original proven sleep strategy: read SleepSessionRecord once for the
+        // whole requested range, then assign complete sessions to the day when the user wakes.
+        // Sleep records are low-volume, so unlike heart-rate/cadence series this is memory-safe.
+        val wideSleepRecordsByWakeDate: Map<LocalDate, List<SleepSessionRecord>> =
+            if (dates.isEmpty()) {
+                emptyMap()
+            } else {
+                val wideStart = dates.first().atStartOfDay(zone).toInstant().minus(Duration.ofHours(24))
+                val wideEnd = dates.last().plusDays(1).atStartOfDay(zone).toInstant()
+                onProgress(
+                    "Сон · широкое чтение Health Connect ${dates.first()}…${dates.last()} одним запросом…"
+                )
+                val wideRecords = readSleepRecordsWideRange(wideStart, wideEnd)
+                val deduplicated = wideRecords.distinctBy {
+                    it.metadata.id.takeIf(String::isNotBlank)
+                        ?: "${it.metadata.dataOrigin.packageName}|${it.startTime}|${it.endTime}"
+                }
+                val byWakeDate = deduplicated.groupBy { it.endTime.atZone(zone).toLocalDate() }
+                val sources = deduplicated.asSequence()
+                    .map { it.sourcePackage() }
+                    .filter { it.isNotBlank() }
+                    .distinct()
+                    .joinToString(", ")
+                    .ifBlank { "—" }
+                onProgress(
+                    "Сон · широкий scan: ${deduplicated.size} сесс. · источники $sources · " +
+                        "дней с данными ${byWakeDate.size}"
+                )
+                byWakeDate
+            }
+
         var totalWorkouts = 0
         var totalMeasurements = 0
         val allSources = linkedSetOf<String>()
 
         dates.forEachIndexed { index, date ->
             onProgress("Читаю день ${index + 1}/${dates.size}: $date…")
-            val result = syncDay(endpoint, token, date, zone, onProgress)
+            val result = syncDay(
+                endpoint = endpoint,
+                token = token,
+                date = date,
+                zone = zone,
+                wideSleepRecords = wideSleepRecordsByWakeDate[date].orEmpty(),
+                onProgress = onProgress
+            )
             totalWorkouts += result.workouts
             totalMeasurements += result.measurements
             allSources += result.sources
@@ -146,6 +184,7 @@ class HealthSyncStreamer(
         token: String,
         date: LocalDate,
         zone: ZoneId,
+        wideSleepRecords: List<SleepSessionRecord>,
         onProgress: (String) -> Unit
     ): DayResult {
         permissionDeniedTypes.clear()
@@ -281,10 +320,25 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // (main sleep, nap, additional sleep) without splitting them at midnight.
             onProgress("[$date] Этап 3/8 · читаю сон…")
             val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
-            val rawSleepRecords = readSleepRecordsWithKnownOriginsFallback(sleepQueryStart, dayEnd)
-            val records = rawSleepRecords
+            val wideRecords = wideSleepRecords
                 .filter { it.endTime.atZone(zone).toLocalDate() == date }
                 .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
+            val rawSleepRecords: List<SleepSessionRecord>
+            val records: List<SleepSessionRecord>
+            val sleepReadPath: String
+            if (wideRecords.isNotEmpty()) {
+                rawSleepRecords = wideRecords
+                records = wideRecords
+                sleepOriginProbeDiagnostic = "origin probe: не нужен"
+                sleepReadPath = "wide-range"
+            } else {
+                val targeted = readSleepRecordsWithKnownOriginsFallback(sleepQueryStart, dayEnd)
+                rawSleepRecords = targeted
+                records = targeted
+                    .filter { it.endTime.atZone(zone).toLocalDate() == date }
+                    .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
+                sleepReadPath = "targeted-origin-fallback"
+            }
             addSources(records, sources)
             readDiagnostics.add(
                 "Сон",
@@ -300,7 +354,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 .joinToString(", ")
                 .ifBlank { "—" }
             onProgress(
-                "[$date] Сон · raw ${rawSleepRecords.size} · после фильтра ${records.size} · " +
+                "[$date] Сон · путь $sleepReadPath · raw ${rawSleepRecords.size} · после фильтра ${records.size} · " +
                     "источники $sleepSources · $sleepOriginProbeDiagnostic · " +
                     "${sleepSummary.stageCount} стадий · " +
                     "${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч"
@@ -1340,6 +1394,37 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
             lastError
         )
+    }
+
+    /**
+     * Original HealthConnector strategy: one unfiltered read for the whole sleep range.
+     * This deliberately avoids per-day DataOrigin filtering because older builds proved that
+     * Health Connect may expose imported sleep more reliably in a broad read.
+     */
+    private suspend fun readSleepRecordsWideRange(
+        start: Instant,
+        end: Instant
+    ): List<SleepSessionRecord> {
+        var lastError: Exception? = null
+        repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
+            try {
+                return readAll(start, end)
+            } catch (error: Exception) {
+                if (HealthConnectErrorUtils.isPermissionFailure(error)) {
+                    return emptyList()
+                }
+                lastError = error
+                if (attempt + 1 < HEALTH_CONNECT_READ_RETRIES) {
+                    delay(HEALTH_CONNECT_RETRY_BASE_MS * (attempt + 1L))
+                }
+            }
+        }
+        SyncDiagnostics.server(
+            context,
+            "Wide sleep scan failed: ${lastError?.message ?: "unknown"}",
+            "WARNING"
+        )
+        return emptyList()
     }
 
     /**
