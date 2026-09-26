@@ -214,7 +214,7 @@ class HealthSyncStreamer(
         val workoutDayRecords = WorkoutDayRecords()
 
         var sleepSummary = SleepAggregation.empty()
-        val sleepSessions = JSONArray()
+        var sleepSessions = JSONArray()
 val workouts = JSONArray()
 
 var sentBatches = 0
@@ -315,102 +315,25 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
 
         run {
-            // Attribute each complete sleep session to the day when the user wakes up.
-            // This keeps an overnight sleep intact and allows several sessions on the same day
-            // (main sleep, nap, additional sleep) without splitting them at midnight.
-            onProgress("[$date] Этап 3/8 · читаю сон…")
-            val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
-            val wideCandidates = wideSleepRecords
-                .filter { it.endTime.atZone(zone).toLocalDate() == date }
-                .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
-            val wideRecords = preferBestSource(wideCandidates)
-            val rawSleepRecords: List<SleepSessionRecord>
-            val records: List<SleepSessionRecord>
-            val sleepReadPath: String
-            if (wideRecords.isNotEmpty()) {
-                rawSleepRecords = wideCandidates
-                records = wideRecords
-                sleepOriginProbeDiagnostic = "origin probe: не нужен"
-                sleepReadPath = "wide-range"
-            } else {
-                val targeted = readSleepRecordsWithKnownOriginsFallback(sleepQueryStart, dayEnd)
-                rawSleepRecords = targeted
-                records = preferBestSource(
-                    targeted
-                        .filter { it.endTime.atZone(zone).toLocalDate() == date }
-                        .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
-                )
-                sleepReadPath = "targeted-origin-fallback"
-            }
-            addSources(records, sources)
+            val sleepRead = readSleepForDay(
+                date = date,
+                zone = zone,
+                dayStart = dayStart,
+                dayEnd = dayEnd,
+                wideSleepRecords = wideSleepRecords,
+                endpoint = endpoint,
+                token = token,
+                onProgress = onProgress
+            )
+            addSources(sleepRead.records, sources)
             readDiagnostics.add(
                 "Сон",
-                rawSleepRecords,
-                records,
-                "стадий ${records.sumOf { it.stages.size }}"
+                sleepRead.rawRecords,
+                sleepRead.records,
+                "путь ${sleepRead.path} · стадий ${sleepRead.summary.stageCount}"
             )
-            sleepSummary = aggregateSleep(records)
-            val sleepSources = rawSleepRecords.asSequence()
-                .map { it.sourcePackage() }
-                .filter { it.isNotBlank() }
-                .distinct()
-                .joinToString(", ")
-                .ifBlank { "—" }
-            onProgress(
-                "[$date] Сон · путь $sleepReadPath · raw ${rawSleepRecords.size} · после фильтра ${records.size} · " +
-                    "источники $sleepSources · $sleepOriginProbeDiagnostic · " +
-                    "${sleepSummary.stageCount} стадий · " +
-                    "${sleepSummary.hours?.let { "%.2f".format(it) } ?: "—"} ч"
-            )
-            for (r in records) {
-                val stageTotals = stageTotals(r.stages, r.startTime, r.endTime)
-                sleepSessions.put(JSONObject().apply {
-                    put("id", stableRecordId(r, "sleep|${r.startTime}|${r.endTime}"))
-                    put("start", r.startTime.toString())
-                    put("end", r.endTime.toString())
-                    put("durationMinutes", Duration.between(r.startTime, r.endTime).toMinutes())
-                    put("title", r.title ?: "")
-                    put("notes", r.notes ?: "")
-                    put("deepSleepMinutes", stageTotals.deepMinutes)
-                    put("lightSleepMinutes", stageTotals.lightMinutes)
-                    put("remSleepMinutes", stageTotals.remMinutes)
-                    put("awakeMinutes", stageTotals.awakeMinutes)
-                    put("stageCount", r.stages.size)
-                    put("stagesJson", JSONArray().apply {
-                        r.stages.forEach { stage ->
-                            put(JSONObject().apply {
-                                put("start", stage.startTime.toString())
-                                put("end", stage.endTime.toString())
-                                put("stage", stage.stage)
-                                put("stageName", sleepStageName(stage.stage))
-                            })
-                        }
-                    }.toString())
-                    put("sourcePackage", r.sourcePackage())
-                    put("sourceName", sourceName(r.sourcePackage()))
-                })
-            }
-
-            if (records.isEmpty() && date.isBefore(LocalDate.now(zone))) {
-                onProgress("[$date] Health Connect не вернул сон · проверяю Google Health Cloud fallback…")
-                val repaired = runCatching {
-                    requestGoogleHealthSleepRepair(endpoint, token, date)
-                }.getOrElse { error ->
-                    SyncDiagnostics.server(
-                        context,
-                        "Google Health sleep repair $date: ${error.message ?: error.javaClass.simpleName}",
-                        "WARNING"
-                    )
-                    false
-                }
-                onProgress(
-                    if (repaired) {
-                        "[$date] ✓ Сон восстановлен сервером из Google Health API; локальный день будет перепроверен при следующей синхронизации"
-                    } else {
-                        "[$date] Google Health не восстановил сон; оставляю день на повторное чтение Health Connect"
-                    }
-                )
-            }
+            sleepSummary = sleepRead.summary
+            sleepSessions = sleepRead.sessions
         }
 
         // Persist the dashboard-critical part of the day before processing high-frequency data.
@@ -1340,6 +1263,121 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         else -> "Unknown"
     }
 
+    private suspend fun readSleepForDay(
+        date: LocalDate,
+        zone: ZoneId,
+        dayStart: Instant,
+        dayEnd: Instant,
+        wideSleepRecords: List<SleepSessionRecord>,
+        endpoint: String,
+        token: String,
+        onProgress: (String) -> Unit
+    ): SleepDayRead {
+        onProgress("[$date] Этап 3/8 · читаю сон…")
+        val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
+        val wideCandidates = wideSleepRecords
+            .filter { it.endTime.atZone(zone).toLocalDate() == date }
+            .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
+        val wideSelected = preferBestSource(wideCandidates)
+
+        val rawRecords: List<SleepSessionRecord>
+        val records: List<SleepSessionRecord>
+        val path: String
+        if (wideSelected.isNotEmpty()) {
+            rawRecords = wideCandidates
+            records = wideSelected
+            sleepOriginProbeDiagnostic = "origin probe: не нужен"
+            path = "wide-range"
+        } else {
+            val targeted = readSleepRecordsWithKnownOriginsFallback(sleepQueryStart, dayEnd)
+            rawRecords = targeted
+            records = preferBestSource(
+                targeted
+                    .filter { it.endTime.atZone(zone).toLocalDate() == date }
+                    .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
+            )
+            path = "targeted-origin-fallback"
+        }
+
+        val summary = aggregateSleep(records)
+        val sleepSources = rawRecords.asSequence()
+            .map { it.sourcePackage() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .joinToString(", ")
+            .ifBlank { "—" }
+
+        onProgress(
+            "[$date] Сон · путь $path · raw ${rawRecords.size} · выбрано ${records.size} · " +
+                "источники $sleepSources · $sleepOriginProbeDiagnostic · " +
+                "${summary.stageCount} стадий · " +
+                "${summary.hours?.let { "%.2f".format(it) } ?: "—"} ч"
+        )
+
+        val sessions = buildSleepSessionsJson(records)
+
+        if (records.isEmpty() && date.isBefore(LocalDate.now(zone))) {
+            onProgress("[$date] Health Connect не вернул сон · проверяю Google Health Cloud fallback…")
+            val repaired = runCatching {
+                requestGoogleHealthSleepRepair(endpoint, token, date)
+            }.getOrElse { error ->
+                SyncDiagnostics.server(
+                    context,
+                    "Google Health sleep repair $date: ${error.message ?: error.javaClass.simpleName}",
+                    "WARNING"
+                )
+                false
+            }
+            onProgress(
+                if (repaired) {
+                    "[$date] ✓ Сон восстановлен сервером из Google Health API; локальный день будет перепроверен при следующей синхронизации"
+                } else {
+                    "[$date] Google Health не восстановил сон; оставляю день на повторное чтение Health Connect"
+                }
+            )
+        }
+
+        return SleepDayRead(
+            rawRecords = rawRecords,
+            records = records,
+            summary = summary,
+            sessions = sessions,
+            path = path
+        )
+    }
+
+    private fun buildSleepSessionsJson(records: List<SleepSessionRecord>): JSONArray =
+        JSONArray().apply {
+            for (record in records) {
+                val stageTotals = stageTotals(record.stages, record.startTime, record.endTime)
+                put(JSONObject().apply {
+                    put("id", stableRecordId(record, "sleep|${record.startTime}|${record.endTime}"))
+                    put("start", record.startTime.toString())
+                    put("end", record.endTime.toString())
+                    put("durationMinutes", Duration.between(record.startTime, record.endTime).toMinutes())
+                    put("title", record.title ?: "")
+                    put("notes", record.notes ?: "")
+                    put("deepSleepMinutes", stageTotals.deepMinutes)
+                    put("lightSleepMinutes", stageTotals.lightMinutes)
+                    put("remSleepMinutes", stageTotals.remMinutes)
+                    put("awakeMinutes", stageTotals.awakeMinutes)
+                    put("stageCount", record.stages.size)
+                    put("stagesJson", JSONArray().apply {
+                        record.stages.forEach { stage ->
+                            put(JSONObject().apply {
+                                put("start", stage.startTime.toString())
+                                put("end", stage.endTime.toString())
+                                put("stage", stage.stage)
+                                put("stageName", sleepStageName(stage.stage))
+                            })
+                        }
+                    }.toString())
+                    put("sourcePackage", record.sourcePackage())
+                    put("sourceName", sourceName(record.sourcePackage()))
+                })
+            }
+        }
+
     private fun <T : Record> preferBestSource(records: List<T>): List<T> {
         if (records.isEmpty()) return emptyList()
         val best = records.asSequence()
@@ -1612,6 +1650,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         var elevation: List<ElevationGainedRecord> = emptyList()
         var floors: List<FloorsClimbedRecord> = emptyList()
     }
+
+    private data class SleepDayRead(
+        val rawRecords: List<SleepSessionRecord>,
+        val records: List<SleepSessionRecord>,
+        val summary: SleepAggregation,
+        val sessions: JSONArray,
+        val path: String
+    )
 
     private data class DayResult(
         val workouts: Int,
