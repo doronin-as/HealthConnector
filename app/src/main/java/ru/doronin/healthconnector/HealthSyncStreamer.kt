@@ -335,22 +335,22 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             }
 
             if (records.isEmpty() && date.isBefore(LocalDate.now(zone))) {
-                onProgress("[$date] Health Connect не вернул сон · проверяю Fitbit Cloud fallback…")
+                onProgress("[$date] Health Connect не вернул сон · проверяю Google Health Cloud fallback…")
                 val repaired = runCatching {
-                    requestFitbitSleepRepair(endpoint, token, date)
+                    requestGoogleHealthSleepRepair(endpoint, token, date)
                 }.getOrElse { error ->
                     SyncDiagnostics.server(
                         context,
-                        "Fitbit sleep repair $date: ${error.message ?: error.javaClass.simpleName}",
+                        "Google Health sleep repair $date: ${error.message ?: error.javaClass.simpleName}",
                         "WARNING"
                     )
                     false
                 }
                 onProgress(
                     if (repaired) {
-                        "[$date] ✓ Сон восстановлен сервером из Fitbit Cloud; локальный день будет перепроверен при следующей синхронизации"
+                        "[$date] ✓ Сон восстановлен сервером из Google Health API; локальный день будет перепроверен при следующей синхронизации"
                     } else {
-                        "[$date] Fitbit Cloud не восстановил сон; оставляю день на повторное чтение Health Connect"
+                        "[$date] Google Health не восстановил сон; оставляю день на повторное чтение Health Connect"
                     }
                 )
             }
@@ -947,14 +947,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
     }
 
-    private suspend fun requestFitbitSleepRepair(
+    private suspend fun requestGoogleHealthSleepRepair(
         endpoint: String,
         token: String,
         date: LocalDate
     ): Boolean {
         val body = JSONObject().apply {
             put("token", token)
-            put("action", "fitbitRepairSleepV1")
+            put("action", "googleHealthRepairSleepV1")
             put("schemaVersion", 1)
             put("date", date.toString())
         }
