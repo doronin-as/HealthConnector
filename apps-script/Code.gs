@@ -1039,8 +1039,14 @@ function json_(object) {
 
 // ===== Health Connector schema v3 integrity layer =====
 const DAY_HEADERS_V3 = DAY_HEADERS.concat([
-  'MainSleepHours', 'NapCount', 'NapMinutes', 'SyncComplete', 'CompletedAt'
+  'MainSleepHours', 'NapCount', 'NapMinutes', 'SyncComplete', 'CompletedAt',
+  'SyncState', 'ReadTypes'
 ]);
+
+// Per-day sync state written by the Android client. SyncComplete stays the boolean
+// the sync planner reads; SyncState says why a day is not complete.
+const DAY_SYNC_STATES_V3 = Object.freeze(['COMPLETE', 'PARTIAL', 'WAITING_FOR_SOURCE', 'PERMISSION_BLOCKED']);
+const TYPE_READ_STATES_V3 = Object.freeze(['HAS_DATA', 'EMPTY', 'PERMISSION_DENIED']);
 
 const DAY_FIELD_TO_HEADER_V3 = Object.freeze({
   steps: 'Steps',
@@ -1105,7 +1111,10 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   const measurementsSheet = ensureSheet_(spreadsheet, MEASUREMENTS_SHEET, MEASUREMENT_HEADERS);
   const syncedAt = payload.syncedAt || new Date().toISOString();
 
-  upsertDayObjectsPartialV3_(daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete);
+  upsertDayObjectsPartialV3_(
+    daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete,
+    normalizeDaySyncStateV3_(payload.syncState), normalizeReadTypesV3_(payload.readTypes)
+  );
 
   const workoutRows = (payload.workouts || []).map(w => [
     w.id, w.start, w.end, w.exerciseType, nullable_(w.title), Number(w.durationMinutes || 0),
@@ -1130,10 +1139,17 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   upsertByKey_(sleepSheet, sleepRows, 1);
   upsertByKey_(measurementsSheet, measurementRows, 1);
 
+  // A complete re-read of a day proves which raw rows still exist in Health Connect.
+  // Rows for that day not touched by this sync were deleted at the source.
+  const swept = payload.reconcileWindow
+    ? sweepStaleDayRowsV3_(measurementsSheet, sleepSheet, workoutsSheet, payload.reconcileWindow, syncedAt)
+    : null;
+
   logSheet.appendRow([
     new Date(), payload.deviceId || '', payload.rangeStart || '', payload.rangeEnd || '',
     (payload.days || []).length, workoutRows.length, 'OK',
-    `V3 partial sync: сон ${sleepRows.length}; измерения ${measurementRows.length}`
+    `V3 partial sync: сон ${sleepRows.length}; измерения ${measurementRows.length}` +
+      (swept ? `; удалено устаревших: изм. ${swept.measurements}, сон ${swept.sleep}, трен. ${swept.workouts}` : '')
   ]);
 
   return {
@@ -1143,11 +1159,28 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
     workouts: workoutRows.length,
     sleepSessions: sleepRows.length,
     measurements: measurementRows.length,
+    swept,
     message: `V3: дней ${(payload.days || []).length}; тренировок ${workoutRows.length}; сна ${sleepRows.length}; измерений ${measurementRows.length}`
   };
 }
 
-function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
+function normalizeDaySyncStateV3_(value) {
+  const text = String(value == null ? '' : value).trim().toUpperCase();
+  return DAY_SYNC_STATES_V3.indexOf(text) >= 0 ? text : '';
+}
+
+// Proof of which record types were read for the day, e.g. {"StepsRecord":"HAS_DATA"}.
+function normalizeReadTypesV3_(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const result = {};
+  Object.keys(value).sort().slice(0, 64).forEach(key => {
+    const state = String(value[key] || '').trim().toUpperCase();
+    if (/^[A-Za-z0-9]{1,64}$/.test(key) && TYPE_READ_STATES_V3.indexOf(state) >= 0) result[key] = state;
+  });
+  return Object.keys(result).length ? JSON.stringify(result) : '';
+}
+
+function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete, syncState, readTypes) {
   if (!days.length) return;
   const headers = DAY_HEADERS_V3;
   const headerIndex = new Map(headers.map((value, index) => [value, index]));
@@ -1223,6 +1256,9 @@ function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
     if (typeof dayComplete === 'boolean') {
       row[headerIndex.get('SyncComplete')] = dayComplete;
       row[headerIndex.get('CompletedAt')] = dayComplete ? syncedAt : '';
+      // Older clients send only the boolean; derive the closest state for them.
+      row[headerIndex.get('SyncState')] = syncState || (dayComplete ? 'COMPLETE' : 'PARTIAL');
+      row[headerIndex.get('ReadTypes')] = readTypes || '';
     }
     sheet.getRange(rowNumber, 1, 1, headers.length).setValues([row]);
   });
@@ -1252,6 +1288,7 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
   const headers = sheet.getRange(1, 1, 1, DAY_HEADERS_V3.length).getDisplayValues()[0];
   const dateIndex = headers.indexOf('Date');
   const completeIndex = headers.indexOf('SyncComplete');
+  const stateIndex = headers.indexOf('SyncState');
   const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, DAY_HEADERS_V3.length).getValues();
   const rows = [];
 
@@ -1269,6 +1306,7 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
     rows.push({
       date,
       complete: completeIndex >= 0 ? booleanCellV3_(row[completeIndex]) : null,
+      state: stateIndex >= 0 ? normalizeDaySyncStateV3_(row[stateIndex]) : '',
       coreCoverage
     });
   });
@@ -1295,6 +1333,7 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
   // Interrupted syncs explicitly leave SyncComplete=false.
   let startDate = dates.find(date => byDate.get(date).complete === false) || '';
   let reason = startDate ? 'incomplete-day' : '';
+
 
   // A missing date inside existing history is also a repair point.
   if (!startDate) {
@@ -1346,7 +1385,9 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
     latestDate,
     today,
     reason,
-    message: `Dashboard: последняя дата ${latestDate}; синхронизация с ${startDate}`
+    startDayState: byDate.has(startDate) ? byDate.get(startDate).state : '',
+    message: `Dashboard: последняя дата ${latestDate}; синхронизация с ${startDate}` +
+      (byDate.has(startDate) && byDate.get(startDate).state ? ` (${byDate.get(startDate).state})` : '')
   };
 }
 
@@ -1425,6 +1466,93 @@ function isoDateKeyV3_(value, tz) {
   return isNaN(d) ? '' : Utilities.formatDate(d, tz, 'yyyy-MM-dd');
 }
 
+
+// Rows written by cloud connectors never come from the phone, so a phone re-read
+// cannot prove them stale.
+const CLOUD_SOURCE_PACKAGES_V3 = Object.freeze(['google.health.api', 'fitbit.webapi']);
+const MAX_RECONCILE_WINDOW_MS = 26 * 60 * 60 * 1000;
+const SYNCED_AT_TOLERANCE_MS = 1000;
+
+// Column layout (0-based) used to date and age a raw row in each sheet.
+const STALE_ROW_SPECS_V3 = Object.freeze({
+  measurement: Object.freeze({ timeColumns: [1, 2], sourceColumn: 7, syncedColumn: 9 }),
+  sleep: Object.freeze({ timeColumns: [2], sourceColumn: 12, syncedColumn: 14 }),
+  workout: Object.freeze({ timeColumns: [1], sourceColumn: 6, syncedColumn: 7 })
+});
+
+function cellTimeMsV3_(value) {
+  if (value instanceof Date) return isNaN(value) ? null : value.getTime();
+  const text = String(value == null ? '' : value).trim();
+  if (!text) return null;
+  const ms = Date.parse(text);
+  return isNaN(ms) ? null : ms;
+}
+
+// Returns 0-based indexes of rows dated inside [startMs, endMs) that the current sync
+// (syncedAtMs) did not rewrite. Rows with an unreadable date or SyncedAt are kept.
+function staleRowIndexesV3_(values, spec, startMs, endMs, syncedAtMs) {
+  const result = [];
+  values.forEach((row, index) => {
+    const source = String(row[spec.sourceColumn] || '').trim();
+    if (CLOUD_SOURCE_PACKAGES_V3.indexOf(source) >= 0) return;
+    let timeMs = null;
+    for (let i = 0; i < spec.timeColumns.length && timeMs === null; i++) {
+      timeMs = cellTimeMsV3_(row[spec.timeColumns[i]]);
+    }
+    if (timeMs === null || timeMs < startMs || timeMs >= endMs) return;
+    const rowSyncedMs = cellTimeMsV3_(row[spec.syncedColumn]);
+    // Sheets may turn the ISO text into a Date and round it; a second of slack keeps
+    // rows written by this very sync.
+    if (rowSyncedMs === null || rowSyncedMs >= syncedAtMs - SYNCED_AT_TOLERANCE_MS) return;
+    result.push(index);
+  });
+  return result;
+}
+
+function parseReconcileWindowV3_(window) {
+  if (!window || typeof window !== 'object') return null;
+  const startMs = cellTimeMsV3_(window.start);
+  const endMs = cellTimeMsV3_(window.end);
+  if (startMs === null || endMs === null || endMs <= startMs) return null;
+  if (endMs - startMs > MAX_RECONCILE_WINDOW_MS) return null;
+  return { startMs, endMs };
+}
+
+function sweepStaleDayRowsV3_(measurementsSheet, sleepSheet, workoutsSheet, window, syncedAt) {
+  const parsed = parseReconcileWindowV3_(window);
+  const syncedAtMs = cellTimeMsV3_(syncedAt);
+  if (!parsed || syncedAtMs === null) return null;
+  const sweep = (sheet, spec) => {
+    if (!sheet || sheet.getLastRow() < 2) return 0;
+    const width = Math.min(sheet.getLastColumn(), spec.syncedColumn + 1);
+    if (width <= spec.syncedColumn) return 0;
+    const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
+    const indexes = staleRowIndexesV3_(values, spec, parsed.startMs, parsed.endMs, syncedAtMs);
+    deleteRowIndexesV3_(sheet, indexes);
+    return indexes.length;
+  };
+  return {
+    measurements: sweep(measurementsSheet, STALE_ROW_SPECS_V3.measurement),
+    sleep: sweep(sleepSheet, STALE_ROW_SPECS_V3.sleep),
+    workouts: sweep(workoutsSheet, STALE_ROW_SPECS_V3.workout)
+  };
+}
+
+// Deletes data rows (0-based indexes below the header) bottom-up, one call per contiguous run.
+function deleteRowIndexesV3_(sheet, indexes) {
+  const rows = indexes.map(index => index + 2).sort((a, b) => b - a);
+  let i = 0;
+  while (i < rows.length) {
+    let first = rows[i];
+    let count = 1;
+    while (i + count < rows.length && rows[i + count] === first - 1) {
+      first--;
+      count++;
+    }
+    sheet.deleteRows(first, count);
+    i += count;
+  }
+}
 
 // ===== Google Health API connector v1 =====
 //

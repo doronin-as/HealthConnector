@@ -76,12 +76,3 @@ class HealthAggregateReader(
         val floors: MetricRead<Double>
     )
 }
-
-sealed interface MetricRead<out T> {
-    data class Available<T>(
-        val value: T?,
-        val sourcePackages: Set<String> = emptySet()
-    ) : MetricRead<T>
-
-    data class PermissionDenied(val reason: String) : MetricRead<Nothing>
-}

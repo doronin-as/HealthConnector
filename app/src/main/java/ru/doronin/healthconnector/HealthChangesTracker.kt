@@ -64,60 +64,57 @@ class HealthChangesTracker(
         WeightRecord::class
     )
 
+    private val typesByKey: Map<String, KClass<out Record>> =
+        recordTypes.associateBy { it.qualifiedName ?: it.toString() }
+
     suspend fun collect(zone: ZoneId): ChangeSet {
-        val dates = linkedSetOf<LocalDate>()
-        val deletedIds = linkedSetOf<String>()
-        var observedChanges = 0
-
-        for (type in recordTypes) {
-            val key = "token_${type.qualifiedName}"
-            var token = prefs.getString(key, null)
-            if (token.isNullOrBlank()) {
-                token = createToken(type) ?: continue
-                prefs.edit().putString(key, token).apply()
-                continue
+        val store = object : ChangeTokenStore {
+            override fun get(typeKey: String): String? = prefs.getString(tokenKey(typeKey), null)
+            override fun put(typeKey: String, token: String) {
+                prefs.edit().putString(tokenKey(typeKey), token).apply()
             }
+            override fun remove(typeKey: String) {
+                prefs.edit().remove(tokenKey(typeKey)).apply()
+            }
+        }
+        val source = object : ChangesSource {
+            override suspend fun createToken(typeKey: String): String? =
+                this@HealthChangesTracker.createToken(typesByKey.getValue(typeKey))
 
-            try {
-                var nextToken: String = token
-                var keepReading: Boolean
-                do {
-                    val response = client.getChanges(nextToken)
-                    if (response.changesTokenExpired) {
-                        createToken(type)?.let { prefs.edit().putString(key, it).apply() }
-                        break
+            override suspend fun readPage(typeKey: String, token: String): ChangesPage {
+                val response = client.getChanges(token)
+                if (response.changesTokenExpired) return ChangesPage(tokenExpired = true)
+                val dates = linkedSetOf<LocalDate>()
+                val deletedIds = linkedSetOf<String>()
+                response.changes.forEach { change ->
+                    when (change) {
+                        is UpsertionChange -> dates += affectedDates(change.record, zone)
+                        is DeletionChange -> deletedIds += change.recordId
                     }
-                    response.changes.forEach { change ->
-                        observedChanges++
-                        when (change) {
-                            is UpsertionChange -> dates += affectedDates(change.record, zone)
-                            is DeletionChange -> deletedIds += change.recordId
-                        }
-                    }
-                    keepReading = response.hasMore
-                    val responseToken = response.nextChangesToken
-                    if (keepReading && responseToken.isNullOrBlank()) {
-                        throw IllegalStateException("Health Connect returned hasMore without a continuation token")
-                    }
-                    if (!responseToken.isNullOrBlank()) nextToken = responseToken
-                    if (!keepReading) prefs.edit().putString(key, nextToken).apply()
-                } while (keepReading)
-            } catch (error: Throwable) {
-                if (HealthConnectErrorUtils.isPermissionFailure(error)) {
-                    // Keep other record-type tokens working. If permission is granted later,
-                    // recreate this token and the normal lookback sync will fill recent history.
-                    prefs.edit().remove(key).apply()
-                    continue
                 }
-                throw IllegalStateException(
-                    "Health Connect changes failed for ${type.simpleName}: ${error.message}",
-                    error
+                return ChangesPage(
+                    affectedDates = dates,
+                    deletedRecordIds = deletedIds,
+                    observedChanges = response.changes.size,
+                    hasMore = response.hasMore,
+                    nextToken = response.nextChangesToken
                 )
             }
         }
-
-        return ChangeSet(dates, deletedIds, observedChanges)
+        return ChangesCollector(store, source).collect(typesByKey.keys.toList())
     }
+
+    /** First day still waiting for a re-read after a changes token expired, if any. */
+    fun pendingReconciliationFrom(): LocalDate? =
+        prefs.getString(RECONCILE_FROM_KEY, null)?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+
+    fun setPendingReconciliationFrom(date: LocalDate?) {
+        prefs.edit().apply {
+            if (date == null) remove(RECONCILE_FROM_KEY) else putString(RECONCILE_FROM_KEY, date.toString())
+        }.apply()
+    }
+
+    private fun tokenKey(typeKey: String) = "token_$typeKey"
 
     @Suppress("UNCHECKED_CAST")
     private suspend fun createToken(type: KClass<out Record>): String? = try {
@@ -165,9 +162,7 @@ class HealthChangesTracker(
     }
 
 
-    data class ChangeSet(
-        val affectedDates: Set<LocalDate>,
-        val deletedRecordIds: Set<String>,
-        val observedChanges: Int
-    )
+    private companion object {
+        const val RECONCILE_FROM_KEY = "reconcile_from"
+    }
 }
