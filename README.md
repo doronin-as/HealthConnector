@@ -2,7 +2,7 @@
 
 Android-приложение для сбора персональных health-данных из **Android Health Connect** и импорта пищевого дневника из **FatSecret** в Google Sheets через Google Apps Script.
 
-Текущее состояние: **1.6.8** (`versionCode 22`).
+Текущее состояние: **1.6.34** (`versionCode 48`). Полная история версий — в [CHANGELOG.md](CHANGELOG.md).
 
 > Важно: FatSecret-интеграция работает **не** как подключаемое приложение внутри списка интеграций FatSecret. Отчёт передаётся через Android **«Поделиться» → «FatSecret → Health Connector 2»**.
 
