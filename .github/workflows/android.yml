@@ -28,6 +28,7 @@ jobs:
         run: |
           cp apps-script/Code.gs /tmp/HealthConnectorCode.js
           node --check /tmp/HealthConnectorCode.js
+          node apps-script/tests/google-health-vitals.test.js
           grep -F 'schemaVersion: 3' apps-script/Code.gs
           grep -F "payload.action === 'healthSyncV3'" apps-script/Code.gs
           grep -F "payload.action === 'healthChangesV3'" apps-script/Code.gs

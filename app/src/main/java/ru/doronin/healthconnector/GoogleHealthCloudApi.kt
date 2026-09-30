@@ -8,7 +8,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.time.LocalDate
 
-/** Control plane for the server-side Google Health API OAuth and sleep fallback. */
+/** Control plane for the server-side Google Health API OAuth, sleep fallback and vitals. */
 object GoogleHealthCloudApi {
     data class Status(
         val configured: Boolean,
@@ -17,7 +17,9 @@ object GoogleHealthCloudApi {
         val scope: String?,
         val tokenExpiresAt: String?,
         val lastSyncAt: String?,
-        val lastStatus: String?
+        val lastStatus: String?,
+        /** OAuth grant includes heart rate, HRV, SpO2 and respiratory rate. */
+        val vitalsAuthorized: Boolean
     )
 
     data class ConfigureResult(
@@ -100,6 +102,34 @@ object GoogleHealthCloudApi {
         )
     }
 
+    data class VitalsResult(
+        val date: String,
+        val attempted: Boolean,
+        val fields: Int,
+        val warnings: Int,
+        val reason: String?,
+        val message: String?
+    )
+
+    suspend fun syncVitals(endpoint: String, token: String, date: LocalDate): VitalsResult {
+        val json = postWithRetry(endpoint, vitalsRequest(token, date), attempts = 2)
+        return VitalsResult(
+            date = json.optString("date", date.toString()),
+            attempted = json.optBoolean("attempted", false),
+            fields = json.optJSONArray("fields")?.length() ?: 0,
+            warnings = json.optJSONArray("warnings")?.length() ?: 0,
+            reason = json.optString("reason").trim().takeIf { it.isNotEmpty() },
+            message = json.optString("message").trim().takeIf { it.isNotEmpty() }
+        )
+    }
+
+    fun vitalsRequest(token: String, date: LocalDate): JSONObject = JSONObject().apply {
+        put("action", "googleHealthSyncVitalsV1")
+        put("schemaVersion", 1)
+        put("token", token)
+        put("date", date.toString())
+    }
+
     private suspend fun postWithRetry(
         endpoint: String,
         payload: JSONObject,
@@ -167,7 +197,8 @@ object GoogleHealthCloudApi {
             scope = json.stringOrNull("scope"),
             tokenExpiresAt = json.stringOrNull("tokenExpiresAt"),
             lastSyncAt = json.stringOrNull("lastSyncAt"),
-            lastStatus = json.stringOrNull("lastStatus")
+            lastStatus = json.stringOrNull("lastStatus"),
+            vitalsAuthorized = json.optBoolean("vitalsAuthorized", false)
         )
     }
 

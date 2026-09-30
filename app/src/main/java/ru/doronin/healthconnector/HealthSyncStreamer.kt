@@ -171,6 +171,29 @@ class HealthSyncStreamer(
             if (index + 1 < dates.size) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
         }
 
+        // Fitbit heart rate, HRV, SpO2 and respiratory rate never reach Health Connect.
+        // Ask the server to pull the recent days from Google Health API; it answers
+        // attempted=false when the cloud is not connected, so this is a no-op then.
+        val vitalsDates = dates.filter { !it.isBefore(today.minusDays(GOOGLE_HEALTH_VITALS_DAYS - 1L)) }
+        for (date in vitalsDates) {
+            val response = runCatching {
+                postBody(endpoint, GoogleHealthCloudApi.vitalsRequest(token, date))
+            }.getOrElse { error ->
+                SyncDiagnostics.server(
+                    context,
+                    "Google Health vitals $date: ${error.message ?: error.javaClass.simpleName}",
+                    "WARNING"
+                )
+                null
+            } ?: break
+            if (!response.optBoolean("attempted", false)) {
+                onProgress("Google Health · показатели не загружены: ${response.optString("message", "облако не подключено")}")
+                break
+            }
+            val fields = response.optJSONArray("fields")?.length() ?: 0
+            onProgress("[$date] Google Health · показателей $fields (пульс, HRV, SpO₂, дыхание)")
+        }
+
         return SyncResult(
             days = dates.size,
             workouts = totalWorkouts,
@@ -1744,5 +1767,6 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         private const val HEALTH_CONNECT_READ_RETRIES = 3
         private const val HEALTH_CONNECT_RETRY_BASE_MS = 750L
         private const val HEALTH_CONNECT_DAY_PAUSE_MS = 1000L
+        private const val GOOGLE_HEALTH_VITALS_DAYS = 3
     }
 }
