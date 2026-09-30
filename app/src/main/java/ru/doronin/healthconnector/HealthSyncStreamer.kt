@@ -137,7 +137,7 @@ class HealthSyncStreamer(
                     it.metadata.id.takeIf(String::isNotBlank)
                         ?: "${it.metadata.dataOrigin.packageName}|${it.startTime}|${it.endTime}"
                 }
-                val byWakeDate = deduplicated.groupBy { it.endTime.atZone(zone).toLocalDate() }
+                val byWakeDate = deduplicated.groupBy { SleepMath.wakeDate(it.endTime, zone) }
                 val sources = deduplicated.asSequence()
                     .map { it.sourcePackage() }
                     .filter { it.isNotBlank() }
@@ -1104,13 +1104,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     private fun aggregateSleep(
         records: List<SleepSessionRecord>
     ): SleepAggregation {
-        val intervals = records
-            .filter { it.startTime < it.endTime }
-            .map { SleepInterval(it.startTime, it.endTime) }
-            .sortedBy { it.start }
+        val intervalSummary = SleepMath.summarize(records.map { SleepMath.Interval(it.startTime, it.endTime) })
 
         val stageList = records.flatMap { it.stages }
-        if (intervals.isEmpty()) {
+        if (intervalSummary == null) {
             return SleepAggregation(
                 hours = null,
                 suspicious = false,
@@ -1130,43 +1127,22 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
 
         val stage = deduplicatedStageTotals(records)
-        val rawMillis = intervals.sumOf { Duration.between(it.start, it.end).toMillis() }
-
-        // Union all sleep intervals so overlapping duplicate sessions cannot inflate total sleep.
-        val merged = mutableListOf<SleepInterval>()
-        var currentStart = intervals.first().start
-        var currentEnd = intervals.first().end
-        for (interval in intervals.drop(1)) {
-            if (!interval.start.isAfter(currentEnd)) {
-                if (interval.end > currentEnd) currentEnd = interval.end
-            } else {
-                merged += SleepInterval(currentStart, currentEnd)
-                currentStart = interval.start
-                currentEnd = interval.end
-            }
-        }
-        merged += SleepInterval(currentStart, currentEnd)
-
-        val uniqueMillis = merged.sumOf { Duration.between(it.start, it.end).toMillis() }
-        val uniqueHours = uniqueMillis / 3_600_000.0
+        // SleepMath unions overlapping intervals so duplicate sessions cannot inflate total sleep.
+        val uniqueHours = intervalSummary.uniqueHours
         val suspicious = uniqueHours > MAX_SLEEP_HOURS_PER_DAY
-
-        val main = merged.maxByOrNull { Duration.between(it.start, it.end).toMillis() }
-        val naps = merged.filter { it != main }
-        val mainHours = main?.let { Duration.between(it.start, it.end).toMillis() / 3_600_000.0 }
-        val napMinutes = naps.sumOf { Duration.between(it.start, it.end).toMinutes() }
+        val main = intervalSummary.main
 
         return SleepAggregation(
             hours = if (suspicious) null else uniqueHours,
             suspicious = suspicious,
-            rawHours = rawMillis / 3_600_000.0,
+            rawHours = intervalSummary.rawHours,
             sessionCount = records.size,
             stageCount = stageList.size,
             start = main?.start,
             end = main?.end,
-            mainHours = mainHours,
-            napCount = naps.size,
-            napMinutes = napMinutes,
+            mainHours = intervalSummary.mainHours,
+            napCount = intervalSummary.naps.size,
+            napMinutes = intervalSummary.napMinutes,
             deepMinutes = stage.deepMinutes,
             lightMinutes = stage.lightMinutes,
             remMinutes = stage.remMinutes,
@@ -1276,7 +1252,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         onProgress("[$date] Этап 3/8 · читаю сон…")
         val sleepQueryStart = dayStart.minus(Duration.ofHours(24))
         val wideCandidates = wideSleepRecords
-            .filter { it.endTime.atZone(zone).toLocalDate() == date }
+            .filter { SleepMath.wakeDate(it.endTime, zone) == date }
             .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
         val wideSelected = preferBestSource(wideCandidates)
 
@@ -1293,7 +1269,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             rawRecords = targeted
             records = preferBestSource(
                 targeted
-                    .filter { it.endTime.atZone(zone).toLocalDate() == date }
+                    .filter { SleepMath.wakeDate(it.endTime, zone) == date }
                     .distinctBy { "${it.startTime}|${it.endTime}|${it.sourcePackage()}" }
             )
             path = "targeted-origin-fallback"
@@ -1708,7 +1684,6 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
     }
 
-    private data class SleepInterval(val start: Instant, val end: Instant)
     private data class StageTotals(
         val deepMinutes: Long,
         val lightMinutes: Long,
