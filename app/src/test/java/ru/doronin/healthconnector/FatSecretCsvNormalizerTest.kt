@@ -57,6 +57,32 @@ class FatSecretCsvNormalizerTest {
     }
 
     @Test
+    fun `formula-like food names reach the server verbatim for sheet escaping`() {
+        // The app must not strip, evaluate or pre-escape these: Apps Script's
+        // sheetSafeExternalText_ is the single escaping boundary before Sheets.
+        val foods = listOf(
+            "=HYPERLINK(\"https://evil.example\",\"click\")",
+            "+7 (999) 123-45-67",
+            "-2+3",
+            "@SUM(A1:A9)",
+            "=1+1, with comma"
+        )
+        val foodRows = foods.joinToString("\n") { name ->
+            "\"${name.replace("\"", "\"\"")}\",10,1,,1,,,1"
+        }
+        val source = "# FatSecret export\n# Report Details\n" +
+            "\"September 1, 2026\",50,5,,5,,,5\n" +
+            "Завтрак,50,5,,5,,,5\n" +
+            foodRows + "\n" +
+            "Всего,50,5,,5,,,5"
+
+        val result = FatSecretCsvNormalizer.normalize(source)
+        val names = FatSecretCsvNormalizer.parseCsvRows(result.csvText).map { it.first() }
+
+        foods.forEach { assertTrue("missing $it", names.contains(it)) }
+    }
+
+    @Test
     fun `non FatSecret payload is left untouched`() {
         val source = "a,b\n1,2\n"
         val result = FatSecretCsvNormalizer.normalize(source)

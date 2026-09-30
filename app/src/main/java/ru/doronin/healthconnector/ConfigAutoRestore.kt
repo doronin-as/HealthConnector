@@ -40,18 +40,20 @@ object ConfigAutoRestore {
         val message: String
     )
 
-    private data class Candidate(
+    internal data class Candidate(
         val label: String,
         val modifiedAt: Long,
         val readText: () -> String?
     )
+
+    internal enum class TokenAction { STORE, CLEAR, KEEP }
 
     suspend fun tryAutoRestore(context: Context): RestoreResult = withContext(Dispatchers.IO) {
         val app = context.applicationContext
         val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val existingEndpoint = prefs.getString("endpoint", "").orEmpty().trim()
         val existingToken = SecureTokenStore(app).getToken().trim()
-        if (existingEndpoint.isNotBlank() && existingToken.isNotBlank()) {
+        if (isAlreadyConfigured(existingEndpoint, existingToken)) {
             return@withContext RestoreResult(
                 restored = false,
                 message = "Конфигурация уже настроена"
@@ -63,24 +65,48 @@ object ConfigAutoRestore {
             addAll(appFileCandidates(app))
             addAll(sharedFileCandidates(app))
             addAll(mediaStoreDownloadCandidates(app))
-        }.sortedByDescending { it.modifiedAt }
-
-        for (candidate in candidates) {
-            val raw = runCatching { candidate.readText() }.getOrNull() ?: continue
-            val parsed = runCatching { parse(raw) }.getOrNull() ?: continue
-            apply(app, parsed)
-            return@withContext RestoreResult(
-                restored = true,
-                source = candidate.label,
-                tokenRestored = !parsed.token.isNullOrBlank(),
-                message = "Конфигурация восстановлена из ${candidate.label}"
-            )
         }
 
+        val selected = selectNewestValid(candidates)
+            ?: return@withContext RestoreResult(
+                restored = false,
+                message = "Автоматически доступный JSON-конфиг не найден"
+            )
+        val (candidate, parsed) = selected
+        apply(app, parsed)
         RestoreResult(
-            restored = false,
-            message = "Автоматически доступный JSON-конфиг не найден"
+            restored = true,
+            source = candidate.label,
+            tokenRestored = !parsed.token.isNullOrBlank(),
+            message = "Конфигурация восстановлена из ${candidate.label}"
         )
+    }
+
+    /** Automatic restore must never overwrite an installation that already has endpoint + token. */
+    internal fun isAlreadyConfigured(existingEndpoint: String, existingToken: String): Boolean =
+        existingEndpoint.isNotBlank() && existingToken.isNotBlank()
+
+    /** Newest candidate that can be read and parsed wins; unreadable or invalid files are skipped. */
+    internal fun selectNewestValid(candidates: List<Candidate>): Pair<Candidate, ParsedConfig>? {
+        for (candidate in candidates.sortedByDescending { it.modifiedAt }) {
+            val raw = runCatching { candidate.readText() }.getOrNull() ?: continue
+            val parsed = runCatching { parse(raw) }.getOrNull() ?: continue
+            return candidate to parsed
+        }
+        return null
+    }
+
+    /**
+     * A token from legacy JSON is migrated into [SecureTokenStore]. Without one, the stored
+     * token is kept unless the endpoint changed, since it would belong to another deployment.
+     */
+    internal fun tokenAction(config: ParsedConfig, previousEndpoint: String): TokenAction {
+        val endpointChanged = previousEndpoint.isNotBlank() && previousEndpoint != config.endpoint
+        return when {
+            !config.token.isNullOrBlank() -> TokenAction.STORE
+            endpointChanged -> TokenAction.CLEAR
+            else -> TokenAction.KEEP
+        }
     }
 
     suspend fun importFromUri(context: Context, uri: Uri): RestoreResult = withContext(Dispatchers.IO) {
@@ -145,7 +171,7 @@ object ConfigAutoRestore {
     private fun apply(context: Context, config: ParsedConfig) {
         val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val previousEndpoint = prefs.getString("endpoint", "").orEmpty().trim()
-        val endpointChanged = previousEndpoint.isNotBlank() && previousEndpoint != config.endpoint
+        val tokenAction = tokenAction(config, previousEndpoint)
 
         prefs.edit()
             .putString("endpoint", config.endpoint)
@@ -156,9 +182,10 @@ object ConfigAutoRestore {
             .apply()
 
         val tokenStore = SecureTokenStore(context)
-        when {
-            !config.token.isNullOrBlank() -> tokenStore.setToken(config.token)
-            endpointChanged -> tokenStore.clear()
+        when (tokenAction) {
+            TokenAction.STORE -> tokenStore.setToken(requireNotNull(config.token))
+            TokenAction.CLEAR -> tokenStore.clear()
+            TokenAction.KEEP -> Unit
         }
         BackgroundSyncScheduler.apply(context)
     }

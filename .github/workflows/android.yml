@@ -47,6 +47,8 @@ jobs:
           grep -F 'isMinifyEnabled = true' app/build.gradle.kts
           grep -F 'stableRelease' app/build.gradle.kts
           test ! -e .github/signing/healthconnector-dev.keystore.b64
+      - name: Run Apps Script unit tests
+        run: node --test 'apps-script/tests/*.test.js'
       - name: Run unit tests
         run: gradle :app:testReleaseUnitTest --stacktrace
       - name: Build installable TEST APK
