@@ -4,11 +4,11 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 
 ## P0 — data integrity
 
-- [ ] Replace binary `SyncComplete` semantics with explicit per-day/per-type sync state: COMPLETE / PARTIAL / WAITING_FOR_SOURCE / PERMISSION_BLOCKED / ERROR.
-- [ ] Introduce tri-state metric transport: unavailable, value, authoritative-empty. Do not infer "0" from "no records".
+- [~] Replace binary `SyncComplete` semantics with explicit per-day/per-type sync state: COMPLETE / PARTIAL / WAITING_FOR_SOURCE / PERMISSION_BLOCKED are written to `SyncState`; a failed day stays PARTIAL (no separate ERROR yet).
+- [~] Introduce tri-state metric transport: unavailable, value, authoritative-empty. Do not infer "0" from "no records". Client side done (`TypeReadState`, `ReadTypes`, workout sums); server still has no authoritative-empty write.
 - [ ] Make authoritative zero/delete updates possible without allowing transient empty reads to erase good historical values.
-- [ ] On expired Health Connect changes token, mark the readable lookback window for reconciliation instead of silently starting a new token.
-- [ ] Add generation/reconciliation metadata so a completed day can prove which record types were read.
+- [x] On expired Health Connect changes token, mark the readable lookback window for reconciliation instead of silently starting a new token.
+- [~] Add generation/reconciliation metadata so a completed day can prove which record types were read. `ReadTypes` records per-type read results; no generation counter yet.
 - [ ] Rework deletion reconciliation so stale raw rows and day aggregates are repaired together.
 ## P0 — configuration recovery
 
@@ -72,8 +72,8 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 
 ## Tests required before release
 
-- [ ] Health Connect: empty vs permission denied vs real zero.
-- [ ] Health Connect: expired changes token triggers reconciliation.
+- [x] Health Connect: empty vs permission denied vs real zero.
+- [x] Health Connect: expired changes token triggers reconciliation.
 - [ ] Health Connect: deletion changes clear/recompute affected day.
 - [~] Multiple sources: canonical Fitbit + Google Fit + Mi Fitness package mapping and sleep-origin merge are unit-covered; full end-to-end no-loss validation still required.
 - [ ] Sleep: 30-second stage segments aggregate correctly.

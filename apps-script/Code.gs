@@ -1039,8 +1039,14 @@ function json_(object) {
 
 // ===== Health Connector schema v3 integrity layer =====
 const DAY_HEADERS_V3 = DAY_HEADERS.concat([
-  'MainSleepHours', 'NapCount', 'NapMinutes', 'SyncComplete', 'CompletedAt'
+  'MainSleepHours', 'NapCount', 'NapMinutes', 'SyncComplete', 'CompletedAt',
+  'SyncState', 'ReadTypes'
 ]);
+
+// Per-day sync state written by the Android client. SyncComplete stays the boolean
+// the sync planner reads; SyncState says why a day is not complete.
+const DAY_SYNC_STATES_V3 = Object.freeze(['COMPLETE', 'PARTIAL', 'WAITING_FOR_SOURCE', 'PERMISSION_BLOCKED']);
+const TYPE_READ_STATES_V3 = Object.freeze(['HAS_DATA', 'EMPTY', 'PERMISSION_DENIED']);
 
 const DAY_FIELD_TO_HEADER_V3 = Object.freeze({
   steps: 'Steps',
@@ -1105,7 +1111,10 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   const measurementsSheet = ensureSheet_(spreadsheet, MEASUREMENTS_SHEET, MEASUREMENT_HEADERS);
   const syncedAt = payload.syncedAt || new Date().toISOString();
 
-  upsertDayObjectsPartialV3_(daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete);
+  upsertDayObjectsPartialV3_(
+    daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete,
+    normalizeDaySyncStateV3_(payload.syncState), normalizeReadTypesV3_(payload.readTypes)
+  );
 
   const workoutRows = (payload.workouts || []).map(w => [
     w.id, w.start, w.end, w.exerciseType, nullable_(w.title), Number(w.durationMinutes || 0),
@@ -1147,7 +1156,23 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   };
 }
 
-function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
+function normalizeDaySyncStateV3_(value) {
+  const text = String(value == null ? '' : value).trim().toUpperCase();
+  return DAY_SYNC_STATES_V3.indexOf(text) >= 0 ? text : '';
+}
+
+// Proof of which record types were read for the day, e.g. {"StepsRecord":"HAS_DATA"}.
+function normalizeReadTypesV3_(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const result = {};
+  Object.keys(value).sort().slice(0, 64).forEach(key => {
+    const state = String(value[key] || '').trim().toUpperCase();
+    if (/^[A-Za-z0-9]{1,64}$/.test(key) && TYPE_READ_STATES_V3.indexOf(state) >= 0) result[key] = state;
+  });
+  return Object.keys(result).length ? JSON.stringify(result) : '';
+}
+
+function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete, syncState, readTypes) {
   if (!days.length) return;
   const headers = DAY_HEADERS_V3;
   const headerIndex = new Map(headers.map((value, index) => [value, index]));
@@ -1223,6 +1248,9 @@ function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
     if (typeof dayComplete === 'boolean') {
       row[headerIndex.get('SyncComplete')] = dayComplete;
       row[headerIndex.get('CompletedAt')] = dayComplete ? syncedAt : '';
+      // Older clients send only the boolean; derive the closest state for them.
+      row[headerIndex.get('SyncState')] = syncState || (dayComplete ? 'COMPLETE' : 'PARTIAL');
+      row[headerIndex.get('ReadTypes')] = readTypes || '';
     }
     sheet.getRange(rowNumber, 1, 1, headers.length).setValues([row]);
   });
@@ -1252,6 +1280,7 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
   const headers = sheet.getRange(1, 1, 1, DAY_HEADERS_V3.length).getDisplayValues()[0];
   const dateIndex = headers.indexOf('Date');
   const completeIndex = headers.indexOf('SyncComplete');
+  const stateIndex = headers.indexOf('SyncState');
   const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, DAY_HEADERS_V3.length).getValues();
   const rows = [];
 
@@ -1269,6 +1298,7 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
     rows.push({
       date,
       complete: completeIndex >= 0 ? booleanCellV3_(row[completeIndex]) : null,
+      state: stateIndex >= 0 ? normalizeDaySyncStateV3_(row[stateIndex]) : '',
       coreCoverage
     });
   });
@@ -1295,6 +1325,7 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
   // Interrupted syncs explicitly leave SyncComplete=false.
   let startDate = dates.find(date => byDate.get(date).complete === false) || '';
   let reason = startDate ? 'incomplete-day' : '';
+
 
   // A missing date inside existing history is also a repair point.
   if (!startDate) {
@@ -1346,7 +1377,9 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
     latestDate,
     today,
     reason,
-    message: `Dashboard: последняя дата ${latestDate}; синхронизация с ${startDate}`
+    startDayState: byDate.has(startDate) ? byDate.get(startDate).state : '',
+    message: `Dashboard: последняя дата ${latestDate}; синхронизация с ${startDate}` +
+      (byDate.has(startDate) && byDate.get(startDate).state ? ` (${byDate.get(startDate).state})` : '')
   };
 }
 

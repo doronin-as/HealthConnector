@@ -53,6 +53,7 @@ class HealthSyncStreamer(
     private val aggregateReader = HealthAggregateReader(client)
     private val changesTracker = HealthChangesTracker(context, client)
     private val permissionDeniedTypes = linkedSetOf<String>()
+    private val typeReadStates = linkedMapOf<String, TypeReadState>()
     private var sleepOriginProbeDiagnostic: String = "origin probe: не выполнялся"
 
     suspend fun sync(
@@ -79,7 +80,7 @@ class HealthSyncStreamer(
                 )
                 SyncPlan(fallbackStart, "fallback", "План Dashboard недоступен")
             }
-        val oldestReadable = today.minusDays(29)
+        val oldestReadable = ReconciliationWindow.oldestReadable(today)
         val tableStart = plan.startDate.coerceAtLeast(oldestReadable).coerceAtMost(today)
         // Background remains bounded; manual sync can repair an older incomplete day.
         val requestedStart = if (includeHistoricalChanges) tableStart else tableStart.coerceAtLeast(fallbackStart)
@@ -93,6 +94,25 @@ class HealthSyncStreamer(
         onProgress("${plan.message} · к обработке ${requestedDates.size} дн.")
         onProgress("Проверяю изменения Health Connect…")
         val changes = changesTracker.collect(zone)
+        if (changes.expiredTypes.isNotEmpty()) {
+            val reconcileFrom = ReconciliationWindow.afterTokenExpiry(
+                today,
+                changesTracker.pendingReconciliationFrom()
+            )
+            changesTracker.setPendingReconciliationFrom(reconcileFrom)
+            val expired = changes.expiredTypes.joinToString(", ") { it.substringAfterLast('.') }
+            onProgress("Health Connect: токен изменений истёк ($expired) · перечитываю дни с $reconcileFrom")
+            SyncDiagnostics.server(
+                context,
+                "Changes token expired for $expired; reconciliation scheduled from $reconcileFrom",
+                "WARNING"
+            )
+        }
+        // Survives interrupted runs: the marker only advances as days are actually re-read.
+        val reconciliationDates = ReconciliationWindow.pendingDates(
+            changesTracker.pendingReconciliationFrom(),
+            today
+        )
         val deletionDates = if (changes.deletedRecordIds.isNotEmpty()) {
             postDeletedRecordIds(endpoint, token, changes.deletedRecordIds)
         } else {
@@ -116,6 +136,7 @@ class HealthSyncStreamer(
             addAll(requestedDates)
             addAll(affectedDates)
             addAll(mappedDeletionDates)
+            addAll(reconciliationDates)
         }.filter { !it.isBefore(oldestReadable) && !it.isAfter(today) }
             .distinct()
             .sorted()
@@ -168,6 +189,11 @@ class HealthSyncStreamer(
             totalWorkouts += result.workouts
             totalMeasurements += result.measurements
             allSources += result.sources
+            changesTracker.pendingReconciliationFrom()?.let { pending ->
+                changesTracker.setPendingReconciliationFrom(
+                    ReconciliationWindow.advance(pending, date, today)
+                )
+            }
             if (index + 1 < dates.size) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
         }
 
@@ -188,6 +214,7 @@ class HealthSyncStreamer(
         onProgress: (String) -> Unit
     ): DayResult {
         permissionDeniedTypes.clear()
+        typeReadStates.clear()
         val dayStart = date.atStartOfDay(zone).toInstant()
         val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant()
         val syncedAt = Instant.now().toString()
@@ -334,6 +361,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             )
             sleepSummary = sleepRead.summary
             sleepSessions = sleepRead.sessions
+            // The wide-range path bypasses safeReadAll, so record what sleep proved explicitly.
+            typeReadStates[SleepSessionRecord::class.simpleName!!] = TypeReadState.of(
+                permissionDenied = !isTypeReadable<SleepSessionRecord>(),
+                recordCount = sleepRead.records.size
+            )
         }
 
         // Persist the dashboard-critical part of the day before processing high-frequency data.
@@ -382,7 +414,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 sleepSessions = sleepSessions,
                 measurements = JSONArray(),
                 sources = sources,
-                dayComplete = false
+                syncState = DaySyncState.PARTIAL
             )
             onProgress("[$date] ✓ Ранняя сводка сохранена · день помечен незавершённым")
         }
@@ -658,10 +690,13 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             recentHistoricalDay &&
                 isTypeReadable<SleepSessionRecord>() &&
                 (sleepSummary.sessionCount == 0 || sleepSummary.suspicious || sleepSummary.hours == null)
-        val dayComplete =
-            date.isBefore(todayForCompletion) &&
-                permissionDeniedTypes.isEmpty() &&
-                !sleepNeedsRepair
+        val verdict = DaySyncStateEvaluator.evaluate(
+            date = date,
+            today = todayForCompletion,
+            typeStates = typeReadStates,
+            sleepNeedsRepair = sleepNeedsRepair
+        )
+        val dayComplete = verdict.state.isComplete
 
         onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
         postHealthPayload(
@@ -674,9 +709,13 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             sleepSessions = sleepSessions,
             measurements = JSONArray(),
             sources = sources,
-            dayComplete = dayComplete
+            syncState = verdict.state,
+            readTypes = typeReadStates
         )
         when {
+            verdict.state == DaySyncState.PERMISSION_BLOCKED -> onProgress(
+                "[$date] ✓ Данные сохранены · нет доступа к ${verdict.deniedTypes.joinToString(", ")}; день помечен PERMISSION_BLOCKED"
+            )
             sleepNeedsRepair -> onProgress(
                 "[$date] ↻ День сохранён, но сон ещё не подтверждён Health Connect; оставляю его на повторное восстановление"
             )
@@ -824,28 +863,28 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         // session crossing midnight falls back to a direct range read to preserve the
         // original behavior for the part that is outside the cached day.
         val steps = run {
-            val candidate = if (crossesDayBoundary) safeReadAll<StepsRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<StepsRecord>(start, end, recordState = false)
             else dayRecords.steps.filter { it.startTime < end && it.endTime > start }
-            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.count }
+            val r = preferBestSource(candidate); addSources(r, sources); sumOrNull(r) { it.count.toDouble() }?.toLong()
         }
         val distance = run {
-            val candidate = if (crossesDayBoundary) safeReadAll<DistanceRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<DistanceRecord>(start, end, recordState = false)
             else dayRecords.distance.filter { it.startTime < end && it.endTime > start }
-            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.distance.inKilometers }
+            val r = preferBestSource(candidate); addSources(r, sources); sumOrNull(r) { it.distance.inKilometers }
         }
         val activeCalories = run {
-            val candidate = if (crossesDayBoundary) safeReadAll<ActiveCaloriesBurnedRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<ActiveCaloriesBurnedRecord>(start, end, recordState = false)
             else dayRecords.activeCalories.filter { it.startTime < end && it.endTime > start }
-            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.energy.inKilocalories }
+            val r = preferBestSource(candidate); addSources(r, sources); sumOrNull(r) { it.energy.inKilocalories }
         }
         val totalCalories = run {
-            val candidate = if (crossesDayBoundary) safeReadAll<TotalCaloriesBurnedRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<TotalCaloriesBurnedRecord>(start, end, recordState = false)
             else dayRecords.totalCalories.filter { it.startTime < end && it.endTime > start }
-            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.energy.inKilocalories }
+            val r = preferBestSource(candidate); addSources(r, sources); sumOrNull(r) { it.energy.inKilocalories }
         }
         val heart = run {
             val stats = Stats()
-            val candidate = if (crossesDayBoundary) safeReadAll<HeartRateRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<HeartRateRecord>(start, end, recordState = false)
             else dayRecords.heartRate.filter { it.startTime < end && it.endTime > start }
             val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.beatsPerMinute.toDouble())
@@ -853,7 +892,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         val speed = run {
             val stats = Stats()
-            val candidate = if (crossesDayBoundary) safeReadAll<SpeedRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<SpeedRecord>(start, end, recordState = false)
             else dayRecords.speed.filter { it.startTime < end && it.endTime > start }
             val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.speed.inKilometersPerHour)
@@ -861,7 +900,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         val stepCadence = run {
             val stats = Stats()
-            val candidate = if (crossesDayBoundary) safeReadAll<StepsCadenceRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<StepsCadenceRecord>(start, end, recordState = false)
             else dayRecords.stepCadence.filter { it.startTime < end && it.endTime > start }
             val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.rate)
@@ -869,7 +908,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         val cyclingCadence = run {
             val stats = Stats()
-            val candidate = if (crossesDayBoundary) safeReadAll<CyclingPedalingCadenceRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<CyclingPedalingCadenceRecord>(start, end, recordState = false)
             else dayRecords.cyclingCadence.filter { it.startTime < end && it.endTime > start }
             val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.revolutionsPerMinute)
@@ -877,21 +916,21 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
         val power = run {
             val stats = Stats()
-            val candidate = if (crossesDayBoundary) safeReadAll<PowerRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<PowerRecord>(start, end, recordState = false)
             else dayRecords.power.filter { it.startTime < end && it.endTime > start }
             val r = preferBestSource(candidate); addSources(r, sources)
             for (item in r) for (sample in item.samples) if (sample.time >= start && sample.time <= end) stats.add(sample.power.inWatts)
             stats
         }
         val elevation = run {
-            val candidate = if (crossesDayBoundary) safeReadAll<ElevationGainedRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<ElevationGainedRecord>(start, end, recordState = false)
             else dayRecords.elevation.filter { it.startTime < end && it.endTime > start }
-            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.elevation.inMeters }
+            val r = preferBestSource(candidate); addSources(r, sources); sumOrNull(r) { it.elevation.inMeters }
         }
         val floors = run {
-            val candidate = if (crossesDayBoundary) safeReadAll<FloorsClimbedRecord>(start, end)
+            val candidate = if (crossesDayBoundary) safeReadAll<FloorsClimbedRecord>(start, end, recordState = false)
             else dayRecords.floors.filter { it.startTime < end && it.endTime > start }
-            val r = preferBestSource(candidate); addSources(r, sources); r.sumOf { it.floors }
+            val r = preferBestSource(candidate); addSources(r, sources); sumOrNull(r) { it.floors }
         }
 
         return JSONObject().apply {
@@ -902,10 +941,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             put("title", record.title ?: "")
             put("notes", record.notes ?: "")
             put("durationMinutes", Duration.between(start, end).toMinutes())
-            put("distanceKm", distance)
-            put("steps", steps)
-            put("activeCaloriesKcal", activeCalories)
-            put("totalCaloriesKcal", totalCalories)
+            putNullable("distanceKm", distance)
+            putNullable("steps", steps)
+            putNullable("activeCaloriesKcal", activeCalories)
+            putNullable("totalCaloriesKcal", totalCalories)
             putNullable("averageHeartRate", heart.average())
             putNullable("minimumHeartRate", heart.min)
             putNullable("maximumHeartRate", heart.max)
@@ -917,8 +956,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             putNullable("maximumCyclingCadence", cyclingCadence.max)
             putNullable("averagePowerW", power.average())
             putNullable("maximumPowerW", power.max)
-            put("elevationGainedM", elevation)
-            put("floorsClimbed", floors)
+            putNullable("elevationGainedM", elevation)
+            putNullable("floorsClimbed", floors)
             put("segmentsJson", JSONArray(record.segments.map { it.toString() }).toString())
             put("lapsJson", JSONArray(record.laps.map { it.toString() }).toString())
             put("routeState", record.exerciseRouteResult.javaClass.simpleName)
@@ -1000,7 +1039,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         sleepSessions: JSONArray,
         measurements: JSONArray,
         sources: Set<String>,
-        dayComplete: Boolean? = null
+        syncState: DaySyncState? = null,
+        readTypes: Map<String, TypeReadState> = emptyMap()
     ): JSONObject? {
         val body = JSONObject().apply {
             put("token", token)
@@ -1014,7 +1054,16 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             put("workouts", workouts)
             put("sleepSessions", sleepSessions)
             put("measurements", measurements)
-            if (dayComplete != null) put("dayComplete", dayComplete)
+            if (syncState != null) {
+                // dayComplete stays for Apps Script deployments that predate syncState.
+                put("dayComplete", syncState.isComplete)
+                put("syncState", syncState.name)
+            }
+            if (readTypes.isNotEmpty()) {
+                put("readTypes", JSONObject().apply {
+                    readTypes.forEach { (type, state) -> put(type, state.name) }
+                })
+            }
             put("sources", JSONArray().apply {
                 sources.sortedBy { sourcePriority(it) }.forEach { pkg ->
                     put(JSONObject().apply {
@@ -1415,14 +1464,21 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         return HealthSourceCatalog.displayName(packageName)
     }
 
-    private suspend inline fun <reified T : Record> safeReadAll(start: Instant, end: Instant): List<T> {
+    private suspend inline fun <reified T : Record> safeReadAll(
+        start: Instant,
+        end: Instant,
+        recordState: Boolean = true
+    ): List<T> {
         var lastError: Exception? = null
         repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
             try {
-                return readAll(start, end)
+                val records = readAll<T>(start, end)
+                if (recordState) noteTypeRead<T>(TypeReadState.of(false, records.size))
+                return records
             } catch (error: Exception) {
                 if (HealthConnectErrorUtils.isPermissionFailure(error)) {
                     permissionDeniedTypes += typeKey<T>()
+                    if (recordState) noteTypeRead<T>(TypeReadState.PERMISSION_DENIED)
                     return emptyList()
                 }
                 lastError = error
@@ -1513,6 +1569,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
 
         sleepOriginProbeDiagnostic = "origin probe: " + diagnostics.joinToString("; ")
         return merged.values.toList()
+    }
+
+    private inline fun <reified T : Record> noteTypeRead(state: TypeReadState) {
+        val key = T::class.simpleName ?: return
+        typeReadStates[key] = TypeReadState.merge(typeReadStates[key], state)
     }
 
     private inline fun <reified T : Record> typeKey(): String =
