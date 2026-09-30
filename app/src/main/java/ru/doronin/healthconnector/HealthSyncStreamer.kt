@@ -37,6 +37,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import kotlin.reflect.KClass
 
 /**
  * Memory-bounded Health Connect synchronizer.
@@ -1464,21 +1465,30 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         return HealthSourceCatalog.displayName(packageName)
     }
 
+    // Thin inline wrapper: the read itself is a regular function so syncDay's bytecode
+    // stays under the JVM 64 KB method limit.
     private suspend inline fun <reified T : Record> safeReadAll(
         start: Instant,
         end: Instant,
         recordState: Boolean = true
+    ): List<T> = safeReadAll(T::class, start, end, recordState)
+
+    private suspend fun <T : Record> safeReadAll(
+        type: KClass<T>,
+        start: Instant,
+        end: Instant,
+        recordState: Boolean
     ): List<T> {
         var lastError: Exception? = null
         repeat(HEALTH_CONNECT_READ_RETRIES) { attempt ->
             try {
-                val records = readAll<T>(start, end)
-                if (recordState) noteTypeRead<T>(TypeReadState.of(false, records.size))
+                val records = readAll(type, start, end)
+                if (recordState) noteTypeRead(type, TypeReadState.of(false, records.size))
                 return records
             } catch (error: Exception) {
                 if (HealthConnectErrorUtils.isPermissionFailure(error)) {
-                    permissionDeniedTypes += typeKey<T>()
-                    if (recordState) noteTypeRead<T>(TypeReadState.PERMISSION_DENIED)
+                    permissionDeniedTypes += type.qualifiedName ?: type.simpleName ?: "unknown"
+                    if (recordState) noteTypeRead(type, TypeReadState.PERMISSION_DENIED)
                     return emptyList()
                 }
                 lastError = error
@@ -1488,7 +1498,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             }
         }
         throw IllegalStateException(
-            "Health Connect: ошибка чтения ${T::class.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
+            "Health Connect: ошибка чтения ${type.simpleName}: ${lastError?.message ?: "неизвестная ошибка"}",
             lastError
         )
     }
@@ -1571,8 +1581,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         return merged.values.toList()
     }
 
-    private inline fun <reified T : Record> noteTypeRead(state: TypeReadState) {
-        val key = T::class.simpleName ?: return
+    private fun noteTypeRead(type: KClass<out Record>, state: TypeReadState) {
+        val key = type.simpleName ?: return
         typeReadStates[key] = TypeReadState.merge(typeReadStates[key], state)
     }
 
@@ -1595,13 +1605,20 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         start: Instant,
         end: Instant,
         dataOriginFilter: Set<DataOrigin> = emptySet()
+    ): List<T> = readAll(T::class, start, end, dataOriginFilter)
+
+    private suspend fun <T : Record> readAll(
+        type: KClass<T>,
+        start: Instant,
+        end: Instant,
+        dataOriginFilter: Set<DataOrigin> = emptySet()
     ): List<T> {
         val all = ArrayList<T>()
         var pageToken: String? = null
         do {
             val response = client.readRecords(
                 ReadRecordsRequest(
-                    recordType = T::class,
+                    recordType = type,
                     timeRangeFilter = TimeRangeFilter.between(start, end),
                     dataOriginFilter = dataOriginFilter,
                     pageSize = HEALTH_CONNECT_PAGE_SIZE,
