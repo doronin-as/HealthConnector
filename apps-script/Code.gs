@@ -174,6 +174,9 @@ function doPost(e) {
     if (payload.action === 'googleHealthRepairSleepV1') {
       return json_(googleHealthRepairSleepV1_(spreadsheet, logSheet, payload));
     }
+    if (payload.action === 'googleHealthSyncVitalsV1') {
+      return json_(googleHealthSyncVitalsActionV1_(spreadsheet, logSheet, payload));
+    }
     if (payload.action === 'fitbitCloudStatusV1') {
       return json_({ ok: true, status: fitbitStatusV1_() });
     }
@@ -1437,6 +1440,12 @@ const GOOGLE_HEALTH_V1 = Object.freeze({
   SOURCE_PACKAGE: 'google.health.api',
   SOURCE_NAME: 'Google Health API',
   SLEEP_SCOPE: 'https://www.googleapis.com/auth/googlehealth.sleep.readonly',
+  // Heart rate, resting HR, HRV, SpO2 and respiratory rate. Fitbit/Google Health
+  // does not write these to Health Connect, so the cloud is their only source.
+  VITALS_SCOPE: 'https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly',
+  ACTIVITY_SCOPE: 'https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly',
+  SCHEDULED_DAYS: 3,
+  MAX_MANUAL_DAYS: 30,
   TOKEN_SKEW_MS: 120000,
   OAUTH_STATE_TTL_MS: 20 * 60 * 1000
 });
@@ -1515,7 +1524,11 @@ function getGoogleHealthAuthorizationUrlV1_() {
     ['client_id', clientId],
     ['redirect_uri', redirectUri],
     ['response_type', 'code'],
-    ['scope', GOOGLE_HEALTH_V1.SLEEP_SCOPE],
+    ['scope', [
+      GOOGLE_HEALTH_V1.SLEEP_SCOPE,
+      GOOGLE_HEALTH_V1.VITALS_SCOPE,
+      GOOGLE_HEALTH_V1.ACTIVITY_SCOPE
+    ].join(' ')],
     ['access_type', 'offline'],
     ['prompt', 'consent'],
     ['include_granted_scopes', 'true'],
@@ -1558,7 +1571,8 @@ function googleHealthHandleOAuthCallbackV1_(e) {
     });
     props.deleteProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE);
     props.deleteProperty(GOOGLE_HEALTH_PROP.OAUTH_STATE_AT);
-    props.setProperty(GOOGLE_HEALTH_PROP.LAST_STATUS, 'OAuth подключён; Google Health готов к синхронизации сна');
+    props.setProperty(GOOGLE_HEALTH_PROP.LAST_STATUS, 'OAuth подключён; Google Health готов к синхронизации сна и показателей');
+    try { googleHealthInstallTriggerV1(); } catch (_) {}
     return json_({
       ok: true,
       googleHealth: true,
@@ -1589,7 +1603,10 @@ function googleHealthStatusV1_() {
     scope: props.getProperty(GOOGLE_HEALTH_PROP.SCOPE) || '',
     tokenExpiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
     lastSyncAt: props.getProperty(GOOGLE_HEALTH_PROP.LAST_SYNC_AT) || null,
-    lastStatus: props.getProperty(GOOGLE_HEALTH_PROP.LAST_STATUS) || ''
+    lastStatus: props.getProperty(GOOGLE_HEALTH_PROP.LAST_STATUS) || '',
+    vitalsAuthorized: String(props.getProperty(GOOGLE_HEALTH_PROP.SCOPE) || '')
+      .split(/\s+/)
+      .indexOf(GOOGLE_HEALTH_V1.VITALS_SCOPE) >= 0
   };
 }
 
@@ -1846,6 +1863,335 @@ function googleHealthRepairSleepV1_(spreadsheet, logSheet, payload) {
       ? 'Сон восстановлен из Google Health API'
       : 'Google Health API не вернул сон за эту дату'
   };
+}
+
+// ===== Google Health API vitals v1 =====
+//
+// Fitbit/Google Health does not write heart rate, resting heart rate, HRV, SpO2
+// or respiratory rate to Health Connect, so HC_Дни stays empty for them unless
+// they are fetched from the cloud. This pulls them per day and upserts them
+// additively: a metric the API did not return never clears a stored value.
+const GOOGLE_HEALTH_VITALS_V1 = Object.freeze({
+  HEART_RATE: { type: 'heart-rate', field: 'heartRate', filter: 'heart_rate.sample_time.civil_time', pageSize: 10000, maxPages: 10 },
+  RESTING_HEART_RATE: { type: 'daily-resting-heart-rate', field: 'dailyRestingHeartRate', filter: 'daily_resting_heart_rate.date', daily: true },
+  HRV_DAILY: { type: 'daily-heart-rate-variability', field: 'dailyHeartRateVariability', filter: 'daily_heart_rate_variability.date', daily: true },
+  HRV_SAMPLES: { type: 'heart-rate-variability', field: 'heartRateVariability', filter: 'heart_rate_variability.sample_time.civil_time', pageSize: 10000, maxPages: 5 },
+  SPO2_DAILY: { type: 'daily-oxygen-saturation', field: 'dailyOxygenSaturation', filter: 'daily_oxygen_saturation.date', daily: true },
+  SPO2_SAMPLES: { type: 'oxygen-saturation', field: 'oxygenSaturation', filter: 'oxygen_saturation.sample_time.civil_time', pageSize: 10000, maxPages: 5 },
+  RESPIRATORY_DAILY: { type: 'daily-respiratory-rate', field: 'dailyRespiratoryRate', filter: 'daily_respiratory_rate.date', daily: true },
+  RESPIRATORY_SLEEP: { type: 'respiratory-rate-sleep-summary', field: 'respiratoryRateSleepSummary', filter: 'respiratory_rate_sleep_summary.date', daily: true }
+});
+
+function googleHealthNumberV1_(object, keys) {
+  if (!object || typeof object !== 'object') return null;
+  for (let i = 0; i < keys.length; i++) {
+    const raw = String(keys[i]).split('.').reduce((value, key) => value == null ? value : value[key], object);
+    if (raw === null || raw === undefined || raw === '') continue;
+    const number = Number(raw);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function googleHealthStatsV1_(values) {
+  const finite = values.filter(value => Number.isFinite(value));
+  if (!finite.length) return { avg: null, min: null, max: null, count: 0 };
+  const sum = finite.reduce((total, value) => total + value, 0);
+  return {
+    avg: sum / finite.length,
+    min: Math.min.apply(null, finite),
+    max: Math.max.apply(null, finite),
+    count: finite.length
+  };
+}
+
+function googleHealthDateMatchesV1_(dateObject, date) {
+  if (!dateObject || typeof dateObject !== 'object' || !dateObject.year) return true;
+  const key = String(dateObject.year).padStart(4, '0') + '-' +
+    String(dateObject.month || 0).padStart(2, '0') + '-' +
+    String(dateObject.day || 0).padStart(2, '0');
+  return key === date;
+}
+
+/** Returns the payload of each data point (point[spec.field]) for one civil date. */
+function googleHealthListVitalsV1_(spec, date, next) {
+  const filter = spec.filter + ' >= "' + date + '" AND ' + spec.filter + ' < "' + next + '"';
+  const base = GOOGLE_HEALTH_V1.API_BASE + '/users/me/dataTypes/' + spec.type + '/dataPoints';
+  const values = [];
+  let pageToken = '';
+  let pages = 0;
+  do {
+    let url = base + '?pageSize=' + (spec.pageSize || 100) + '&filter=' + encodeURIComponent(filter);
+    if (pageToken) url += '&pageToken=' + encodeURIComponent(pageToken);
+    const json = googleHealthFetchJsonV1_(url, true);
+    (Array.isArray(json.dataPoints) ? json.dataPoints : []).forEach(point => {
+      const value = point && point[spec.field];
+      if (!value) return;
+      if (spec.daily && !googleHealthDateMatchesV1_(value.date, date)) return;
+      values.push(value);
+    });
+    pageToken = String(json.nextPageToken || '');
+    pages++;
+  } while (pageToken && pages < (spec.maxPages || 3));
+  return values;
+}
+
+/**
+ * Pure transform from Google Health data points to an HC_Дни day object and
+ * daily HC_Измерения rows. `points` maps GOOGLE_HEALTH_VITALS_V1 keys to the
+ * arrays googleHealthListVitalsV1_ returned; missing keys mean "not fetched".
+ */
+function googleHealthBuildVitalsDayV1_(date, points, syncedAt) {
+  const day = { date: date };
+  const fields = new Set();
+  const measurements = [];
+  const list = key => Array.isArray(points[key]) ? points[key] : [];
+
+  function field(name, value) {
+    if (value === null || value === undefined || (typeof value === 'number' && !Number.isFinite(value))) return;
+    day[name] = value;
+    fields.add(name);
+  }
+  function measurement(type, value, unit) {
+    if (value === null || value === undefined || !Number.isFinite(value)) return;
+    measurements.push({
+      id: 'google-health|' + type + '|' + date,
+      time: date + 'T12:00:00',
+      start: null,
+      end: null,
+      type: type,
+      value: value,
+      unit: unit,
+      sourcePackage: GOOGLE_HEALTH_V1.SOURCE_PACKAGE,
+      sourceName: GOOGLE_HEALTH_V1.SOURCE_NAME,
+      syncedAt: syncedAt
+    });
+  }
+
+  const heart = googleHealthStatsV1_(list('HEART_RATE').map(p => googleHealthNumberV1_(p, ['beatsPerMinute'])));
+  if (heart.count) {
+    field('averageHeartRate', heart.avg);
+    field('minimumHeartRate', heart.min);
+    field('maximumHeartRate', heart.max);
+    field('heartRateSamples', heart.count);
+    measurement('HeartRateDailyAvg', heart.avg, 'bpm');
+  }
+
+  const resting = list('RESTING_HEART_RATE')
+    .map(p => googleHealthNumberV1_(p, ['beatsPerMinute']))
+    .filter(value => value != null);
+  if (resting.length) {
+    field('restingHeartRate', resting[resting.length - 1]);
+    measurement('RestingHeartRate', resting[resting.length - 1], 'bpm');
+  }
+
+  // Daily summaries are the canonical nightly values; samples give min/max/count.
+  function dailyWithSamples(dailyKey, dailyKeys, sampleKey, sampleKeys) {
+    const daily = list(dailyKey).map(p => googleHealthNumberV1_(p, dailyKeys)).filter(v => v != null);
+    const samples = googleHealthStatsV1_(list(sampleKey).map(p => googleHealthNumberV1_(p, sampleKeys)));
+    if (samples.count) {
+      return { avg: daily.length ? daily[daily.length - 1] : samples.avg, min: samples.min, max: samples.max, count: samples.count };
+    }
+    if (daily.length) {
+      const value = daily[daily.length - 1];
+      return { avg: value, min: value, max: value, count: 1 };
+    }
+    return null;
+  }
+
+  const hrv = dailyWithSamples(
+    'HRV_DAILY', ['averageHeartRateVariabilityMilliseconds', 'rootMeanSquareOfSuccessiveDifferencesMilliseconds'],
+    'HRV_SAMPLES', ['rootMeanSquareOfSuccessiveDifferencesMilliseconds']
+  );
+  if (hrv) {
+    field('averageHrvRmssdMs', hrv.avg);
+    field('minimumHrvRmssdMs', hrv.min);
+    field('maximumHrvRmssdMs', hrv.max);
+    field('hrvSamples', hrv.count);
+    measurement('HRV_RMSSD_Daily', hrv.avg, 'ms');
+  }
+
+  const spo2Keys = ['percentage', 'percentageHealth', 'averagePercentage', 'value'];
+  const spo2 = dailyWithSamples('SPO2_DAILY', spo2Keys, 'SPO2_SAMPLES', spo2Keys);
+  if (spo2) {
+    field('averageSpO2', spo2.avg);
+    field('minimumSpO2', spo2.min);
+    field('maximumSpO2', spo2.max);
+    field('spO2Samples', spo2.count);
+    measurement('SpO2DailyAvg', spo2.avg, '%');
+  }
+
+  const respiratoryDaily = list('RESPIRATORY_DAILY')
+    .map(p => googleHealthNumberV1_(p, ['breathsPerMinute', 'averageBreathsPerMinute', 'value']))
+    .filter(value => value != null);
+  const sleepStats = list('RESPIRATORY_SLEEP').map(p => {
+    const stats = p.respiratoryRateSleepSummaryStatistics ||
+      (Array.isArray(p.statistics) ? p.statistics[0] : p.statistics) || {};
+    return {
+      avg: googleHealthNumberV1_(stats, ['average', 'averageBreathsPerMinute']),
+      min: googleHealthNumberV1_(stats, ['minimum', 'minimumBreathsPerMinute']),
+      max: googleHealthNumberV1_(stats, ['maximum', 'maximumBreathsPerMinute'])
+    };
+  }).filter(stats => stats.avg != null || stats.min != null || stats.max != null);
+  const respiratoryAvg = respiratoryDaily.length
+    ? respiratoryDaily[respiratoryDaily.length - 1]
+    : (sleepStats.length ? sleepStats[sleepStats.length - 1].avg : null);
+  if (respiratoryAvg != null) {
+    const mins = sleepStats.map(s => s.min).filter(v => v != null);
+    const maxs = sleepStats.map(s => s.max).filter(v => v != null);
+    field('averageRespiratoryRate', respiratoryAvg);
+    field('minimumRespiratoryRate', mins.length ? Math.min.apply(null, mins) : respiratoryAvg);
+    field('maximumRespiratoryRate', maxs.length ? Math.max.apply(null, maxs) : respiratoryAvg);
+    field('respiratorySamples', Math.max(respiratoryDaily.length, sleepStats.length));
+    measurement('RespiratoryRateDaily', respiratoryAvg, 'breaths/min');
+  }
+
+  if (fields.size) {
+    day.sourcePackages = [GOOGLE_HEALTH_V1.SOURCE_PACKAGE];
+    fields.add('sourcePackages');
+  }
+  day.availableFields = Array.from(fields);
+  return { day: day, measurements: measurements };
+}
+
+function googleHealthSyncVitalsDateV1_(spreadsheet, logSheet, date) {
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  const next = addDaysToDateKeyV3_(date, 1, tz);
+  const syncedAt = new Date().toISOString();
+  const points = {};
+  const warnings = [];
+
+  Object.keys(GOOGLE_HEALTH_VITALS_V1).forEach(key => {
+    const spec = GOOGLE_HEALTH_VITALS_V1[key];
+    try {
+      points[key] = googleHealthListVitalsV1_(spec, date, next);
+    } catch (error) {
+      warnings.push(spec.type + ': ' + String(error && error.message || error).slice(0, 200));
+    }
+  });
+
+  const built = googleHealthBuildVitalsDayV1_(date, points, syncedAt);
+  const metricFields = built.day.availableFields.filter(name => name !== 'sourcePackages');
+  if (metricFields.length) {
+    importHealthPayloadV3_(spreadsheet, logSheet, {
+      action: 'healthSyncV3',
+      deviceId: 'GoogleHealthAPI',
+      rangeStart: date,
+      rangeEnd: date,
+      syncedAt: syncedAt,
+      days: [built.day],
+      workouts: [],
+      sleepSessions: [],
+      measurements: built.measurements,
+      sources: [{ packageName: GOOGLE_HEALTH_V1.SOURCE_PACKAGE, name: GOOGLE_HEALTH_V1.SOURCE_NAME }]
+      // No dayComplete: cloud enrichment must not change Health Connect sync state.
+    });
+  }
+  if (warnings.length) {
+    logSheet.appendRow([
+      new Date(), 'GoogleHealthAPI', date, date, metricFields.length ? 1 : 0, 0, 'WARNING',
+      sheetSafeExternalText_('Google Health vitals partial: ' + warnings.join(' | ').slice(0, 1500))
+    ]);
+  }
+  return { date: date, fields: metricFields, measurements: built.measurements.length, warnings: warnings };
+}
+
+function googleHealthSyncVitalsActionV1_(spreadsheet, logSheet, payload) {
+  const date = String(payload && payload.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('googleHealthSyncVitalsV1: некорректная дата');
+
+  const status = googleHealthStatusV1_();
+  if (!status.configured || !status.authorized || !status.vitalsAuthorized) {
+    return {
+      ok: true,
+      attempted: false,
+      date: date,
+      fields: [],
+      reason: !status.configured ? 'google-health-not-configured'
+        : !status.authorized ? 'google-health-not-authorized'
+        : 'google-health-vitals-scope-missing',
+      message: status.authorized && !status.vitalsAuthorized
+        ? 'Google Health: нужна повторная авторизация для пульса, HRV, SpO₂ и дыхания'
+        : 'Google Health Cloud пока не подключён'
+    };
+  }
+
+  const result = googleHealthSyncVitalsDateV1_(spreadsheet, logSheet, date);
+  googleHealthRecordVitalsStatusV1_([result]);
+  return {
+    ok: true,
+    attempted: true,
+    date: date,
+    fields: result.fields,
+    measurements: result.measurements,
+    warnings: result.warnings,
+    message: result.fields.length
+      ? 'Google Health: показателей ' + result.fields.length
+      : 'Google Health не вернул показатели за эту дату'
+  };
+}
+
+function googleHealthRecordVitalsStatusV1_(results) {
+  const withData = results.filter(item => item.fields.length).length;
+  const warnings = results.reduce((sum, item) => sum + item.warnings.length, 0);
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(GOOGLE_HEALTH_PROP.LAST_SYNC_AT, new Date().toISOString());
+  props.setProperty(
+    GOOGLE_HEALTH_PROP.LAST_STATUS,
+    'OK: показатели ' + withData + '/' + results.length + ' дн.; предупреждений ' + warnings
+  );
+}
+
+/** Manual backfill from the Apps Script editor; also used by the scheduled trigger. */
+function googleHealthSyncRecentV1(days) {
+  const safeDays = Math.max(1, Math.min(GOOGLE_HEALTH_V1.MAX_MANUAL_DAYS, Number(days || GOOGLE_HEALTH_V1.SCHEDULED_DAYS)));
+  const status = googleHealthStatusV1_();
+  if (!status.authorized) throw new Error('Google Health не авторизован');
+  if (!status.vitalsAuthorized) throw new Error('Google Health: нужна повторная авторизация для показателей');
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) throw new Error('Google Health sync: сервер занят другой синхронизацией');
+  try {
+    googleHealthAccessTokenV1_();
+    const spreadsheet = getSpreadsheet_();
+    const logSheet = ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS);
+    const tz = spreadsheet.getSpreadsheetTimeZone();
+    const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+    const results = [];
+    for (let offset = safeDays - 1; offset >= 0; offset--) {
+      results.push(googleHealthSyncVitalsDateV1_(spreadsheet, logSheet, addDaysToDateKeyV3_(today, -offset, tz)));
+    }
+    googleHealthRecordVitalsStatusV1_(results);
+    return { ok: true, days: results.length, results: results };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+function googleHealthScheduledSyncV1() {
+  try {
+    return googleHealthSyncRecentV1(GOOGLE_HEALTH_V1.SCHEDULED_DAYS);
+  } catch (error) {
+    PropertiesService.getScriptProperties().setProperty(
+      GOOGLE_HEALTH_PROP.LAST_STATUS,
+      'ERROR: ' + String(error && error.message || error)
+    );
+    throw error;
+  }
+}
+
+function googleHealthInstallTriggerV1() {
+  googleHealthRemoveTriggerV1();
+  ScriptApp.newTrigger('googleHealthScheduledSyncV1').timeBased().everyHours(6).create();
+  return { ok: true, message: 'Google Health sync trigger: каждые 6 часов' };
+}
+
+function googleHealthRemoveTriggerV1() {
+  let removed = 0;
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === 'googleHealthScheduledSyncV1')
+    .forEach(trigger => { ScriptApp.deleteTrigger(trigger); removed++; });
+  return { ok: true, removed };
 }
 
 // ===== Fitbit Web API connector v1 =====

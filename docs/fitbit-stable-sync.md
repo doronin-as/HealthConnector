@@ -17,6 +17,17 @@ HealthConnector uses two independent health-data paths so a change in Google Hea
 
 Google Health currently writes sleep and sleep stages to Health Connect but does not write heart rate, HRV, SpO2, respiratory rate, or resting heart rate. Those Fitbit metrics therefore must not depend on Health Connect alone.
 
+## Google Health API vitals
+
+The Google Health API connector (the in-app **Google Health Cloud** card) now also fills heart rate (average, min, max, sample count), resting heart rate, HRV, SpO2 and respiratory rate in `HC_Дни`, plus one daily row per metric in `HC_Измерения` (`google-health|<type>|<date>`). It needs the `googlehealth.health_metrics_and_measurements.readonly` and `googlehealth.activity_and_fitness.readonly` scopes, so an existing sleep-only authorization must be repeated once; the app says so in the card status.
+
+It runs three ways, all additive (a metric the API does not return never clears a stored value):
+- after every app sync, for the synced days within the last three days (`googleHealthSyncVitalsV1`);
+- from the card's **Загрузить сон и показатели за 7 дней** button;
+- every six hours for the last three days (`googleHealthScheduledSyncV1`, installed on OAuth callback or with `googleHealthInstallTriggerV1()`); `googleHealthSyncRecentV1(days)` backfills up to 30 days from the editor.
+
+Endpoints that fail (for example a data type the account has no data for) are logged as one `WARNING` row in `HC_Журнал` and do not stop the other metrics.
+
 ## Fitbit Web API setup
 
 1. Register a Fitbit Developer application for personal use.

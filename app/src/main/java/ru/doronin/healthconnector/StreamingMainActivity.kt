@@ -490,7 +490,7 @@ class StreamingMainActivity : AppCompatActivity() {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         content.addView(TextView(this).apply {
-            text = "Необязательный резервный источник сна. Обычно приложение сначала читает сон напрямую из Health Connect; Google Health используется только если локальные записи отсутствуют."
+            text = "Облачный источник пульса, пульса покоя, HRV, SpO₂ и частоты дыхания: Fitbit не передаёт их в Health Connect. Для сна это резерв, если Health Connect не вернул записи."
             textSize = 13f
             alpha = 0.72f
             setPadding(0, dp(6), 0, dp(8))
@@ -536,7 +536,7 @@ class StreamingMainActivity : AppCompatActivity() {
             setOnClickListener { openGoogleHealthAuthorization() }
         })
         content.addView(com.google.android.material.button.MaterialButton(this).apply {
-            text = "Восстановить сон за 7 дней"
+            text = "Загрузить сон и показатели за 7 дней"
             setOnClickListener { repairGoogleHealthSleep(days = 7) }
         })
         content.addView(com.google.android.material.button.MaterialButton(this).apply {
@@ -599,7 +599,12 @@ class StreamingMainActivity : AppCompatActivity() {
                         "и добавь Redirect URI выше. В OAuth consent screen добавь себя как test user."
                 )
             } else if (!status.authorized) {
-                append("\n\nНажми «Авторизовать Google Health» и разреши доступ к данным сна.")
+                append("\n\nНажми «Авторизовать Google Health» и разреши доступ ко сну и показателям здоровья.")
+            } else if (!status.vitalsAuthorized) {
+                append(
+                    "\n\nПульс, HRV, SpO₂ и дыхание ещё не разрешены. Нажми «Авторизовать Google Health» " +
+                        "ещё раз и отметь все запрошенные разрешения."
+                )
             }
         }
     }
@@ -665,13 +670,14 @@ class StreamingMainActivity : AppCompatActivity() {
 
             var repairedDays = 0
             var sessions = 0
+            var vitalsDays = 0
             var failures = 0
             var totalHours = 0.0
             val today = java.time.LocalDate.now()
             for (offset in (safeDays - 1) downTo 0) {
                 val date = today.minusDays(offset.toLong())
                 googleHealthStatusText?.text =
-                    "Google Health · восстанавливаю сон за $date…\n" +
+                    "Google Health · загружаю сон и показатели за $date…\n" +
                         "Успешно: $repairedDays · ошибок: $failures"
                 runCatching {
                     GoogleHealthCloudApi.repairSleep(credentials.first, credentials.second, date)
@@ -684,11 +690,22 @@ class StreamingMainActivity : AppCompatActivity() {
                 }.onFailure {
                     failures++
                 }
+                if (status.vitalsAuthorized) {
+                    runCatching {
+                        GoogleHealthCloudApi.syncVitals(credentials.first, credentials.second, date)
+                    }.onSuccess {
+                        if (it.fields > 0) vitalsDays++
+                    }.onFailure {
+                        failures++
+                    }
+                }
             }
 
             googleHealthStatusText?.text =
-                "Google Health · восстановление завершено: дней $repairedDays/$safeDays, " +
-                    "сессий $sessions, сна %.1f ч, ошибок $failures.".format(totalHours)
+                "Google Health · загрузка завершена: сон $repairedDays/$safeDays дн., " +
+                    "сессий $sessions, сна %.1f ч; ".format(totalHours) +
+                    (if (status.vitalsAuthorized) "показатели $vitalsDays/$safeDays дн.; " else "показатели не разрешены; ") +
+                    "ошибок $failures."
             refreshDashboardSnapshot(showStatus = false)
             refreshGoogleHealthStatus(showLoading = false)
         }
