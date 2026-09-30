@@ -139,4 +139,62 @@ class SyncCompletenessTest {
             ReconciliationWindow.advance(stale, today.minusDays(29), today)
         )
     }
+
+    @Test
+    fun ordinarySyncNeverClearsStoredValues() {
+        val clears = AuthoritativeDayRules.clearFields(
+            state = DaySyncState.COMPLETE,
+            reReadForReconciliation = false,
+            typeStates = mapOf("StepsRecord" to TypeReadState.EMPTY),
+            presentFields = emptySet(),
+            zeroValuedFields = emptySet()
+        )
+        assertTrue(clears.isEmpty())
+    }
+
+    @Test
+    fun incompleteReconciliationNeverClearsStoredValues() {
+        for (state in listOf(DaySyncState.PARTIAL, DaySyncState.WAITING_FOR_SOURCE, DaySyncState.PERMISSION_BLOCKED)) {
+            val clears = AuthoritativeDayRules.clearFields(
+                state = state,
+                reReadForReconciliation = true,
+                typeStates = mapOf("StepsRecord" to TypeReadState.EMPTY),
+                presentFields = emptySet(),
+                zeroValuedFields = emptySet()
+            )
+            assertTrue("$state must not clear", clears.isEmpty())
+        }
+    }
+
+    @Test
+    fun completeReconciliationClearsEmptiedTypesAndSendsRealZeros() {
+        val clears = AuthoritativeDayRules.clearFields(
+            state = DaySyncState.COMPLETE,
+            reReadForReconciliation = true,
+            typeStates = mapOf(
+                "StepsRecord" to TypeReadState.HAS_DATA,
+                "WeightRecord" to TypeReadState.EMPTY,
+                "ExerciseSessionRecord" to TypeReadState.EMPTY
+            ),
+            presentFields = setOf("steps"),
+            zeroValuedFields = setOf("steps")
+        )
+        assertEquals(setOf("steps", "weightKg", "workoutCount", "workoutMinutes"), clears)
+    }
+
+    @Test
+    fun readableTypeWithoutDayFieldsIsClearedButPresentOnesAreKept() {
+        // Heart-rate records overlapped the day but had no samples inside it.
+        val clears = AuthoritativeDayRules.clearFields(
+            state = DaySyncState.COMPLETE,
+            reReadForReconciliation = true,
+            typeStates = mapOf("HeartRateRecord" to TypeReadState.HAS_DATA, "Vo2MaxRecord" to TypeReadState.HAS_DATA),
+            presentFields = setOf("vo2Max"),
+            zeroValuedFields = emptySet()
+        )
+        assertEquals(
+            setOf("averageHeartRate", "minimumHeartRate", "maximumHeartRate", "heartRateSamples"),
+            clears
+        )
+    }
 }

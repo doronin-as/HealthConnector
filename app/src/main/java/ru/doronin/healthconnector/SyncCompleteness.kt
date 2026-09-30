@@ -134,3 +134,71 @@ object ReconciliationWindow {
         return if (next.isAfter(today)) null else next
     }
 }
+
+/**
+ * A day re-read because Health Connect reported deletions for it, or because the change log was
+ * lost, is authoritative: once it is COMPLETE, what was read is the whole truth for that day.
+ * Only then may the server clear stored values, accept a real zero over an older positive value,
+ * and drop raw rows the re-read no longer contains. Ordinary syncs stay additive so a transient
+ * empty read never erases good history.
+ */
+object AuthoritativeDayRules {
+    /** Day-summary fields produced from each record type (keys match Apps Script DAY_FIELD_TO_HEADER_V3). */
+    val DAY_FIELDS_BY_TYPE: Map<String, List<String>> = mapOf(
+        "StepsRecord" to listOf("steps"),
+        "DistanceRecord" to listOf("distanceKm"),
+        "ActiveCaloriesBurnedRecord" to listOf("activeCaloriesKcal"),
+        "TotalCaloriesBurnedRecord" to listOf("totalCaloriesKcal"),
+        "ElevationGainedRecord" to listOf("elevationGainedM"),
+        "FloorsClimbedRecord" to listOf("floorsClimbed"),
+        "SleepSessionRecord" to listOf(
+            "sleepHours", "deepSleepMinutes", "lightSleepMinutes", "remSleepMinutes", "awakeMinutes",
+            "sleepStart", "sleepEnd", "sleepSessionCount", "sleepStageCount", "mainSleepHours",
+            "napCount", "napMinutes"
+        ),
+        "HeartRateRecord" to listOf("averageHeartRate", "minimumHeartRate", "maximumHeartRate", "heartRateSamples"),
+        "RestingHeartRateRecord" to listOf("restingHeartRate"),
+        "OxygenSaturationRecord" to listOf("averageSpO2", "minimumSpO2", "maximumSpO2", "spO2Samples"),
+        "HeartRateVariabilityRmssdRecord" to listOf(
+            "averageHrvRmssdMs", "minimumHrvRmssdMs", "maximumHrvRmssdMs", "hrvSamples"
+        ),
+        "RespiratoryRateRecord" to listOf(
+            "averageRespiratoryRate", "minimumRespiratoryRate", "maximumRespiratoryRate", "respiratorySamples"
+        ),
+        "Vo2MaxRecord" to listOf("vo2Max"),
+        "SkinTemperatureRecord" to listOf(
+            "skinTempBaselineC", "averageSkinTempDeltaC", "minimumSkinTempDeltaC",
+            "maximumSkinTempDeltaC", "skinTempSamples"
+        ),
+        "SpeedRecord" to listOf("averageSpeedKmh", "maximumSpeedKmh"),
+        "StepsCadenceRecord" to listOf("averageStepCadence", "maximumStepCadence"),
+        "CyclingPedalingCadenceRecord" to listOf("averageCyclingCadence", "maximumCyclingCadence"),
+        "PowerRecord" to listOf("averagePowerW", "maximumPowerW"),
+        "WeightRecord" to listOf("weightKg"),
+        "ExerciseSessionRecord" to listOf("workoutCount", "workoutMinutes")
+    )
+
+    fun isAuthoritative(state: DaySyncState, reReadForReconciliation: Boolean): Boolean =
+        reReadForReconciliation && state == DaySyncState.COMPLETE
+
+    /**
+     * Fields the server should overwrite even with empty or zero: fields of readable types that
+     * the re-read did not produce (cleared), plus produced fields whose value is a real zero.
+     */
+    fun clearFields(
+        state: DaySyncState,
+        reReadForReconciliation: Boolean,
+        typeStates: Map<String, TypeReadState>,
+        presentFields: Set<String>,
+        zeroValuedFields: Set<String>
+    ): Set<String> {
+        if (!isAuthoritative(state, reReadForReconciliation)) return emptySet()
+        val result = sortedSetOf<String>()
+        typeStates.forEach { (type, readState) ->
+            if (readState == TypeReadState.PERMISSION_DENIED) return@forEach
+            DAY_FIELDS_BY_TYPE[type].orEmpty().filterTo(result) { it !in presentFields }
+        }
+        result += zeroValuedFields.filter { it in presentFields }
+        return result
+    }
+}

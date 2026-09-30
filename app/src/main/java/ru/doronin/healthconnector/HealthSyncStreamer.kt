@@ -173,6 +173,13 @@ class HealthSyncStreamer(
                 byWakeDate
             }
 
+        // Days whose re-read is authoritative: Health Connect reported deletions there, or the
+        // change log covering them was lost with an expired token.
+        val reconciliationDateSet = linkedSetOf<LocalDate>().apply {
+            addAll(deletionDates)
+            addAll(reconciliationDates)
+        }
+
         var totalWorkouts = 0
         var totalMeasurements = 0
         val allSources = linkedSetOf<String>()
@@ -185,6 +192,7 @@ class HealthSyncStreamer(
                 date = date,
                 zone = zone,
                 wideSleepRecords = wideSleepRecordsByWakeDate[date].orEmpty(),
+                reReadForReconciliation = date in reconciliationDateSet,
                 onProgress = onProgress
             )
             totalWorkouts += result.workouts
@@ -212,6 +220,7 @@ class HealthSyncStreamer(
         date: LocalDate,
         zone: ZoneId,
         wideSleepRecords: List<SleepSessionRecord>,
+        reReadForReconciliation: Boolean,
         onProgress: (String) -> Unit
     ): DayResult {
         permissionDeniedTypes.clear()
@@ -698,6 +707,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             sleepNeedsRepair = sleepNeedsRepair
         )
         val dayComplete = verdict.state.isComplete
+        val authoritative = applyAuthoritativeFields(dayObject, verdict.state, reReadForReconciliation)
 
         onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
         postHealthPayload(
@@ -711,7 +721,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             measurements = JSONArray(),
             sources = sources,
             syncState = verdict.state,
-            readTypes = typeReadStates
+            readTypes = typeReadStates,
+            reconcileWindow = if (authoritative) dayStart to dayEnd else null
         )
         when {
             verdict.state == DaySyncState.PERMISSION_BLOCKED -> onProgress(
@@ -733,6 +744,34 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             measurements = batcher.totalCount,
             sources = sources
         )
+    }
+
+    /**
+     * On an authoritative re-read, marks fields the server must overwrite even with empty or
+     * zero values. Returns whether the day is authoritative (raw rows may then be swept too).
+     * Kept out of syncDay so that method stays under the JVM size limit.
+     */
+    private fun applyAuthoritativeFields(
+        dayObject: JSONObject,
+        state: DaySyncState,
+        reReadForReconciliation: Boolean
+    ): Boolean {
+        if (!AuthoritativeDayRules.isAuthoritative(state, reReadForReconciliation)) return false
+        val availableJson = dayObject.optJSONArray("availableFields") ?: JSONArray()
+        val present = (0 until availableJson.length()).mapTo(linkedSetOf()) { availableJson.getString(it) }
+        val zeroValued = present.filterTo(linkedSetOf()) { key ->
+            (dayObject.opt(key) as? Number)?.toDouble() == 0.0
+        }
+        val clears = AuthoritativeDayRules.clearFields(state, true, typeReadStates, present, zeroValued)
+        for (key in clears) {
+            if (key !in present) {
+                dayObject.put(key, JSONObject.NULL)
+                availableJson.put(key)
+            }
+        }
+        dayObject.put("availableFields", availableJson)
+        if (clears.isNotEmpty()) dayObject.put("clearFields", JSONArray(clears.toList()))
+        return true
     }
 
     private fun buildDaySummaryObject(
@@ -1041,7 +1080,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         measurements: JSONArray,
         sources: Set<String>,
         syncState: DaySyncState? = null,
-        readTypes: Map<String, TypeReadState> = emptyMap()
+        readTypes: Map<String, TypeReadState> = emptyMap(),
+        reconcileWindow: Pair<Instant, Instant>? = null
     ): JSONObject? {
         val body = JSONObject().apply {
             put("token", token)
@@ -1059,6 +1099,12 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 // dayComplete stays for Apps Script deployments that predate syncState.
                 put("dayComplete", syncState.isComplete)
                 put("syncState", syncState.name)
+            }
+            if (reconcileWindow != null) {
+                put("reconcileWindow", JSONObject().apply {
+                    put("start", reconcileWindow.first.toString())
+                    put("end", reconcileWindow.second.toString())
+                })
             }
             if (readTypes.isNotEmpty()) {
                 put("readTypes", JSONObject().apply {

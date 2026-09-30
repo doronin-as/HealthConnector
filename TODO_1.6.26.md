@@ -6,10 +6,10 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 
 - [~] Replace binary `SyncComplete` semantics with explicit per-day/per-type sync state: COMPLETE / PARTIAL / WAITING_FOR_SOURCE / PERMISSION_BLOCKED are written to `SyncState`; a failed day stays PARTIAL (no separate ERROR yet).
 - [~] Introduce tri-state metric transport: unavailable, value, authoritative-empty. Do not infer "0" from "no records". Client side done (`TypeReadState`, `ReadTypes`, workout sums); server still has no authoritative-empty write.
-- [ ] Make authoritative zero/delete updates possible without allowing transient empty reads to erase good historical values.
+- [x] Make authoritative zero/delete updates possible without allowing transient empty reads to erase good historical values. Only COMPLETE re-reads of deletion/reconciliation days send `clearFields`.
 - [x] On expired Health Connect changes token, mark the readable lookback window for reconciliation instead of silently starting a new token.
 - [~] Add generation/reconciliation metadata so a completed day can prove which record types were read. `ReadTypes` records per-type read results; no generation counter yet.
-- [ ] Rework deletion reconciliation so stale raw rows and day aggregates are repaired together.
+- [x] Rework deletion reconciliation so stale raw rows and day aggregates are repaired together. Authoritative re-reads sweep raw rows not rewritten by the sync and clear emptied day fields.
 ## P0 — configuration recovery
 
 - [x] Add first-launch automatic search for `healthconnector-config*.json` in locations readable by the current Android installation.
@@ -74,7 +74,7 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 
 - [x] Health Connect: empty vs permission denied vs real zero.
 - [x] Health Connect: expired changes token triggers reconciliation.
-- [ ] Health Connect: deletion changes clear/recompute affected day.
+- [x] Health Connect: deletion changes clear/recompute affected day.
 - [~] Multiple sources: canonical Fitbit + Google Fit + Mi Fitness package mapping and sleep-origin merge are unit-covered; full end-to-end no-loss validation still required.
 - [ ] Sleep: 30-second stage segments aggregate correctly.
 - [ ] Sleep: overnight session and DST/travel timezone cases.

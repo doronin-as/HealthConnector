@@ -1139,10 +1139,17 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   upsertByKey_(sleepSheet, sleepRows, 1);
   upsertByKey_(measurementsSheet, measurementRows, 1);
 
+  // A complete re-read of a day proves which raw rows still exist in Health Connect.
+  // Rows for that day not touched by this sync were deleted at the source.
+  const swept = payload.reconcileWindow
+    ? sweepStaleDayRowsV3_(measurementsSheet, sleepSheet, workoutsSheet, payload.reconcileWindow, syncedAt)
+    : null;
+
   logSheet.appendRow([
     new Date(), payload.deviceId || '', payload.rangeStart || '', payload.rangeEnd || '',
     (payload.days || []).length, workoutRows.length, 'OK',
-    `V3 partial sync: сон ${sleepRows.length}; измерения ${measurementRows.length}`
+    `V3 partial sync: сон ${sleepRows.length}; измерения ${measurementRows.length}` +
+      (swept ? `; удалено устаревших: изм. ${swept.measurements}, сон ${swept.sleep}, трен. ${swept.workouts}` : '')
   ]);
 
   return {
@@ -1152,6 +1159,7 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
     workouts: workoutRows.length,
     sleepSessions: sleepRows.length,
     measurements: measurementRows.length,
+    swept,
     message: `V3: дней ${(payload.days || []).length}; тренировок ${workoutRows.length}; сна ${sleepRows.length}; измерений ${measurementRows.length}`
   };
 }
@@ -1458,6 +1466,93 @@ function isoDateKeyV3_(value, tz) {
   return isNaN(d) ? '' : Utilities.formatDate(d, tz, 'yyyy-MM-dd');
 }
 
+
+// Rows written by cloud connectors never come from the phone, so a phone re-read
+// cannot prove them stale.
+const CLOUD_SOURCE_PACKAGES_V3 = Object.freeze(['google.health.api', 'fitbit.webapi']);
+const MAX_RECONCILE_WINDOW_MS = 26 * 60 * 60 * 1000;
+const SYNCED_AT_TOLERANCE_MS = 1000;
+
+// Column layout (0-based) used to date and age a raw row in each sheet.
+const STALE_ROW_SPECS_V3 = Object.freeze({
+  measurement: Object.freeze({ timeColumns: [1, 2], sourceColumn: 7, syncedColumn: 9 }),
+  sleep: Object.freeze({ timeColumns: [2], sourceColumn: 12, syncedColumn: 14 }),
+  workout: Object.freeze({ timeColumns: [1], sourceColumn: 6, syncedColumn: 7 })
+});
+
+function cellTimeMsV3_(value) {
+  if (value instanceof Date) return isNaN(value) ? null : value.getTime();
+  const text = String(value == null ? '' : value).trim();
+  if (!text) return null;
+  const ms = Date.parse(text);
+  return isNaN(ms) ? null : ms;
+}
+
+// Returns 0-based indexes of rows dated inside [startMs, endMs) that the current sync
+// (syncedAtMs) did not rewrite. Rows with an unreadable date or SyncedAt are kept.
+function staleRowIndexesV3_(values, spec, startMs, endMs, syncedAtMs) {
+  const result = [];
+  values.forEach((row, index) => {
+    const source = String(row[spec.sourceColumn] || '').trim();
+    if (CLOUD_SOURCE_PACKAGES_V3.indexOf(source) >= 0) return;
+    let timeMs = null;
+    for (let i = 0; i < spec.timeColumns.length && timeMs === null; i++) {
+      timeMs = cellTimeMsV3_(row[spec.timeColumns[i]]);
+    }
+    if (timeMs === null || timeMs < startMs || timeMs >= endMs) return;
+    const rowSyncedMs = cellTimeMsV3_(row[spec.syncedColumn]);
+    // Sheets may turn the ISO text into a Date and round it; a second of slack keeps
+    // rows written by this very sync.
+    if (rowSyncedMs === null || rowSyncedMs >= syncedAtMs - SYNCED_AT_TOLERANCE_MS) return;
+    result.push(index);
+  });
+  return result;
+}
+
+function parseReconcileWindowV3_(window) {
+  if (!window || typeof window !== 'object') return null;
+  const startMs = cellTimeMsV3_(window.start);
+  const endMs = cellTimeMsV3_(window.end);
+  if (startMs === null || endMs === null || endMs <= startMs) return null;
+  if (endMs - startMs > MAX_RECONCILE_WINDOW_MS) return null;
+  return { startMs, endMs };
+}
+
+function sweepStaleDayRowsV3_(measurementsSheet, sleepSheet, workoutsSheet, window, syncedAt) {
+  const parsed = parseReconcileWindowV3_(window);
+  const syncedAtMs = cellTimeMsV3_(syncedAt);
+  if (!parsed || syncedAtMs === null) return null;
+  const sweep = (sheet, spec) => {
+    if (!sheet || sheet.getLastRow() < 2) return 0;
+    const width = Math.min(sheet.getLastColumn(), spec.syncedColumn + 1);
+    if (width <= spec.syncedColumn) return 0;
+    const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
+    const indexes = staleRowIndexesV3_(values, spec, parsed.startMs, parsed.endMs, syncedAtMs);
+    deleteRowIndexesV3_(sheet, indexes);
+    return indexes.length;
+  };
+  return {
+    measurements: sweep(measurementsSheet, STALE_ROW_SPECS_V3.measurement),
+    sleep: sweep(sleepSheet, STALE_ROW_SPECS_V3.sleep),
+    workouts: sweep(workoutsSheet, STALE_ROW_SPECS_V3.workout)
+  };
+}
+
+// Deletes data rows (0-based indexes below the header) bottom-up, one call per contiguous run.
+function deleteRowIndexesV3_(sheet, indexes) {
+  const rows = indexes.map(index => index + 2).sort((a, b) => b - a);
+  let i = 0;
+  while (i < rows.length) {
+    let first = rows[i];
+    let count = 1;
+    while (i + count < rows.length && rows[i + count] === first - 1) {
+      first--;
+      count++;
+    }
+    sheet.deleteRows(first, count);
+    i += count;
+  }
+}
 
 // ===== Google Health API connector v1 =====
 //
