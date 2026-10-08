@@ -107,6 +107,11 @@ class StreamingMainActivity : AppCompatActivity() {
         }
     }
 
+    private val notificationLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) binding.status.text = "Уведомления выключены: управление переносом доступно в приложении"
+        ManualSyncScheduler.enqueue(applicationContext)
+    }
+
     private val permissionLauncher = registerForActivityResult(
         PermissionController.createRequestPermissionResultContract()
     ) { granted ->
@@ -174,12 +179,35 @@ class StreamingMainActivity : AppCompatActivity() {
             if (settings.endpoint.isBlank() || settings.token.isBlank()) {
                 binding.status.text = "Укажи URL Apps Script и токен"
             } else {
-                // Manual sync must read Health Connect while the app is in the
-                // foreground. WorkManager is reserved for periodic background
-                // syncs that have explicit Background Read capability/grant.
-                lifecycleScope.launch { synchronize(settings) }
+                lifecycleScope.launch {
+                    if (!backgroundReadAvailable()) {
+                        binding.status.text = "Health Connect не поддерживает фоновое чтение на этом устройстве"
+                        return@launch
+                    }
+                    val granted = client.permissionController.getGrantedPermissions()
+                    if (HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND !in granted) {
+                        binding.status.text = "Разреши чтение Health Connect в фоне, затем нажми синхронизацию снова"
+                        permissionLauncher.launch(requestedPermissions())
+                        return@launch
+                    }
+                    if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                        androidx.core.content.ContextCompat.checkSelfPermission(this@StreamingMainActivity,
+                            android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        notificationLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                    } else {
+                        ManualSyncScheduler.enqueue(applicationContext)
+                    }
+                }
             }
         }
+        (binding.sync.parent as? LinearLayout)?.addView(android.widget.Button(this).apply {
+            text = "Остановить ручную синхронизацию"
+            setOnClickListener {
+                androidx.work.WorkManager.getInstance(applicationContext)
+                    .cancelUniqueWork(ManualSyncScheduler.UNIQUE_WORK_NAME)
+                binding.status.text = "Останавливаю синхронизацию…"
+            }
+        })
         setupManualSyncObserver()
         refreshDashboardSnapshot()
     }
@@ -188,7 +216,7 @@ class StreamingMainActivity : AppCompatActivity() {
         androidx.work.WorkManager.getInstance(this)
             .getWorkInfosForUniqueWorkLiveData(ManualSyncScheduler.UNIQUE_WORK_NAME)
             .observe(this) { works ->
-                val work = works.lastOrNull() ?: return@observe
+                val work = works.firstOrNull { !it.state.isFinished } ?: works.firstOrNull() ?: return@observe
                 val progress = work.progress.getString(ManualSyncWorker.KEY_PROGRESS).orEmpty()
                 when (work.state) {
                     androidx.work.WorkInfo.State.ENQUEUED, androidx.work.WorkInfo.State.BLOCKED ->
@@ -205,7 +233,7 @@ class StreamingMainActivity : AppCompatActivity() {
                         val error = work.outputData.getString(ManualSyncWorker.KEY_ERROR) ?: "неизвестная ошибка"
                         binding.status.text = "Ошибка синхронизации: $error"
                     }
-                    androidx.work.WorkInfo.State.CANCELLED -> binding.status.text = "Синхронизация отменена системой"
+                    androidx.work.WorkInfo.State.CANCELLED -> binding.status.text = "Синхронизация остановлена. Принятые сервером данные сохранены"
                 }
             }
     }
@@ -1057,6 +1085,17 @@ class StreamingMainActivity : AppCompatActivity() {
             setPadding(0, dp(8), 0, 0)
         }.also(content::addView)
 
+        content.addView(android.widget.Button(this).apply {
+            text = "Настройки батареи приложения"
+            setOnClickListener {
+                startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:$packageName")))
+            }
+        })
+        content.addView(TextView(this).apply {
+            text = "Для длительного переноса разреши уведомления и фоновую работу в настройках батареи. На Xiaomi также проверь автозапуск. Принудительная остановка приложения в Android прерывает перенос."
+            textSize = 12f
+        })
         card.addView(content)
         container.addView(card)
         refreshBackgroundInfo()

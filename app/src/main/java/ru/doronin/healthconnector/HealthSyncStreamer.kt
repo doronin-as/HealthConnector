@@ -26,6 +26,9 @@ import androidx.health.connect.client.records.WeightRecord
 import androidx.health.connect.client.records.metadata.DataOrigin
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -1032,12 +1035,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         val action = body.optString("action", "healthSync")
         var attempt = 0
         while (true) {
+            currentCoroutineContext().ensureActive()
             attempt++
             try {
                 SyncDiagnostics.server(context, "Запрос $action, попытка $attempt/4")
-                val result = withContext(Dispatchers.IO) {
-                    val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
-                    val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
+                val result = CancellableHttp.withConnection(EndpointSecurity.requireHttps(endpoint)) { connection ->
                     try {
                         connection.instanceFollowRedirects = true
                         connection.requestMethod = "POST"
@@ -1054,7 +1056,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                         val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
                             ?.bufferedReader()?.use { it.readText() }.orEmpty()
                         if (code !in 200..299) error("HTTP $code")
-                        if (response.isBlank()) return@withContext null
+                        if (response.isBlank()) return@withConnection null
                         val json = runCatching { JSONObject(response) }.getOrNull()
                         if (json?.optBoolean("ok", true) == false) {
                             val errorCode = json.optString("errorCode")
@@ -1068,6 +1070,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 }
                 SyncDiagnostics.server(context, "Ответ $action получен", "OK")
                 return result
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Throwable) {
                 val retryable = isRetryableRequestError(error)
                 if (!retryable || attempt >= 4) {
