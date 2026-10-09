@@ -54,12 +54,28 @@ class HealthSyncStreamer(
     private val changesTracker = HealthChangesTracker(context, client)
     private val permissionDeniedTypes = linkedSetOf<String>()
     private var sleepOriginProbeDiagnostic: String = "origin probe: не выполнялся"
+    private val sourceNameCache = HashMap<String, String>()
 
+    /**
+     * Runs on [Dispatchers.Default] whatever the caller's dispatcher is: JSON building,
+     * sleep aggregation and per-sample statistics must never run on the main thread.
+     * [onProgress] is therefore invoked off the main thread; UI callers must post to it.
+     */
     suspend fun sync(
         endpoint: String,
         token: String,
         days: Int,
         includeHistoricalChanges: Boolean = true,
+        onProgress: (String) -> Unit
+    ): SyncResult = withContext(Dispatchers.Default) {
+        syncInternal(endpoint, token, days, includeHistoricalChanges, onProgress)
+    }
+
+    private suspend fun syncInternal(
+        endpoint: String,
+        token: String,
+        days: Int,
+        includeHistoricalChanges: Boolean,
         onProgress: (String) -> Unit
     ): SyncResult {
         val safeDays = days.coerceIn(1, 30)
@@ -170,6 +186,9 @@ class HealthSyncStreamer(
             allSources += result.sources
             if (index + 1 < dates.size) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
         }
+
+        // Every day implied by the change feed was uploaded; only now advance the tokens.
+        changesTracker.commit(changes)
 
         return SyncResult(
             days = dates.size,
@@ -981,7 +1000,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 put("schemaVersion", 3)
                 put("deletedRecordIds", JSONArray(chunk))
             }
-            val response = postBody(endpoint, body) ?: continue
+            // An empty response must fail the run: otherwise the change tokens would be
+            // committed and these deletions would never be retried.
+            val response = postBody(endpoint, body)
+                ?: error("Apps Script не подтвердил удаление записей Health Connect")
             val dates = response.optJSONArray("affectedDates") ?: continue
             for (i in 0 until dates.length()) {
                 runCatching { LocalDate.parse(dates.getString(i)) }.getOrNull()?.let(result::add)
@@ -1404,7 +1426,12 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     private fun sourcePriority(packageName: String): Int =
         HealthSourceCatalog.priority(packageName)
 
-    private fun sourceName(packageName: String): String {
+    // Called for every emitted measurement; PackageManager lookups are binder IPC,
+    // so resolve each package once per sync.
+    private fun sourceName(packageName: String): String =
+        sourceNameCache.getOrPut(packageName) { resolveSourceName(packageName) }
+
+    private fun resolveSourceName(packageName: String): String {
         if (packageName.isBlank()) return "Неизвестный источник"
         val installed = runCatching {
             val info = context.packageManager.getApplicationInfo(packageName, 0)

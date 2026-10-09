@@ -849,7 +849,7 @@ function upsertFatSecretMeals_(sheet, parsed, fileName, spreadsheet) {
         else seen.add(key);
       }
     });
-    rowsToDelete.sort((a, b) => b - a).forEach(r => sheet.deleteRow(r));
+    deleteRowRuns_(sheet, rowsToDelete);
   }
 
   const existing = new Map();
@@ -951,6 +951,7 @@ function ensureSheet_(spreadsheet, name, headers) {
 
 function upsertByKey_(sheet, rows, keyColumnOneBased) {
   if (!rows.length) return;
+  const width = rows[0].length;
   const lastRow = sheet.getLastRow();
   const keyIndex = keyColumnOneBased - 1;
   const existing = new Map();
@@ -962,20 +963,55 @@ function upsertByKey_(sheet, rows, keyColumnOneBased) {
     });
   }
 
+  // Updates are collected first and written as contiguous blocks: a re-synced day
+  // touches thousands of adjacent rows, and one setValues per row is the main cost.
+  const updates = new Map();
+  const appendIndex = new Map();
   const appends = [];
   rows.forEach(row => {
     const key = String(row[keyIndex] || '').trim();
     if (!key) return;
     const existingRow = existing.get(key);
     if (existingRow) {
-      sheet.getRange(existingRow, 1, 1, row.length).setValues([row]);
+      updates.set(existingRow, row);
+    } else if (appendIndex.has(key)) {
+      // The same key twice in one payload: last value wins instead of a duplicate row.
+      appends[appendIndex.get(key)] = row;
     } else {
+      appendIndex.set(key, appends.length);
       appends.push(row);
     }
   });
+
+  writeRowRuns_(sheet, updates, width);
   if (appends.length) {
-    sheet.getRange(sheet.getLastRow() + 1, 1, appends.length, appends[0].length)
+    sheet.getRange(sheet.getLastRow() + 1, 1, appends.length, width)
       .setValues(appends);
+  }
+}
+
+/** Writes rows keyed by 1-based row number, one setValues per contiguous run. */
+function writeRowRuns_(sheet, rowsByNumber, width) {
+  const numbers = Array.from(rowsByNumber.keys()).sort((a, b) => a - b);
+  let i = 0;
+  while (i < numbers.length) {
+    let j = i;
+    while (j + 1 < numbers.length && numbers[j + 1] === numbers[j] + 1) j++;
+    const block = numbers.slice(i, j + 1).map(n => rowsByNumber.get(n));
+    sheet.getRange(numbers[i], 1, block.length, width).setValues(block);
+    i = j + 1;
+  }
+}
+
+/** Deletes 1-based row numbers, one deleteRows per contiguous run, bottom-up. */
+function deleteRowRuns_(sheet, rowNumbers) {
+  const numbers = Array.from(new Set(rowNumbers)).sort((a, b) => b - a);
+  let i = 0;
+  while (i < numbers.length) {
+    let j = i;
+    while (j + 1 < numbers.length && numbers[j + 1] === numbers[j] - 1) j++;
+    sheet.deleteRows(numbers[j], j - i + 1);
+    i = j + 1;
   }
 }
 
@@ -1393,14 +1429,13 @@ function handleHealthChangesV3_(spreadsheet, logSheet, payload) {
 function deleteChangedRowsV3_(sheet, ids, kind, affected, tz) {
   if (!sheet || sheet.getLastRow() < 2) return 0;
   const idSet = new Set(ids);
-  const idPrefixes = ids.map(id => `${id}|`);
   const width = Math.min(4, sheet.getLastColumn());
   const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
   const rows = [];
 
   values.forEach((row, index) => {
     const id = String(row[0] || '');
-    const match = idSet.has(id) || idPrefixes.some(prefix => id.startsWith(prefix));
+    const match = changedIdMatches_(idSet, id);
     if (!match) return;
     rows.push(index + 2);
 
@@ -1412,8 +1447,23 @@ function deleteChangedRowsV3_(sheet, ids, kind, affected, tz) {
     if (dateKey) affected.add(dateKey);
   });
 
-  rows.sort((a, b) => b - a).forEach(row => sheet.deleteRow(row));
+  deleteRowRuns_(sheet, rows);
   return rows.length;
+}
+
+/**
+ * Raw measurement ids are `<recordId>|<suffix>`. Instead of testing every deleted id
+ * as a prefix of every row (O(rows × ids)), test each `|`-delimited prefix of the row id
+ * against a Set. Equivalent to the old startsWith(`${id}|`) check.
+ */
+function changedIdMatches_(idSet, id) {
+  if (idSet.has(id)) return true;
+  let pipe = id.indexOf('|');
+  while (pipe > 0) {
+    if (idSet.has(id.slice(0, pipe))) return true;
+    pipe = id.indexOf('|', pipe + 1);
+  }
+  return false;
 }
 
 function isoDateKeyV3_(value, tz) {

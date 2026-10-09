@@ -67,6 +67,7 @@ class HealthChangesTracker(
     suspend fun collect(zone: ZoneId): ChangeSet {
         val dates = linkedSetOf<LocalDate>()
         val deletedIds = linkedSetOf<String>()
+        val pendingTokens = linkedMapOf<String, String>()
         var observedChanges = 0
 
         for (type in recordTypes) {
@@ -84,7 +85,7 @@ class HealthChangesTracker(
                 do {
                     val response = client.getChanges(nextToken)
                     if (response.changesTokenExpired) {
-                        createToken(type)?.let { prefs.edit().putString(key, it).apply() }
+                        createToken(type)?.let { pendingTokens[key] = it }
                         break
                     }
                     response.changes.forEach { change ->
@@ -100,7 +101,10 @@ class HealthChangesTracker(
                         throw IllegalStateException("Health Connect returned hasMore without a continuation token")
                     }
                     if (!responseToken.isNullOrBlank()) nextToken = responseToken
-                    if (!keepReading) prefs.edit().putString(key, nextToken).apply()
+                    // Do not persist here: the token is advanced only after the caller has
+                    // uploaded the dates/deletions it implies (see commit()). A failed sync
+                    // therefore re-reads the same changes instead of silently losing them.
+                    if (!keepReading && nextToken != token) pendingTokens[key] = nextToken
                 } while (keepReading)
             } catch (error: Throwable) {
                 if (HealthConnectErrorUtils.isPermissionFailure(error)) {
@@ -116,7 +120,15 @@ class HealthChangesTracker(
             }
         }
 
-        return ChangeSet(dates, deletedIds, observedChanges)
+        return ChangeSet(dates, deletedIds, observedChanges, pendingTokens)
+    }
+
+    /** Persists the change tokens returned by [collect] once their changes were synced. */
+    fun commit(changes: ChangeSet) {
+        if (changes.pendingTokens.isEmpty()) return
+        val editor = prefs.edit()
+        changes.pendingTokens.forEach { (key, token) -> editor.putString(key, token) }
+        editor.apply()
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -168,6 +180,7 @@ class HealthChangesTracker(
     data class ChangeSet(
         val affectedDates: Set<LocalDate>,
         val deletedRecordIds: Set<String>,
-        val observedChanges: Int
+        val observedChanges: Int,
+        val pendingTokens: Map<String, String> = emptyMap()
     )
 }
