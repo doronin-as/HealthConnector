@@ -49,9 +49,15 @@ object SyncRunGate {
 }
 
 object SyncDiagnostics {
-    private const val PREFS = "settings"
+    // Separate file: the event log used to live in "settings" and every progress
+    // message rewrote that whole file (endpoint, token ciphertext, flags) to disk.
+    private const val PREFS = "sync_diagnostics"
+    private const val LEGACY_PREFS = "settings"
     private const val KEY_EVENTS = "sync_diagnostic_events_v1"
     private const val MAX_EVENTS = 300
+
+    /** Parsed once per process; record() previously re-parsed up to ~200 KB per message. */
+    private var cachedEvents: MutableList<JSONObject>? = null
 
     @Volatile private var activeRunId: String = ""
     @Volatile private var activeOrigin: String = ""
@@ -101,7 +107,7 @@ object SyncDiagnostics {
     }
 
     fun render(context: Context, section: String): String {
-        val events = readEvents(context)
+        val events = synchronized(this) { events(context).toList() }
         val filtered = when (section) {
             "server" -> events.filter {
                 it.optString("stage").startsWith("GOOGLE") ||
@@ -135,7 +141,7 @@ object SyncDiagnostics {
         message: String
     ) {
         val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val items = readEvents(context).toMutableList()
+        val items = events(context)
         items += JSONObject().apply {
             put("time", System.currentTimeMillis())
             put("runId", runId)
@@ -148,13 +154,24 @@ object SyncDiagnostics {
         prefs.edit().putString(KEY_EVENTS, JSONArray(items).toString()).apply()
     }
 
-    private fun readEvents(context: Context): List<JSONObject> {
-        val raw = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(KEY_EVENTS, "[]").orEmpty()
-        val array = runCatching { JSONArray(raw) }.getOrElse { JSONArray() }
-        return buildList {
-            for (index in 0 until array.length()) array.optJSONObject(index)?.let(::add)
+    /** Must be called while holding the SyncDiagnostics monitor. */
+    private fun events(context: Context): MutableList<JSONObject> {
+        cachedEvents?.let { return it }
+        val app = context.applicationContext
+        val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        var raw = prefs.getString(KEY_EVENTS, null)
+        if (raw == null) {
+            // One-time migration out of the shared "settings" file.
+            val legacy = app.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)
+            raw = legacy.getString(KEY_EVENTS, "[]").orEmpty()
+            prefs.edit().putString(KEY_EVENTS, raw).apply()
+            legacy.edit().remove(KEY_EVENTS).apply()
         }
+        val array = runCatching { JSONArray(raw) }.getOrElse { JSONArray() }
+        val list = ArrayList<JSONObject>(MAX_EVENTS + 1)
+        for (index in 0 until array.length()) array.optJSONObject(index)?.let(list::add)
+        cachedEvents = list
+        return list
     }
 
     private fun stageFor(message: String): String = when {

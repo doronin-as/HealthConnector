@@ -54,12 +54,28 @@ class HealthSyncStreamer(
     private val changesTracker = HealthChangesTracker(context, client)
     private val permissionDeniedTypes = linkedSetOf<String>()
     private var sleepOriginProbeDiagnostic: String = "origin probe: не выполнялся"
+    private val sourceNameCache = HashMap<String, String>()
 
+    /**
+     * Runs on [Dispatchers.Default] whatever the caller's dispatcher is: JSON building,
+     * sleep aggregation and per-sample statistics must never run on the main thread.
+     * [onProgress] is therefore invoked off the main thread; UI callers must post to it.
+     */
     suspend fun sync(
         endpoint: String,
         token: String,
         days: Int,
         includeHistoricalChanges: Boolean = true,
+        onProgress: (String) -> Unit
+    ): SyncResult = withContext(Dispatchers.Default) {
+        syncInternal(endpoint, token, days, includeHistoricalChanges, onProgress)
+    }
+
+    private suspend fun syncInternal(
+        endpoint: String,
+        token: String,
+        days: Int,
+        includeHistoricalChanges: Boolean,
         onProgress: (String) -> Unit
     ): SyncResult {
         val safeDays = days.coerceIn(1, 30)
@@ -171,6 +187,9 @@ class HealthSyncStreamer(
             if (index + 1 < dates.size) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
         }
 
+        // Every day implied by the change feed was uploaded; only now advance the tokens.
+        changesTracker.commit(changes)
+
         return SyncResult(
             days = dates.size,
             workouts = totalWorkouts,
@@ -262,6 +281,36 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 put("sourcePackage", pkg)
                 put("sourceName", sourceName(pkg))
             })
+        }
+
+        // High-frequency series are uploaded as 5-minute buckets (avg/min/max/count) instead of
+        // one row per sample; day statistics are still computed from every raw sample.
+        suspend fun emitBuckets(
+            type: String,
+            unit: String,
+            record: Record,
+            samples: Sequence<Pair<Instant, Double>>
+        ) {
+            val pkg = record.sourcePackage()
+            if (pkg.isNotBlank()) sources += pkg
+            val recordId = stableRecordId(record, "${record.javaClass.simpleName}|${record.hashCode()}")
+            for ((bucketStart, stats) in MeasurementBuckets.group(samples)) {
+                val start = Instant.ofEpochSecond(bucketStart)
+                batcher.add(JSONObject().apply {
+                    put("id", MeasurementBuckets.bucketId(recordId, bucketStart))
+                    put("time", start.toString())
+                    put("start", start.toString())
+                    put("end", start.plusSeconds(MeasurementBuckets.BUCKET_SECONDS).toString())
+                    put("type", type)
+                    put("value", stats.average)
+                    put("unit", unit)
+                    put("samples", stats.count)
+                    put("min", stats.min)
+                    put("max", stats.max)
+                    put("sourcePackage", pkg)
+                    put("sourceName", sourceName(pkg))
+                })
+            }
         }
 
         // Cumulative dashboard totals use Health Connect Aggregate API so overlapping origins
@@ -403,12 +452,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             onProgress("[$date] Пульс · ${records.size} серий · ${records.sumOf { it.samples.size }} отсчётов")
             addSources(records, sources)
             for (r in records) {
-                r.samples.forEachIndexed { index, sample ->
-                    if (sample.time >= dayStart && sample.time < dayEnd) {
-                        heartStats.add(sample.beatsPerMinute.toDouble())
-                        emit("HeartRate", sample.time, null, null, sample.beatsPerMinute, "bpm", r, "|$index|${sample.time}")
-                    }
-                }
+                val inDay = r.samples.asSequence()
+                    .filter { it.time >= dayStart && it.time < dayEnd }
+                    .map { it.time to it.beatsPerMinute.toDouble() }
+                inDay.forEach { heartStats.add(it.second) }
+                emitBuckets("HeartRate", "bpm", r, inDay)
             }
         }
         run {
@@ -481,12 +529,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 r.baseline?.let {
                     emit("SkinTemperatureBaseline", null, r.startTime, r.endTime, it.inCelsius, "°C", r, "|baseline")
                 }
-                r.deltas.forEachIndexed { index, delta ->
-                    if (delta.time >= dayStart && delta.time < dayEnd) {
-                        skinDeltaStats.add(delta.delta.inCelsius)
-                        emit("SkinTemperatureDelta", delta.time, null, null, delta.delta.inCelsius, "°C", r, "|$index|${delta.time}")
-                    }
-                }
+                val inDay = r.deltas.asSequence()
+                    .filter { it.time >= dayStart && it.time < dayEnd }
+                    .map { it.time to it.delta.inCelsius }
+                inDay.forEach { skinDeltaStats.add(it.second) }
+                emitBuckets("SkinTemperatureDelta", "°C", r, inDay)
             }
         }
         run {
@@ -516,13 +563,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             )
             addSources(records, sources)
             for (r in records) {
-                r.samples.forEachIndexed { index, sample ->
-                    if (sample.time >= dayStart && sample.time < dayEnd) {
-                        val value = sample.speed.inKilometersPerHour
-                        speedStats.add(value)
-                        emit("Speed", sample.time, null, null, value, "km/h", r, "|$index|${sample.time}")
-                    }
-                }
+                val inDay = r.samples.asSequence()
+                    .filter { it.time >= dayStart && it.time < dayEnd }
+                    .map { it.time to it.speed.inKilometersPerHour }
+                inDay.forEach { speedStats.add(it.second) }
+                emitBuckets("Speed", "km/h", r, inDay)
             }
         }
         run {
@@ -537,12 +582,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             )
             addSources(records, sources)
             for (r in records) {
-                r.samples.forEachIndexed { index, sample ->
-                    if (sample.time >= dayStart && sample.time < dayEnd) {
-                        stepCadenceStats.add(sample.rate)
-                        emit("StepCadence", sample.time, null, null, sample.rate, "steps/min", r, "|$index|${sample.time}")
-                    }
-                }
+                val inDay = r.samples.asSequence()
+                    .filter { it.time >= dayStart && it.time < dayEnd }
+                    .map { it.time to it.rate }
+                inDay.forEach { stepCadenceStats.add(it.second) }
+                emitBuckets("StepCadence", "steps/min", r, inDay)
             }
         }
         run {
@@ -557,12 +601,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             )
             addSources(records, sources)
             for (r in records) {
-                r.samples.forEachIndexed { index, sample ->
-                    if (sample.time >= dayStart && sample.time < dayEnd) {
-                        cyclingCadenceStats.add(sample.revolutionsPerMinute)
-                        emit("CyclingCadence", sample.time, null, null, sample.revolutionsPerMinute, "rpm", r, "|$index|${sample.time}")
-                    }
-                }
+                val inDay = r.samples.asSequence()
+                    .filter { it.time >= dayStart && it.time < dayEnd }
+                    .map { it.time to it.revolutionsPerMinute }
+                inDay.forEach { cyclingCadenceStats.add(it.second) }
+                emitBuckets("CyclingCadence", "rpm", r, inDay)
             }
         }
         run {
@@ -577,13 +620,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             )
             addSources(records, sources)
             for (r in records) {
-                r.samples.forEachIndexed { index, sample ->
-                    if (sample.time >= dayStart && sample.time < dayEnd) {
-                        val value = sample.power.inWatts
-                        powerStats.add(value)
-                        emit("Power", sample.time, null, null, value, "W", r, "|$index|${sample.time}")
-                    }
-                }
+                val inDay = r.samples.asSequence()
+                    .filter { it.time >= dayStart && it.time < dayEnd }
+                    .map { it.time to it.power.inWatts }
+                inDay.forEach { powerStats.add(it.second) }
+                emitBuckets("Power", "W", r, inDay)
             }
         }
         run {
@@ -981,7 +1022,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 put("schemaVersion", 3)
                 put("deletedRecordIds", JSONArray(chunk))
             }
-            val response = postBody(endpoint, body) ?: continue
+            // An empty response must fail the run: otherwise the change tokens would be
+            // committed and these deletions would never be retried.
+            val response = postBody(endpoint, body)
+                ?: error("Apps Script не подтвердил удаление записей Health Connect")
             val dates = response.optJSONArray("affectedDates") ?: continue
             for (i in 0 until dates.length()) {
                 runCatching { LocalDate.parse(dates.getString(i)) }.getOrNull()?.let(result::add)
@@ -1404,7 +1448,12 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     private fun sourcePriority(packageName: String): Int =
         HealthSourceCatalog.priority(packageName)
 
-    private fun sourceName(packageName: String): String {
+    // Called for every emitted measurement; PackageManager lookups are binder IPC,
+    // so resolve each package once per sync.
+    private fun sourceName(packageName: String): String =
+        sourceNameCache.getOrPut(packageName) { resolveSourceName(packageName) }
+
+    private fun resolveSourceName(packageName: String): String {
         if (packageName.isBlank()) return "Неизвестный источник"
         val installed = runCatching {
             val info = context.packageManager.getApplicationInfo(packageName, 0)

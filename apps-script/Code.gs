@@ -53,7 +53,7 @@ const SLEEP_HEADERS = [
 
 const MEASUREMENT_HEADERS = [
   'Id', 'Time', 'Start', 'End', 'Type', 'Value', 'Unit',
-  'SourcePackage', 'SourceName', 'SyncedAt'
+  'SourcePackage', 'SourceName', 'SyncedAt', 'Samples', 'Min', 'Max'
 ];
 
 const LOG_HEADERS = [
@@ -459,6 +459,7 @@ function importBodyCompositionV1_(spreadsheet, logSheet, payload) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Некорректная дата измерения весов');
   if (!Number.isFinite(weight) || weight < 5 || weight > 250) throw new Error('Некорректный вес');
 
+  assertMeasurementsWritableV1_();
   const syncedAt = new Date().toISOString();
   const sheet = ensureSheet_(spreadsheet, BODY_COMPOSITION_SHEET, BODY_COMPOSITION_HEADERS);
   const row = [[
@@ -849,7 +850,7 @@ function upsertFatSecretMeals_(sheet, parsed, fileName, spreadsheet) {
         else seen.add(key);
       }
     });
-    rowsToDelete.sort((a, b) => b - a).forEach(r => sheet.deleteRow(r));
+    deleteRowRuns_(sheet, rowsToDelete);
   }
 
   const existing = new Map();
@@ -951,6 +952,7 @@ function ensureSheet_(spreadsheet, name, headers) {
 
 function upsertByKey_(sheet, rows, keyColumnOneBased) {
   if (!rows.length) return;
+  const width = rows[0].length;
   const lastRow = sheet.getLastRow();
   const keyIndex = keyColumnOneBased - 1;
   const existing = new Map();
@@ -962,20 +964,56 @@ function upsertByKey_(sheet, rows, keyColumnOneBased) {
     });
   }
 
+  // Updates are collected first and written as contiguous blocks: a re-synced day
+  // touches thousands of adjacent rows, and one setValues per row is the main cost.
+  const updates = new Map();
+  const appendIndex = new Map();
   const appends = [];
   rows.forEach(row => {
     const key = String(row[keyIndex] || '').trim();
     if (!key) return;
     const existingRow = existing.get(key);
     if (existingRow) {
-      sheet.getRange(existingRow, 1, 1, row.length).setValues([row]);
+      updates.set(existingRow, row);
+    } else if (appendIndex.has(key)) {
+      // The same key twice in one payload: last value wins instead of a duplicate row.
+      appends[appendIndex.get(key)] = row;
     } else {
+      appendIndex.set(key, appends.length);
       appends.push(row);
     }
   });
+
+  writeRowRuns_(sheet, updates, width);
   if (appends.length) {
-    sheet.getRange(sheet.getLastRow() + 1, 1, appends.length, appends[0].length)
-      .setValues(appends);
+    const start = sheet.getLastRow() + 1;
+    ensureSheetRows_(sheet, start + appends.length - 1);
+    sheet.getRange(start, 1, appends.length, width).setValues(appends);
+  }
+}
+
+/** Writes rows keyed by 1-based row number, one setValues per contiguous run. */
+function writeRowRuns_(sheet, rowsByNumber, width) {
+  const numbers = Array.from(rowsByNumber.keys()).sort((a, b) => a - b);
+  let i = 0;
+  while (i < numbers.length) {
+    let j = i;
+    while (j + 1 < numbers.length && numbers[j + 1] === numbers[j] + 1) j++;
+    const block = numbers.slice(i, j + 1).map(n => rowsByNumber.get(n));
+    sheet.getRange(numbers[i], 1, block.length, width).setValues(block);
+    i = j + 1;
+  }
+}
+
+/** Deletes 1-based row numbers, one deleteRows per contiguous run, bottom-up. */
+function deleteRowRuns_(sheet, rowNumbers) {
+  const numbers = Array.from(new Set(rowNumbers)).sort((a, b) => b - a);
+  let i = 0;
+  while (i < numbers.length) {
+    let j = i;
+    while (j + 1 < numbers.length && numbers[j + 1] === numbers[j] - 1) j++;
+    sheet.deleteRows(numbers[j], j - i + 1);
+    i = j + 1;
   }
 }
 
@@ -1121,9 +1159,22 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
     nullable_(x.deepSleepMinutes), nullable_(x.lightSleepMinutes), nullable_(x.remSleepMinutes), nullable_(x.awakeMinutes),
     nullable_(x.stageCount), nullable_(x.stagesJson), nullable_(x.sourcePackage), nullable_(x.sourceName), syncedAt
   ]);
-  const measurementRows = (payload.measurements || []).map(x => [
+  assertMeasurementsWritableV1_();
+  const migrated = PropertiesService.getScriptProperties().getProperty(MEASUREMENT_MIGRATION_PROP.DONE) === '1';
+  let droppedRawSamples = 0;
+  const measurementRows = (payload.measurements || []).filter(x => {
+    // After the 5-minute migration an older APK may still upload one row per sample.
+    // Those rows would duplicate the bucket rows, so they are dropped; day summaries
+    // from the same payload are still written.
+    if (migrated && isRawHighFrequencyMeasurementV1_(x.type, x.id)) {
+      droppedRawSamples++;
+      return false;
+    }
+    return true;
+  }).map(x => [
     x.id, nullable_(x.time), nullable_(x.start), nullable_(x.end), nullable_(x.type), nullable_(x.value), nullable_(x.unit),
-    nullable_(x.sourcePackage), nullable_(x.sourceName), syncedAt
+    nullable_(x.sourcePackage), nullable_(x.sourceName), syncedAt,
+    nullable_(x.samples), nullable_(x.min), nullable_(x.max)
   ]);
 
   upsertByKey_(workoutsSheet, workoutRows, 1);
@@ -1133,7 +1184,8 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   logSheet.appendRow([
     new Date(), payload.deviceId || '', payload.rangeStart || '', payload.rangeEnd || '',
     (payload.days || []).length, workoutRows.length, 'OK',
-    `V3 partial sync: сон ${sleepRows.length}; измерения ${measurementRows.length}`
+    `V3 partial sync: сон ${sleepRows.length}; измерения ${measurementRows.length}` +
+      (droppedRawSamples ? `; отброшено посэмпловых строк старого клиента ${droppedRawSamples}` : '')
   ]);
 
   return {
@@ -1366,6 +1418,7 @@ function addDaysToDateKeyV3_(dateKey, days, tz) {
 }
 
 function handleHealthChangesV3_(spreadsheet, logSheet, payload) {
+  assertMeasurementsWritableV1_();
   const ids = Array.isArray(payload.deletedRecordIds)
     ? Array.from(new Set(payload.deletedRecordIds.map(String).filter(Boolean)))
     : [];
@@ -1393,14 +1446,13 @@ function handleHealthChangesV3_(spreadsheet, logSheet, payload) {
 function deleteChangedRowsV3_(sheet, ids, kind, affected, tz) {
   if (!sheet || sheet.getLastRow() < 2) return 0;
   const idSet = new Set(ids);
-  const idPrefixes = ids.map(id => `${id}|`);
   const width = Math.min(4, sheet.getLastColumn());
   const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
   const rows = [];
 
   values.forEach((row, index) => {
     const id = String(row[0] || '');
-    const match = idSet.has(id) || idPrefixes.some(prefix => id.startsWith(prefix));
+    const match = changedIdMatches_(idSet, id);
     if (!match) return;
     rows.push(index + 2);
 
@@ -1412,8 +1464,23 @@ function deleteChangedRowsV3_(sheet, ids, kind, affected, tz) {
     if (dateKey) affected.add(dateKey);
   });
 
-  rows.sort((a, b) => b - a).forEach(row => sheet.deleteRow(row));
+  deleteRowRuns_(sheet, rows);
   return rows.length;
+}
+
+/**
+ * Raw measurement ids are `<recordId>|<suffix>`. Instead of testing every deleted id
+ * as a prefix of every row (O(rows × ids)), test each `|`-delimited prefix of the row id
+ * against a Set. Equivalent to the old startsWith(`${id}|`) check.
+ */
+function changedIdMatches_(idSet, id) {
+  if (idSet.has(id)) return true;
+  let pipe = id.indexOf('|');
+  while (pipe > 0) {
+    if (idSet.has(id.slice(0, pipe))) return true;
+    pipe = id.indexOf('|', pipe + 1);
+  }
+  return false;
 }
 
 function isoDateKeyV3_(value, tz) {
@@ -1423,6 +1490,433 @@ function isoDateKeyV3_(value, tz) {
   if (iso) return iso[1];
   const d = new Date(text);
   return isNaN(d) ? '' : Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+}
+
+
+// ===== HC_Измерения downsampling v1 =====
+//
+// High-frequency series are stored as buckets: 5 minutes for recent data, 1 hour for
+// data older than MEASUREMENT_COARSE_AFTER_DAYS. A bucket row keeps Value = weighted
+// average, Samples = number of raw samples, Min, Max, so buckets merge exactly.
+// Ids: `<recordId>|5m|<epochSeconds>` / `<recordId>|1h|<epochSeconds>`; the record id stays
+// the leading segment, so Health Connect deletions keep matching (changedIdMatches_).
+//
+// Operator functions (run from the Apps Script editor):
+//   migrateMeasurementsTo5mV1()       one-time; resumes itself until done
+//   installMeasurementMaintenanceV1()  daily coarsening of rows older than 90 days
+//   measurementMaintenanceStatusV1()   progress / counters
+
+const MEASUREMENT_HF_TYPES = new Set([
+  'HeartRate', 'Speed', 'StepCadence', 'CyclingCadence', 'Power', 'SkinTemperatureDelta'
+]);
+const MEASUREMENT_COL = Object.freeze({
+  ID: 0, TIME: 1, START: 2, END: 3, TYPE: 4, VALUE: 5, UNIT: 6,
+  PKG: 7, NAME: 8, SYNCED: 9, SAMPLES: 10, MIN: 11, MAX: 12
+});
+const MEASUREMENT_WIDTH = 13;
+const MEASUREMENT_BUCKET_FINE = Object.freeze({ tag: '5m', seconds: 300 });
+const MEASUREMENT_BUCKET_COARSE = Object.freeze({ tag: '1h', seconds: 3600 });
+const MEASUREMENT_COARSE_AFTER_DAYS = 90;
+const MEASUREMENT_CHUNK_ROWS = 20000;
+const MEASUREMENT_COARSEN_MAX_ROWS = 30000;
+const MEASUREMENT_TIME_BUDGET_MS = 4.5 * 60 * 1000;
+const MEASUREMENT_MIGRATION_TARGET_SHEET = 'HC_Измерения_5m_tmp';
+const MEASUREMENT_MIGRATION_PROP = Object.freeze({
+  PHASE: 'MEAS_5M_PHASE',          // '' | 'scan' | 'copyback'
+  CURSOR: 'MEAS_5M_CURSOR',        // next source row (scan) / next target offset (copyback)
+  SOURCE_ROWS: 'MEAS_5M_SOURCE_ROWS',
+  DONE: 'MEAS_5M_DONE',
+  LAST_COARSEN: 'MEAS_1H_LAST_RUN'
+});
+
+function measurementEpochMs_(value) {
+  if (value instanceof Date && !isNaN(value)) return value.getTime();
+  const text = String(value == null ? '' : value).trim();
+  if (!text) return null;
+  const ms = Date.parse(text);
+  return isNaN(ms) ? null : ms;
+}
+
+/** Same text as Kotlin Instant.toString() for whole-second instants. */
+function measurementIso_(ms) {
+  return new Date(ms).toISOString().replace('.000Z', 'Z');
+}
+
+/**
+ * Classifies a measurement id:
+ *   `<rec>|5m|<sec>` / `<rec>|1h|<sec>` -> bucket rows
+ *   `<rec>|<index>|<sampleTime>`        -> legacy per-sample rows
+ * Returns { recordId, kind: '5m' | '1h' | 'sample' } or null for anything else.
+ */
+function parseMeasurementId_(id) {
+  const text = String(id == null ? '' : id);
+  for (const bucket of [MEASUREMENT_BUCKET_FINE, MEASUREMENT_BUCKET_COARSE]) {
+    const marker = `|${bucket.tag}|`;
+    const at = text.lastIndexOf(marker);
+    if (at > 0 && /^-?\d+$/.test(text.slice(at + marker.length))) {
+      return { recordId: text.slice(0, at), kind: bucket.tag };
+    }
+  }
+  const last = text.lastIndexOf('|');
+  if (last <= 0) return null;
+  const prev = text.lastIndexOf('|', last - 1);
+  if (prev <= 0 || !/^\d+$/.test(text.slice(prev + 1, last))) return null;
+  return { recordId: text.slice(0, prev), kind: 'sample' };
+}
+
+function isRawHighFrequencyMeasurementV1_(type, id) {
+  if (!MEASUREMENT_HF_TYPES.has(String(type || ''))) return false;
+  const parsed = parseMeasurementId_(id);
+  return Boolean(parsed && parsed.kind === 'sample');
+}
+
+function assertMeasurementsWritableV1_() {
+  const phase = PropertiesService.getScriptProperties().getProperty(MEASUREMENT_MIGRATION_PROP.PHASE);
+  if (phase === 'copyback') {
+    // The client treats LOCK_BUSY as retryable, so syncs resume after the migration.
+    throw new Error('LOCK_BUSY: идёт перезапись HC_Измерения после миграции, повторите позже');
+  }
+}
+
+function padMeasurementRow_(row) {
+  const out = row.slice(0, MEASUREMENT_WIDTH);
+  while (out.length < MEASUREMENT_WIDTH) out.push('');
+  return out;
+}
+
+function measurementNumber_(value) {
+  if (value === '' || value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Folds a row (raw sample or bucket) into `groups` at the given bucket size. */
+function accumulateMeasurementBucket_(groups, row, bucket) {
+  const C = MEASUREMENT_COL;
+  const parsed = parseMeasurementId_(row[C.ID]);
+  const value = measurementNumber_(row[C.VALUE]);
+  const ms = measurementEpochMs_(row[C.TIME]) != null
+    ? measurementEpochMs_(row[C.TIME])
+    : measurementEpochMs_(row[C.START]);
+  if (!parsed || value == null || ms == null) return false;
+
+  const samples = measurementNumber_(row[C.SAMPLES]);
+  const n = samples != null && samples > 0 ? samples : 1;
+  const lo = measurementNumber_(row[C.MIN]);
+  const hi = measurementNumber_(row[C.MAX]);
+  const startSec = Math.floor(ms / 1000 / bucket.seconds) * bucket.seconds;
+  const key = `${parsed.recordId}|${bucket.tag}|${startSec}`;
+  let g = groups.get(key);
+  if (!g) {
+    g = {
+      id: key, startSec, seconds: bucket.seconds,
+      type: row[C.TYPE], unit: row[C.UNIT], pkg: row[C.PKG], name: row[C.NAME],
+      synced: '', n: 0, sum: 0, min: Infinity, max: -Infinity
+    };
+    groups.set(key, g);
+  }
+  g.n += n;
+  g.sum += value * n;
+  g.min = Math.min(g.min, lo != null ? lo : value);
+  g.max = Math.max(g.max, hi != null ? hi : value);
+  const synced = row[C.SYNCED] instanceof Date ? row[C.SYNCED].toISOString() : String(row[C.SYNCED] || '');
+  if (synced > g.synced) g.synced = synced;
+  return true;
+}
+
+function measurementGroupRow_(g) {
+  const start = g.startSec * 1000;
+  return [
+    g.id, measurementIso_(start), measurementIso_(start), measurementIso_(start + g.seconds * 1000),
+    g.type, g.sum / g.n, g.unit, g.pkg, g.name, g.synced, g.n, g.min, g.max
+  ];
+}
+
+/** Weighted merge of two bucket rows with the same id. */
+function mergeMeasurementBucketRows_(a, b) {
+  const C = MEASUREMENT_COL;
+  const groups = new Map();
+  const bucket = parseMeasurementId_(a[C.ID]).kind === MEASUREMENT_BUCKET_COARSE.tag
+    ? MEASUREMENT_BUCKET_COARSE
+    : MEASUREMENT_BUCKET_FINE;
+  accumulateMeasurementBucket_(groups, a, bucket);
+  accumulateMeasurementBucket_(groups, b, bucket);
+  const merged = Array.from(groups.values());
+  if (merged.length !== 1) return padMeasurementRow_(b);
+  return measurementGroupRow_(merged[0]);
+}
+
+/**
+ * Upsert for measurement rows where bucket rows (5m/1h) are MERGED with an existing row
+ * of the same id instead of replacing it. Other rows replace, like upsertByKey_.
+ */
+function mergeMeasurementRows_(sheet, rows) {
+  if (!rows.length) return;
+  const isBucket = id => {
+    const parsed = parseMeasurementId_(id);
+    return Boolean(parsed && parsed.kind !== 'sample');
+  };
+  const existing = new Map();
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues().forEach((row, index) => {
+      const key = String(row[0] || '').trim();
+      if (key) existing.set(key, index + 2);
+    });
+  }
+  const width = Math.min(sheet.getMaxColumns(), MEASUREMENT_WIDTH);
+  const updates = new Map();
+  const appendIndex = new Map();
+  const appends = [];
+  rows.forEach(raw => {
+    const row = padMeasurementRow_(raw);
+    const key = String(row[0] || '').trim();
+    if (!key) return;
+    const at = existing.get(key);
+    if (at) {
+      if (isBucket(key)) {
+        const current = updates.get(at) || padMeasurementRow_(sheet.getRange(at, 1, 1, width).getValues()[0]);
+        updates.set(at, mergeMeasurementBucketRows_(current, row));
+      } else {
+        updates.set(at, row);
+      }
+    } else if (appendIndex.has(key)) {
+      const index = appendIndex.get(key);
+      appends[index] = isBucket(key) ? mergeMeasurementBucketRows_(appends[index], row) : row;
+    } else {
+      appendIndex.set(key, appends.length);
+      appends.push(row);
+    }
+  });
+  writeRowRuns_(sheet, updates, MEASUREMENT_WIDTH);
+  if (appends.length) {
+    const start = sheet.getLastRow() + 1;
+    ensureSheetRows_(sheet, start + appends.length - 1);
+    sheet.getRange(start, 1, appends.length, MEASUREMENT_WIDTH).setValues(appends);
+  }
+}
+
+function ensureSheetRows_(sheet, lastNeededRow) {
+  const maxRows = sheet.getMaxRows();
+  if (maxRows < lastNeededRow) sheet.insertRowsAfter(maxRows, lastNeededRow - maxRows);
+}
+
+function ensureMeasurementColumns_(sheet) {
+  if (sheet.getMaxColumns() < MEASUREMENT_WIDTH) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), MEASUREMENT_WIDTH - sheet.getMaxColumns());
+  }
+}
+
+function scheduleMeasurementMigrationContinuation_() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'migrateMeasurementsTo5mV1')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('migrateMeasurementsTo5mV1').timeBased().after(60 * 1000).create();
+}
+
+/**
+ * One-time migration of legacy per-sample HF rows into 5-minute buckets.
+ *
+ * Phase "scan": reads HC_Измерения in chunks; legacy HF sample rows become buckets,
+ * everything else (spot values, intervals, rows already bucketed by the 1.6.35 client)
+ * is copied unchanged into a temporary sheet. Rows the clients append meanwhile are
+ * picked up because the cursor runs to the current last row.
+ * Phase "copyback": the temporary sheet is written back into HC_Измерения (same sheet,
+ * so formulas that reference it keep working), surplus rows are deleted to free cells,
+ * and the temporary sheet is removed. Writes to measurements are refused with
+ * LOCK_BUSY during this phase; clients retry automatically.
+ *
+ * Resumes itself via a one-off time trigger until finished. Safe to run again.
+ */
+function migrateMeasurementsTo5mV1() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    scheduleMeasurementMigrationContinuation_();
+    return { ok: true, status: 'lock-busy-rescheduled' };
+  }
+  try {
+    const props = PropertiesService.getScriptProperties();
+    if (props.getProperty(MEASUREMENT_MIGRATION_PROP.DONE) === '1' &&
+        !props.getProperty(MEASUREMENT_MIGRATION_PROP.PHASE)) {
+      return { ok: true, status: 'already-migrated' };
+    }
+    const spreadsheet = getSpreadsheet_();
+    const source = ensureSheet_(spreadsheet, MEASUREMENTS_SHEET, MEASUREMENT_HEADERS);
+    ensureMeasurementColumns_(source);
+    const startedAt = Date.now();
+    let phase = props.getProperty(MEASUREMENT_MIGRATION_PROP.PHASE) || '';
+
+    if (!phase) {
+      const stale = spreadsheet.getSheetByName(MEASUREMENT_MIGRATION_TARGET_SHEET);
+      if (stale) spreadsheet.deleteSheet(stale);
+      phase = 'scan';
+      props.setProperty(MEASUREMENT_MIGRATION_PROP.PHASE, phase);
+      props.setProperty(MEASUREMENT_MIGRATION_PROP.CURSOR, '2');
+      props.setProperty(MEASUREMENT_MIGRATION_PROP.SOURCE_ROWS, String(Math.max(0, source.getLastRow() - 1)));
+    }
+    const target = spreadsheet.getSheetByName(MEASUREMENT_MIGRATION_TARGET_SHEET) ||
+      ensureSheet_(spreadsheet, MEASUREMENT_MIGRATION_TARGET_SHEET, MEASUREMENT_HEADERS);
+    ensureMeasurementColumns_(target);
+
+    if (phase === 'scan') {
+      let cursor = Number(props.getProperty(MEASUREMENT_MIGRATION_PROP.CURSOR) || 2);
+      const width = Math.min(source.getMaxColumns(), MEASUREMENT_WIDTH);
+      while (cursor <= source.getLastRow() && Date.now() - startedAt < MEASUREMENT_TIME_BUDGET_MS) {
+        const count = Math.min(MEASUREMENT_CHUNK_ROWS, source.getLastRow() - cursor + 1);
+        const values = source.getRange(cursor, 1, count, width).getValues().map(padMeasurementRow_);
+        const groups = new Map();
+        const passthrough = [];
+        values.forEach(row => {
+          const isRawHf = isRawHighFrequencyMeasurementV1_(row[MEASUREMENT_COL.TYPE], row[MEASUREMENT_COL.ID]);
+          if (!isRawHf || !accumulateMeasurementBucket_(groups, row, MEASUREMENT_BUCKET_FINE)) {
+            passthrough.push(row);
+          }
+        });
+        // Buckets from legacy samples first, then pass-through rows: a bucket uploaded by the
+        // 1.6.35 client is authoritative and must replace, not be merged with, legacy samples.
+        mergeMeasurementRows_(target, Array.from(groups.values()).map(measurementGroupRow_));
+        upsertByKey_(target, passthrough, 1);
+        cursor += count;
+        props.setProperty(MEASUREMENT_MIGRATION_PROP.CURSOR, String(cursor));
+      }
+      if (cursor <= source.getLastRow()) {
+        scheduleMeasurementMigrationContinuation_();
+        return { ok: true, status: 'scan', cursor, sourceRows: source.getLastRow() - 1 };
+      }
+      phase = 'copyback';
+      props.setProperty(MEASUREMENT_MIGRATION_PROP.PHASE, phase);
+      props.setProperty(MEASUREMENT_MIGRATION_PROP.CURSOR, '0');
+      if (source.getLastRow() >= 2) {
+        source.getRange(2, 1, source.getLastRow() - 1, source.getMaxColumns()).clearContent();
+      }
+    }
+
+    // phase === 'copyback'
+    let offset = Number(props.getProperty(MEASUREMENT_MIGRATION_PROP.CURSOR) || 0);
+    const total = Math.max(0, target.getLastRow() - 1);
+    while (offset < total && Date.now() - startedAt < MEASUREMENT_TIME_BUDGET_MS) {
+      const count = Math.min(MEASUREMENT_CHUNK_ROWS, total - offset);
+      const values = target.getRange(2 + offset, 1, count, MEASUREMENT_WIDTH).getValues();
+      ensureSheetRows_(source, 1 + offset + count);
+      source.getRange(2 + offset, 1, count, MEASUREMENT_WIDTH).setValues(values);
+      offset += count;
+      props.setProperty(MEASUREMENT_MIGRATION_PROP.CURSOR, String(offset));
+    }
+    if (offset < total) {
+      scheduleMeasurementMigrationContinuation_();
+      return { ok: true, status: 'copyback', offset, total };
+    }
+
+    // Free the cells of the old raw rows; keep at least one (empty) data row because
+    // Sheets refuses to delete every non-frozen row.
+    const keepRows = Math.max(total + 1, 2);
+    const surplus = source.getMaxRows() - keepRows;
+    if (surplus > 0) source.deleteRows(keepRows + 1, surplus);
+    spreadsheet.deleteSheet(target);
+    const sourceRows = Number(props.getProperty(MEASUREMENT_MIGRATION_PROP.SOURCE_ROWS) || 0);
+    props.deleteProperty(MEASUREMENT_MIGRATION_PROP.PHASE);
+    props.deleteProperty(MEASUREMENT_MIGRATION_PROP.CURSOR);
+    props.deleteProperty(MEASUREMENT_MIGRATION_PROP.SOURCE_ROWS);
+    props.setProperty(MEASUREMENT_MIGRATION_PROP.DONE, '1');
+    ScriptApp.getProjectTriggers()
+      .filter(t => t.getHandlerFunction() === 'migrateMeasurementsTo5mV1')
+      .forEach(t => ScriptApp.deleteTrigger(t));
+    ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS).appendRow([
+      new Date(), 'Maintenance', '', '', 0, 0, 'OK',
+      `HC_Измерения → 5-минутные корзины: было строк ${sourceRows}, стало ${total}`
+    ]);
+    return { ok: true, status: 'done', rowsBefore: sourceRows, rowsAfter: total };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/**
+ * Daily job: HF rows (5-minute buckets or stray raw samples) older than
+ * MEASUREMENT_COARSE_AFTER_DAYS are merged into 1-hour buckets. Day aggregates in
+ * HC_Дни are not touched. New hourly rows are written before the source rows are
+ * deleted, so an interrupted run can only inflate Samples, never lose data.
+ */
+function compactOldMeasurementsV1() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return { ok: true, status: 'lock-busy' };
+  try {
+    const props = PropertiesService.getScriptProperties();
+    if (props.getProperty(MEASUREMENT_MIGRATION_PROP.PHASE)) {
+      return { ok: true, status: 'migration-in-progress' };
+    }
+    const spreadsheet = getSpreadsheet_();
+    const sheet = spreadsheet.getSheetByName(MEASUREMENTS_SHEET);
+    if (!sheet || sheet.getLastRow() < 2) return { ok: true, status: 'empty' };
+    ensureMeasurementColumns_(sheet);
+    const cutoffMs = Date.now() - MEASUREMENT_COARSE_AFTER_DAYS * 24 * 3600 * 1000;
+    const startedAt = Date.now();
+
+    const candidates = [];
+    const lastRow = sheet.getLastRow();
+    for (let row = 2; row <= lastRow && candidates.length < MEASUREMENT_COARSEN_MAX_ROWS &&
+         Date.now() - startedAt < MEASUREMENT_TIME_BUDGET_MS / 3; row += MEASUREMENT_CHUNK_ROWS) {
+      const count = Math.min(MEASUREMENT_CHUNK_ROWS, lastRow - row + 1);
+      sheet.getRange(row, 1, count, 5).getValues().forEach((v, i) => {
+        if (candidates.length >= MEASUREMENT_COARSEN_MAX_ROWS) return;
+        if (!MEASUREMENT_HF_TYPES.has(String(v[MEASUREMENT_COL.TYPE] || ''))) return;
+        const parsed = parseMeasurementId_(v[MEASUREMENT_COL.ID]);
+        if (!parsed || parsed.kind === MEASUREMENT_BUCKET_COARSE.tag) return;
+        const ms = measurementEpochMs_(v[MEASUREMENT_COL.TIME]) != null
+          ? measurementEpochMs_(v[MEASUREMENT_COL.TIME])
+          : measurementEpochMs_(v[MEASUREMENT_COL.START]);
+        if (ms != null && ms < cutoffMs) candidates.push(row + i);
+      });
+    }
+    if (!candidates.length) {
+      props.setProperty(MEASUREMENT_MIGRATION_PROP.LAST_COARSEN, `${new Date().toISOString()} · 0`);
+      return { ok: true, status: 'nothing-to-do' };
+    }
+
+    const groups = new Map();
+    let i = 0;
+    while (i < candidates.length) {
+      let j = i;
+      while (j + 1 < candidates.length && candidates[j + 1] === candidates[j] + 1) j++;
+      sheet.getRange(candidates[i], 1, j - i + 1, MEASUREMENT_WIDTH).getValues()
+        .forEach(row => accumulateMeasurementBucket_(groups, padMeasurementRow_(row), MEASUREMENT_BUCKET_COARSE));
+      i = j + 1;
+    }
+    mergeMeasurementRows_(sheet, Array.from(groups.values()).map(measurementGroupRow_));
+    deleteRowRuns_(sheet, candidates);
+    props.setProperty(MEASUREMENT_MIGRATION_PROP.LAST_COARSEN,
+      `${new Date().toISOString()} · ${candidates.length} → ${groups.size}`);
+    ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS).appendRow([
+      new Date(), 'Maintenance', '', '', 0, 0, 'OK',
+      `HC_Измерения: старше ${MEASUREMENT_COARSE_AFTER_DAYS} дн. ${candidates.length} строк → ${groups.size} часовых`
+    ]);
+    return { ok: true, status: 'compacted', rows: candidates.length, hourly: groups.size };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+function installMeasurementMaintenanceV1() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'compactOldMeasurementsV1')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('compactOldMeasurementsV1').timeBased().everyDays(1).atHour(4).create();
+  return { ok: true, installed: 'compactOldMeasurementsV1 daily at ~04:00' };
+}
+
+function measurementMaintenanceStatusV1() {
+  const props = PropertiesService.getScriptProperties();
+  const sheet = getSpreadsheet_().getSheetByName(MEASUREMENTS_SHEET);
+  const status = {
+    rows: sheet ? Math.max(0, sheet.getLastRow() - 1) : 0,
+    maxRows: sheet ? sheet.getMaxRows() : 0,
+    migrated: props.getProperty(MEASUREMENT_MIGRATION_PROP.DONE) === '1',
+    phase: props.getProperty(MEASUREMENT_MIGRATION_PROP.PHASE) || '',
+    cursor: props.getProperty(MEASUREMENT_MIGRATION_PROP.CURSOR) || '',
+    lastCoarsen: props.getProperty(MEASUREMENT_MIGRATION_PROP.LAST_COARSEN) || ''
+  };
+  console.log(JSON.stringify(status));
+  return status;
 }
 
 

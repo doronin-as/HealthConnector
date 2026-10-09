@@ -1148,10 +1148,13 @@ class StreamingMainActivity : AppCompatActivity() {
                         settings.days,
                         includeHistoricalChanges = true
                     ) { message ->
-                        lastProgressMessage = message
-                        val elapsedSec = (SystemClock.elapsedRealtime() - syncStartedAt) / 1000L
+                        // Progress arrives on a background dispatcher.
                         SyncDiagnostics.progress(this, runId, "manual", message)
-                        binding.status.text = "$message\n● Процесс идёт · ${elapsedSec} с"
+                        runOnUiThread {
+                            lastProgressMessage = message
+                            val elapsedSec = (SystemClock.elapsedRealtime() - syncStartedAt) / 1000L
+                            binding.status.text = "$message\n● Процесс идёт · ${elapsedSec} с"
+                        }
                     }
                     SyncDiagnostics.finish(
                         this,
