@@ -17,6 +17,14 @@ object SyncForeground {
     const val BACKGROUND_NOTIFICATION_ID = 16161
     private const val CHANNEL_ID = "health_connector_sync"
 
+    private val cancelActions = ConcurrentHashMap<Int, PendingIntent>()
+
+    fun registerCancellation(context: Context, notificationId: Int, workId: java.util.UUID) {
+        cancelActions[notificationId] = androidx.work.WorkManager.getInstance(context).createCancelPendingIntent(workId)
+        startedAt.remove(notificationId)
+        lastProgress.remove(notificationId)
+    }
+
     private val startedAt = ConcurrentHashMap<Int, Long>()
     private val lastProgress = ConcurrentHashMap<Int, Int>()
 
@@ -69,6 +77,8 @@ object SyncForeground {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
             )
+
+        cancelActions[id]?.let { builder.addAction(0, "Остановить", it) }
 
         if (progress != null) {
             builder.setProgress(100, progress, false)

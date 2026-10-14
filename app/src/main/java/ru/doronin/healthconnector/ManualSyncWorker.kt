@@ -43,6 +43,7 @@ class ManualSyncWorker(appContext: Context, workerParams: WorkerParameters) : Co
         if (HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND !in granted) {
             return failure("Разреши Health Connect чтение данных в фоне")
         }
+        SyncForeground.registerCancellation(applicationContext, SyncForeground.MANUAL_NOTIFICATION_ID, id)
         setForeground(SyncForeground.info(applicationContext,SyncForeground.MANUAL_NOTIFICATION_ID,"HealthConnector · синхронизация","Запуск… приложение можно свернуть"))
         val runId=SyncDiagnostics.begin(applicationContext,"manual")
         val startedAt=SystemClock.elapsedRealtime()
@@ -57,7 +58,7 @@ class ManualSyncWorker(appContext: Context, workerParams: WorkerParameters) : Co
                 SyncDiagnostics.finish(applicationContext,runId,"manual","Дней ${result.days}, тренировок ${result.workouts}, измерений ${result.measurements}")
                 Result.success(workDataOf(KEY_DAYS to result.days,KEY_WORKOUTS to result.workouts,KEY_MEASUREMENTS to result.measurements,KEY_SOURCES to result.sources))
             }
-        } catch (cancelled: CancellationException) { SyncDiagnostics.skipped(applicationContext,"manual","Foreground-задание отменено системой"); throw cancelled }
+        } catch (cancelled: CancellationException) { SyncDiagnostics.skipped(applicationContext,"manual","Синхронизация остановлена пользователем или системой; принятые данные сохранены"); throw cancelled }
         catch (error: Throwable) { SyncDiagnostics.failure(applicationContext,runId,"manual",error); failure(error.message ?: error.javaClass.simpleName) }
     }
     private fun publish(message:String) { setProgressAsync(workDataOf(KEY_PROGRESS to message)); SyncForeground.update(applicationContext,SyncForeground.MANUAL_NOTIFICATION_ID,"HealthConnector · синхронизация",message) }
