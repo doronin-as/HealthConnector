@@ -1,0 +1,52 @@
+name: Activate Drive daily archive
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/activate-drive-archive.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apps-script-production
+  cancel-in-progress: false
+
+jobs:
+  activate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      APPS_SCRIPT_ID: ${{ secrets.APPS_SCRIPT_ID }}
+      CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install existing deployment client
+        run: npm install --global @google/clasp@3.4.1
+      - name: Activate archive using existing Google authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$APPS_SCRIPT_ID"
+          test -n "$CLASPRC_JSON"
+          printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+          chmod 600 "$HOME/.clasprc.json"
+          TASK_DIR="$RUNNER_TEMP/archive-activation"
+          mkdir -p "$TASK_DIR"
+          cd "$TASK_DIR"
+          node -e 'require("fs").writeFileSync(".clasp.json",JSON.stringify({scriptId:process.env.APPS_SCRIPT_ID,rootDir:"."}))'
+          clasp run installDriveArchiveV1
+      - name: Run first verified migration batch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/archive-activation"
+          clasp run archiveDashboardHistoryV1
+          clasp run driveArchiveStatusV1
+      - name: Remove temporary credentials
+        if: always()
+        run: rm -f "$HOME/.clasprc.json"
