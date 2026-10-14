@@ -39,14 +39,33 @@ jobs:
           mkdir -p "$TASK_DIR"
           cd "$TASK_DIR"
           node -e 'require("fs").writeFileSync(".clasp.json",JSON.stringify({scriptId:process.env.APPS_SCRIPT_ID,rootDir:"."}))'
-          clasp run installDriveArchiveV1
+          clasp pull
+          node <<'JS'
+          const fs = require('fs');
+          const file = 'appsscript.json';
+          const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+          console.log('API executable configured:', Boolean(manifest.executionApi));
+          if (!manifest.executionApi) {
+            manifest.executionApi = {access: 'MYSELF'};
+            fs.writeFileSync(file, JSON.stringify(manifest, null, 2));
+            fs.writeFileSync('.needs-api-deployment', '1');
+          }
+          JS
+          if [[ -f .needs-api-deployment ]]; then
+            clasp push --force
+            clasp create-deployment --description "Owner-only archive maintenance API" --json > "$RUNNER_TEMP/archive-api-deployment.json"
+          fi
+          clasp run installDriveArchiveV1 --json > "$RUNNER_TEMP/archive-install.json"
+          node -e 'const r=JSON.parse(require("fs").readFileSync(process.env.RUNNER_TEMP+"/archive-install.json","utf8")); if(r.error || !r.response || r.response.enabled!==true){console.error(JSON.stringify(r));process.exit(1)};console.log(JSON.stringify(r.response));'
       - name: Run first verified migration batch
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/archive-activation"
-          clasp run archiveDashboardHistoryV1
-          clasp run driveArchiveStatusV1
+          clasp run archiveDashboardHistoryV1 --json > "$RUNNER_TEMP/archive-migrate.json"
+          node -e 'const r=JSON.parse(require("fs").readFileSync(process.env.RUNNER_TEMP+"/archive-migrate.json","utf8")); if(r.error || !r.response || r.response.ok===false){console.error(JSON.stringify(r));process.exit(1)};console.log(JSON.stringify(r.response));'
+          clasp run driveArchiveStatusV1 --json > "$RUNNER_TEMP/archive-status.json"
+          node -e 'const r=JSON.parse(require("fs").readFileSync(process.env.RUNNER_TEMP+"/archive-status.json","utf8")); if(r.error || !r.response || r.response.enabled!==true){console.error(JSON.stringify(r));process.exit(1)};console.log(JSON.stringify(r.response));'
       - name: Remove temporary credentials
         if: always()
         run: rm -f "$HOME/.clasprc.json"
