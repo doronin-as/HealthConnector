@@ -70,4 +70,6 @@ dependencies {
     implementation("com.google.guava:guava:33.3.1-android")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     testImplementation("junit:junit:4.13.2")
+    // Real org.json for JVM unit tests; android.jar only ships stubs.
+    testImplementation("org.json:json:20240303")
 }

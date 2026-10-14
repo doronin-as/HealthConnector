@@ -77,12 +77,12 @@ Release goal: make synchronization loss-resistant, diagnosable and recoverable b
 - [ ] Health Connect: deletion changes clear/recompute affected day.
 - [~] Multiple sources: canonical Fitbit + Google Fit + Mi Fitness package mapping and sleep-origin merge are unit-covered; full end-to-end no-loss validation still required.
 - [ ] Sleep: 30-second stage segments aggregate correctly.
-- [ ] Sleep: overnight session and DST/travel timezone cases.
-- [ ] Config recovery: newest valid JSON wins when multiple readable candidates exist.
-- [ ] Config recovery: invalid/malformed/wrong-format JSON is ignored safely.
-- [ ] Config recovery: legacy token is migrated to `SecureTokenStore`.
-- [ ] Config recovery: existing configured installation is never overwritten automatically.
-- [ ] Apps Script: formula-injection strings remain literal.
+- [x] Sleep: overnight session and DST/travel timezone cases.
+- [x] Config recovery: newest valid JSON wins when multiple readable candidates exist.
+- [x] Config recovery: invalid/malformed/wrong-format JSON is ignored safely.
+- [x] Config recovery: legacy token is migrated to `SecureTokenStore`.
+- [x] Config recovery: existing configured installation is never overwritten automatically.
+- [x] Apps Script: formula-injection strings remain literal.
 - [ ] Apps Script: large raw table performance regression test.
 - [ ] End-to-end: sparse day is repaired without erasing previously good values.
 
