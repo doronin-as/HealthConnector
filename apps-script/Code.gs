@@ -348,11 +348,13 @@ function getDashboardLatestDayV1_(spreadsheet, tz) {
 
 function getDashboardDevicesV1_(spreadsheet, tz) {
   const devices = new Map();
-  dashboardCollectSourcesV1_(spreadsheet.getSheetByName(MEASUREMENTS_SHEET), 'Измерения', devices, 2500);
-  dashboardCollectSourcesV1_(spreadsheet.getSheetByName(SLEEP_SHEET), 'Сон', devices, 800);
-  dashboardCollectSourcesV1_(spreadsheet.getSheetByName(WORKOUTS_SHEET), 'Тренировки', devices, 800);
+  if (!driveArchiveEnabledV1_()) {
+    dashboardCollectSourcesV1_(spreadsheet.getSheetByName(MEASUREMENTS_SHEET), 'Измерения', devices, 2500);
+    dashboardCollectSourcesV1_(spreadsheet.getSheetByName(SLEEP_SHEET), 'Сон', devices, 800);
+    dashboardCollectSourcesV1_(spreadsheet.getSheetByName(WORKOUTS_SHEET), 'Тренировки', devices, 800);
+  }
 
-  const scale = spreadsheet.getSheetByName(BODY_COMPOSITION_SHEET);
+  const scale = driveArchiveEnabledV1_() ? null : spreadsheet.getSheetByName(BODY_COMPOSITION_SHEET);
   if (scale && scale.getLastRow() >= 2) {
     const width = Math.min(scale.getLastColumn(), BODY_COMPOSITION_HEADERS.length);
     const headers = scale.getRange(1, 1, 1, width).getDisplayValues()[0];
@@ -1451,6 +1453,8 @@ function handleHealthChangesV3_(spreadsheet, logSheet, payload) {
       const dates = daily.getRange(2, 1, daily.getLastRow() - 1, 1).getValues();
       dates.forEach(row => { const date = normalizeDateWithTz_(row[0], spreadsheet.getSpreadsheetTimeZone()); if (date) affected.add(date); });
       if (index >= 0) daily.getRange(2, index + 1, dates.length, 1).setValues(dates.map(() => [false]));
+      const completedIndex = headers.indexOf('CompletedAt');
+      if (completedIndex >= 0) daily.getRange(2, completedIndex + 1, dates.length, 1).clearContent();
     }
     return { ok: true, schemaVersion: 3, deleted: 0, archivedDeletionIds: ids.length, affectedDates: Array.from(affected).sort() };
   }
