@@ -567,13 +567,14 @@ function importHealthPayload_(spreadsheet, logSheet, payload) {
 
   const measurementRows = (payload.measurements || []).map(x => [
     x.id, nullable_(x.time), nullable_(x.start), nullable_(x.end), nullable_(x.type), nullable_(x.value), nullable_(x.unit),
-    nullable_(x.sourcePackage), nullable_(x.sourceName), syncedAt
+    nullable_(x.sourcePackage), nullable_(x.sourceName), syncedAt,
+    nullable_(x.samples), nullable_(x.min), nullable_(x.max)
   ]);
 
-  upsertByKey_(daysSheet, dayRows, 1);
   upsertByKey_(workoutsSheet, workoutRows, 1);
   upsertByKey_(sleepSheet, sleepRows, 1);
   upsertByKey_(measurementsSheet, measurementRows, 1);
+  upsertByKey_(daysSheet, dayRows, 1);
 
   logSheet.appendRow([
     new Date(), payload.deviceId || '', payload.rangeStart || '', payload.rangeEnd || '',
@@ -939,6 +940,15 @@ function getSpreadsheet_() {
 }
 
 function ensureSheet_(spreadsheet, name, headers) {
+  if (driveArchiveEnabledV1_() && DRIVE_ARCHIVE_SHEETS_V1.includes(name)) {
+    return {
+      archiveOnly: true,
+      getName: () => name,
+      getParent: () => spreadsheet,
+      archiveHeaders: headers,
+      appendRow: row => archiveRowsToDriveV1_(spreadsheet, name, headers, [row], 'append')
+    };
+  }
   let sheet = spreadsheet.getSheetByName(name);
   if (!sheet) sheet = spreadsheet.insertSheet(name);
   if (sheet.getMaxColumns() < headers.length) {
@@ -952,6 +962,10 @@ function ensureSheet_(spreadsheet, name, headers) {
 
 function upsertByKey_(sheet, rows, keyColumnOneBased) {
   if (!rows.length) return;
+  if (sheet.archiveOnly) {
+    archiveRowsToDriveV1_(sheet.getParent(), sheet.getName(), sheet.archiveHeaders, rows, 'upsert');
+    return;
+  }
   const width = rows[0].length;
   const lastRow = sheet.getLastRow();
   const keyIndex = keyColumnOneBased - 1;
@@ -1143,8 +1157,6 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   const measurementsSheet = ensureSheet_(spreadsheet, MEASUREMENTS_SHEET, MEASUREMENT_HEADERS);
   const syncedAt = payload.syncedAt || new Date().toISOString();
 
-  upsertDayObjectsPartialV3_(daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete);
-
   const workoutRows = (payload.workouts || []).map(w => [
     w.id, w.start, w.end, w.exerciseType, nullable_(w.title), Number(w.durationMinutes || 0),
     nullable_(w.sourcePackage), syncedAt, nullable_(w.notes), nullable_(w.distanceKm), nullable_(w.steps),
@@ -1166,7 +1178,7 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
     // After the 5-minute migration an older APK may still upload one row per sample.
     // Those rows would duplicate the bucket rows, so they are dropped; day summaries
     // from the same payload are still written.
-    if (migrated && isRawHighFrequencyMeasurementV1_(x.type, x.id)) {
+    if (!driveArchiveEnabledV1_() && migrated && isRawHighFrequencyMeasurementV1_(x.type, x.id)) {
       droppedRawSamples++;
       return false;
     }
@@ -1180,6 +1192,7 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   upsertByKey_(workoutsSheet, workoutRows, 1);
   upsertByKey_(sleepSheet, sleepRows, 1);
   upsertByKey_(measurementsSheet, measurementRows, 1);
+  upsertDayObjectsPartialV3_(daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete);
 
   logSheet.appendRow([
     new Date(), payload.deviceId || '', payload.rangeStart || '', payload.rangeEnd || '',
@@ -1426,6 +1439,21 @@ function handleHealthChangesV3_(spreadsheet, logSheet, payload) {
   if (ids.length > 10000) throw new Error('Слишком много удалений в одном пакете');
 
   const affected = new Set();
+  if (driveArchiveEnabledV1_()) {
+    // Preserve deletion events; immutable raw archives are an event history.
+    // Source IDs alone do not carry a date. Conservatively invalidate all daily
+    // summaries so the client's normal repair plan can refresh its readable window.
+    archiveRowsToDriveV1_(spreadsheet, 'HealthConnectChanges', ['Id'], ids.map(id => [id]), 'delete');
+    const daily = spreadsheet.getSheetByName(DAYS_SHEET);
+    if (daily && daily.getLastRow() > 1) {
+      const headers = daily.getRange(1, 1, 1, daily.getLastColumn()).getValues()[0];
+      const index = headers.indexOf('SyncComplete');
+      const dates = daily.getRange(2, 1, daily.getLastRow() - 1, 1).getValues();
+      dates.forEach(row => { const date = normalizeDateWithTz_(row[0], spreadsheet.getSpreadsheetTimeZone()); if (date) affected.add(date); });
+      if (index >= 0) daily.getRange(2, index + 1, dates.length, 1).setValues(dates.map(() => [false]));
+    }
+    return { ok: true, schemaVersion: 3, deleted: 0, archivedDeletionIds: ids.length, affectedDates: Array.from(affected).sort() };
+  }
   let deleted = 0;
   deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(MEASUREMENTS_SHEET), ids, 'measurement', affected, spreadsheet.getSpreadsheetTimeZone());
   deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(SLEEP_SHEET), ids, 'sleep', affected, spreadsheet.getSpreadsheetTimeZone());
@@ -1729,6 +1757,7 @@ function scheduleMeasurementMigrationContinuation_() {
  * Resumes itself via a one-off time trigger until finished. Safe to run again.
  */
 function migrateMeasurementsTo5mV1() {
+  if (driveArchiveEnabledV1_()) return { ok: true, status: 'drive-archive-enabled' };
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) {
     scheduleMeasurementMigrationContinuation_();
@@ -1838,6 +1867,7 @@ function migrateMeasurementsTo5mV1() {
  * deleted, so an interrupted run can only inflate Samples, never lose data.
  */
 function compactOldMeasurementsV1() {
+  if (driveArchiveEnabledV1_()) return archiveDashboardHistoryV1();
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) return { ok: true, status: 'lock-busy' };
   try {
@@ -2989,4 +3019,195 @@ function disconnectFitbitOAuthV1() {
     FITBIT_PROP.LAST_STATUS
   ].forEach(key => props.deleteProperty(key));
   return { ok: true, message: 'Fitbit OAuth tokens удалены; client credentials сохранены' };
+}
+
+// ===== Daily results in Sheets, immutable raw events in Google Drive =====
+const DRIVE_ARCHIVE_SHEETS_V1 = [
+  MEASUREMENTS_SHEET, WORKOUTS_SHEET, SLEEP_SHEET, BODY_COMPOSITION_SHEET, LOG_SHEET
+];
+const DRIVE_ARCHIVE_HISTORY_V1 = DRIVE_ARCHIVE_SHEETS_V1.concat([
+  'Тренировки_данные', 'Данные Mi Fitness', 'Сегменты сна'
+]);
+
+function driveArchiveEnabledV1_() {
+  return PropertiesService.getScriptProperties().getProperty('DRIVE_ARCHIVE_ENABLED_V1') === '1';
+}
+
+function archiveDigestV1_(text) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8)
+    .map(b => ('0' + ((b + 256) % 256).toString(16)).slice(-2)).join('');
+}
+
+function archiveFolderV1_() {
+  const id = PropertiesService.getScriptProperties().getProperty('DRIVE_ARCHIVE_FOLDER_V1');
+  if (!id) throw new Error('Run installDriveArchiveV1 in Apps Script first');
+  return DriveApp.getFolderById(id);
+}
+
+function archiveDayKeyV1_(headers, row, tz) {
+  for (const field of ['Date', 'Time', 'Timestamp', 'Start', 'Дата']) {
+    const index = headers.indexOf(field);
+    if (index < 0 || row[index] === '' || row[index] == null) continue;
+    const value = row[index];
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+    const instant = value instanceof Date ? value : new Date(String(value));
+    if (!isNaN(instant.getTime())) return Utilities.formatDate(instant, tz, 'yyyy-MM-dd');
+  }
+  // Never invent a date or discard a legacy record with an unknown date format.
+  return 'undated';
+}
+
+function archiveRowsToDriveV1_(spreadsheet, source, headers, rows, operation) {
+  if (!rows.length) return [];
+  const folder = archiveFolderV1_();
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  const days = new Map();
+  rows.forEach(row => {
+    const day = archiveDayKeyV1_(headers, row, tz);
+    if (!days.has(day)) days.set(day, []);
+    days.get(day).push(row);
+  });
+  const files = [];
+  days.forEach((dailyRows, day) => {
+    // A day can have arbitrarily many parts. The bound is only a per-file chunk,
+    // never a daily cap; it keeps Apps Script memory and verification bounded.
+    for (let offset = 0; offset < dailyRows.length; offset += 2000) {
+      const document = {
+        schemaVersion: 1, spreadsheetId: spreadsheet.getId(), timeZone: tz,
+        source, day, operation, headers, rows: dailyRows.slice(offset, offset + 2000)
+      };
+      const text = JSON.stringify(document);
+      const digest = archiveDigestV1_(text);
+      const filename = day + '__' + source + '__' + digest + '.json.gz';
+      const existing = folder.getFilesByName(filename);
+      let file = null;
+      while (existing.hasNext()) {
+        const candidate = existing.next();
+        if (archiveDigestV1_(Utilities.ungzip(candidate.getBlob()).getDataAsString('UTF-8')) === digest) {
+          file = candidate;
+          break;
+        }
+      }
+      if (!file) {
+        file = folder.createFile(Utilities.gzip(Utilities.newBlob(text, 'application/json'), filename));
+        // Read the stored bytes back, not the in-memory blob passed to createFile.
+        const restored = Utilities.ungzip(file.getBlob()).getDataAsString('UTF-8');
+        if (archiveDigestV1_(restored) !== digest) throw new Error('Archive verification failed: ' + filename);
+      }
+      files.push(file.getId());
+    }
+  });
+  return files;
+}
+
+/** Run once in the Apps Script editor as the owner to grant Drive/trigger access. */
+function installDriveArchiveV1() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    if (props.getProperty(MEASUREMENT_MIGRATION_PROP.PHASE)) {
+      throw new Error('Finish the existing 5-minute migration before enabling Drive archives');
+    }
+    let folderId = props.getProperty('DRIVE_ARCHIVE_FOLDER_V1');
+    if (!folderId) {
+      folderId = DriveApp.createFolder('HealthConnector — архив сырых данных').getId();
+      props.setProperty('DRIVE_ARCHIVE_FOLDER_V1', folderId);
+    }
+    archiveRowsToDriveV1_(getSpreadsheet_(), 'ArchiveSetup', ['Date'],
+      [[Utilities.formatDate(new Date(), getSpreadsheet_().getSpreadsheetTimeZone(), 'yyyy-MM-dd')]], 'check');
+    // Install a recurring continuation before enabling the new writer. If trigger
+    // authorization fails the old write path remains enabled.
+    const triggers = ScriptApp.getProjectTriggers();
+    if (!triggers.some(t => t.getHandlerFunction() === 'archiveDashboardHistoryV1')) {
+      ScriptApp.newTrigger('archiveDashboardHistoryV1').timeBased().everyMinutes(5).create();
+    }
+    props.setProperty('DRIVE_ARCHIVE_ENABLED_V1', '1');
+    triggers.filter(t => ['migrateMeasurementsTo5mV1', 'compactOldMeasurementsV1'].includes(t.getHandlerFunction()))
+      .forEach(t => ScriptApp.deleteTrigger(t));
+    return { ok: true, folderUrl: archiveFolderV1_().getUrl(), enabled: true, migration: 'scheduled' };
+  } finally { lock.releaseLock(); }
+}
+
+function archiveDependentSheetsV1_(spreadsheet, source) {
+  const dependents = new Set();
+  spreadsheet.getSheets().forEach(sheet => {
+    if (DRIVE_ARCHIVE_HISTORY_V1.includes(sheet.getName())) return;
+    // Formula references include indirect strings too: false positives are safer
+    // than silently blanking a report. Process only populated rows in small reads.
+    for (let start = 1; start <= sheet.getLastRow(); start += 500) {
+      const formulas = sheet.getRange(start, 1, Math.min(500, sheet.getLastRow() - start + 1),
+        Math.max(1, sheet.getLastColumn())).getFormulas();
+      if (formulas.some(row => row.some(formula => formula.includes(source)))) dependents.add(sheet.getName());
+    }
+    sheet.getCharts().forEach(chart => {
+      if (chart.getRanges().some(range => range.getSheet().getName() === source)) dependents.add(sheet.getName());
+    });
+  });
+  return Array.from(dependents);
+}
+
+/** Reentrant, bounded migration. No cursor/delete ambiguity after a crash:
+ * always archive the current leading block, verify it, then delete that block.
+ * Retried blocks find their verified content-addressed files and do not duplicate.
+ * New uploads go directly to Drive while this trigger drains legacy sheets.
+ */
+function archiveDashboardHistoryV1() {
+  if (!driveArchiveEnabledV1_()) return { ok: false, status: 'not-enabled' };
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return { ok: true, status: 'busy' };
+  try {
+    const started = Date.now();
+    const spreadsheet = getSpreadsheet_();
+    const blocked = [];
+    let archivedRows = 0;
+    for (const name of DRIVE_ARCHIVE_HISTORY_V1) {
+      if (Date.now() - started > 120000) break;
+      const sheet = spreadsheet.getSheetByName(name);
+      if (!sheet || sheet.getLastRow() < 2) continue;
+      const dependencies = archiveDependentSheetsV1_(spreadsheet, name);
+      if (dependencies.length) { blocked.push({ source: name, dependents: dependencies }); continue; }
+      // Different historical sheets have multirow headers; preserve them verbatim
+      // in the archive and retain their original header rows in the workbook.
+      const headerRows = Math.max(1, sheet.getFrozenRows());
+      const width = sheet.getLastColumn();
+      const headers = sheet.getRange(1, 1, 1, width).getValues()[0];
+      archiveRowsToDriveV1_(spreadsheet, name, headers,
+        sheet.getRange(1, 1, headerRows, width).getValues(), 'legacy-headers');
+      while (sheet.getLastRow() > headerRows && Date.now() - started < 120000) {
+        const count = Math.min(2000, sheet.getLastRow() - headerRows);
+        const range = sheet.getRange(headerRows + 1, 1, count, width);
+        if (range.getFormulas().some(row => row.some(Boolean))) {
+          blocked.push({ source: name, reason: 'source-contains-formulas' });
+          break;
+        }
+        const rows = range.getValues();
+        archiveRowsToDriveV1_(spreadsheet, name, headers, rows, 'legacy-snapshot');
+        // Sheets requires a non-frozen row to remain.
+        if (sheet.getMaxRows() <= headerRows + count) sheet.insertRowsAfter(sheet.getMaxRows(), 1);
+        sheet.deleteRows(headerRows + 1, count);
+        archivedRows += count;
+      }
+      if (sheet.getLastRow() <= headerRows) {
+        const surplus = sheet.getMaxRows() - headerRows - 1;
+        if (surplus > 0) sheet.deleteRows(headerRows + 2, surplus);
+        sheet.hideSheet();
+      }
+    }
+    const remaining = DRIVE_ARCHIVE_HISTORY_V1.reduce((sum, name) => {
+      const sheet = spreadsheet.getSheetByName(name);
+      return sum + (sheet ? Math.max(0, sheet.getLastRow() - Math.max(1, sheet.getFrozenRows())) : 0);
+    }, 0);
+    const status = { at: new Date().toISOString(), archivedRows, remaining, blocked, folderUrl: archiveFolderV1_().getUrl() };
+    PropertiesService.getScriptProperties().setProperty('DRIVE_ARCHIVE_STATUS_V1', JSON.stringify(status));
+    if (!remaining) ScriptApp.getProjectTriggers()
+      .filter(t => t.getHandlerFunction() === 'archiveDashboardHistoryV1')
+      .forEach(t => ScriptApp.deleteTrigger(t));
+    return status;
+  } finally { lock.releaseLock(); }
+}
+
+function driveArchiveStatusV1() {
+  const props = PropertiesService.getScriptProperties();
+  return { enabled: driveArchiveEnabledV1_(), migration: JSON.parse(props.getProperty('DRIVE_ARCHIVE_STATUS_V1') || '{}') };
 }
