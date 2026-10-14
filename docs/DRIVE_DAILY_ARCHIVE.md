@@ -28,7 +28,7 @@ A failed readback propagates to the uploader and prevents source deletion. Migra
 - Owner must grant Drive and trigger permissions; these cannot be granted by repository changes.
 - Check explicit scopes in the deployed manifest (the deploy workflow intentionally preserves the live manifest).
 - Inspect `migration.blocked` and migrate report formulas/charts as necessary. Source formula cells are preserved rather than replaced with values.
-- Device/source panels that read detailed tables need a future daily-source view once history has drained; existing daily source names remain in `HC_Дни`.
+- In archive mode the device panel uses the existing daily-source fallback from `HC_Дни`; detailed scale addresses/models remain in the archive.
 - Deletion events lack dates, so all daily rows are marked incomplete. Automatic correction is bounded by the existing client repair window; older days require explicit resync from the source. No old aggregate is silently recomputed from insufficient data.
 - Data already bucketed by the Android client cannot be expanded back to original samples.
 - Preserve the Drive folder. Do not disable archival after partially draining history without a deliberate rollback plan.
@@ -38,3 +38,5 @@ A failed readback propagates to the uploader and prevents source deletion. Migra
 `node --test tests/drive-archive.test.cjs`
 
 Eight mocked Apps Script tests cover timezone grouping, exact values, retry deduplication, large days, readback failures, raw-grid bypass, completion ordering, migration retries and report dependency blocking. These tests are not a live Google permission/deployment test.
+
+Live inspection on 2026-10-14 found no formula references to the raw sources in the populated bounds of Дашборд, Аналитика, Индекс эффективности, Дневник, Сон and Тренировки. Runtime dependency checks still protect remaining sheets and charts.
