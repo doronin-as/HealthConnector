@@ -31,6 +31,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Duration
@@ -236,26 +237,18 @@ class HealthSyncStreamer(
         var sleepSessions = JSONArray()
 val workouts = JSONArray()
 
+        // Bounded memory: stage detailed records in app-private cache while calculating
+        // the daily trends. Delete on success, failure or coroutine cancellation.
+        // If interrupted, the daily row stays incomplete and the next run re-reads HC.
+        val archiveSpool = File.createTempFile("hc-raw-${date}-", ".jsonl", context.cacheDir)
+        try {
+
 var sentBatches = 0
 var sentMeasurements = 0
 val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
-    val batchSize = batch.length()
-    val batchNumber = sentBatches + 1
-    onProgress("[$date] Google Sheets: отправляю пачку #$batchNumber · $batchSize изм. · уже отправлено $sentMeasurements")
-            postHealthPayload(
-                endpoint = endpoint,
-                token = token,
-                syncedAt = syncedAt,
-                rangeDate = date,
-                days = JSONArray(),
-                workouts = JSONArray(),
-                sleepSessions = JSONArray(),
-                measurements = batch,
-                sources = sources
-            )
-            sentBatches = batchNumber
-            sentMeasurements += batchSize
-            onProgress("[$date] ✓ Пачка #$sentBatches принята · всего отправлено $sentMeasurements измерений")
+            // One JSON array per line; never keep a full day's measurements in memory.
+            archiveSpool.appendText(batch.toString() + "\\n", Charsets.UTF_8)
+            sentBatches++
         }
 
         suspend fun emit(
@@ -283,8 +276,9 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             })
         }
 
-        // High-frequency series are uploaded as 5-minute buckets (avg/min/max/count) instead of
-        // one row per sample; day statistics are still computed from every raw sample.
+        // Archive every original high-frequency sample. Five-minute buckets are useful
+        // for trends but cannot be expanded into ML-quality time series later.
+        // Day-level statistics above are still computed from the original records.
         suspend fun emitBuckets(
             type: String,
             unit: String,
@@ -294,19 +288,19 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             val pkg = record.sourcePackage()
             if (pkg.isNotBlank()) sources += pkg
             val recordId = stableRecordId(record, "${record.javaClass.simpleName}|${record.hashCode()}")
-            for ((bucketStart, stats) in MeasurementBuckets.group(samples)) {
-                val start = Instant.ofEpochSecond(bucketStart)
+            var ordinal = 0
+            for ((time, value) in samples) {
                 batcher.add(JSONObject().apply {
-                    put("id", MeasurementBuckets.bucketId(recordId, bucketStart))
-                    put("time", start.toString())
-                    put("start", start.toString())
-                    put("end", start.plusSeconds(MeasurementBuckets.BUCKET_SECONDS).toString())
+                    put("id", "${recordId}|raw|${time.toEpochMilli()}|${ordinal++}")
+                    put("time", time.toString())
+                    put("start", time.toString())
+                    put("end", time.toString())
                     put("type", type)
-                    put("value", stats.average)
+                    put("value", value)
                     put("unit", unit)
-                    put("samples", stats.count)
-                    put("min", stats.min)
-                    put("max", stats.max)
+                    put("samples", 1)
+                    put("min", value)
+                    put("max", value)
                     put("sourcePackage", pkg)
                     put("sourceName", sourceName(pkg))
                 })
@@ -428,7 +422,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 rangeDate = date,
                 days = JSONArray().put(checkpointDay),
                 workouts = JSONArray(),
-                sleepSessions = sleepSessions,
+                sleepSessions = JSONArray(),
                 measurements = JSONArray(),
                 sources = sources,
                 dayComplete = false
@@ -652,10 +646,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             workouts.put(buildWorkoutJson(record, workoutDayRecords, dayEnd, sources))
         }
 
-        // Make sure the final partial measurement batch is persisted before the day summary.
-        onProgress("[$date] Финализирую очередь измерений · накоплено ${batcher.totalCount}…")
+        // Detailed batches remain local until HC_Дни has accepted its full summary.
+        onProgress("[$date] Подготовка подробного архива · ${batcher.totalCount} изм.…")
         batcher.flush()
-        onProgress("[$date] ✓ Все измерения отправлены · ${batcher.totalCount} изм. · $sentBatches пачек")
+        onProgress("[$date] Подготовлено ${batcher.totalCount} изм. в $sentBatches пакетах")
 
         if (permissionDeniedTypes.isNotEmpty()) {
             onProgress(
@@ -704,19 +698,81 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 permissionDeniedTypes.isEmpty() &&
                 !sleepNeedsRepair
 
-        onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
+        // Stage A: small, complete trend snapshot. Do not mark the day complete
+        // until the separate raw export has been acknowledged by Drive.
+        onProgress("[$date] Этап 8/8 · сохраняю суточную сводку в Dashboard…")
         postHealthPayload(
             endpoint = endpoint,
             token = token,
             syncedAt = syncedAt,
             rangeDate = date,
             days = JSONArray().put(dayObject),
+            workouts = JSONArray(),
+            sleepSessions = JSONArray(),
+            measurements = JSONArray(),
+            sources = sources,
+            dayComplete = false
+        ) ?: error("Сервер не подтвердил сохранение суточной сводки")
+
+        // Stage B: detailed sleep/workouts, then raw time series. V4 forbids
+        // falling back to Sheets; an unconfigured Drive keeps the day incomplete.
+        onProgress("[$date] Подробный архив · сон и тренировки…")
+        val sessionReceipt = postHealthPayload(
+            endpoint = endpoint,
+            token = token,
+            syncedAt = syncedAt,
+            rangeDate = date,
+            days = JSONArray(),
             workouts = workouts,
             sleepSessions = sleepSessions,
             measurements = JSONArray(),
             sources = sources,
+            action = "healthArchiveV4"
+        ) ?: error("Нет подтверждения архива сна и тренировок")
+        requireArchiveReceipt(sessionReceipt, workouts.length(), sleepSessions.length(), 0)
+
+        var archivedBatches = 0
+        archiveSpool.bufferedReader(Charsets.UTF_8).use { reader ->
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isBlank()) continue
+                val rawBatch = JSONArray(line)
+                val receipt = postHealthPayload(
+                    endpoint = endpoint,
+                    token = token,
+                    syncedAt = syncedAt,
+                    rangeDate = date,
+                    days = JSONArray(),
+                    workouts = JSONArray(),
+                    sleepSessions = JSONArray(),
+                    measurements = rawBatch,
+                    sources = sources,
+                    action = "healthArchiveV4"
+                ) ?: error("Нет подтверждения архива измерений")
+                requireArchiveReceipt(receipt, 0, 0, rawBatch.length())
+                sentMeasurements += rawBatch.length()
+                archivedBatches++
+                onProgress("[$date] Архив проверен: ${sentMeasurements}/${batcher.totalCount} измерений")
+            }
+        }
+        if (sentMeasurements != batcher.totalCount || archivedBatches != sentBatches) {
+            error("Архив неполон: ${sentMeasurements}/${batcher.totalCount} измерений, ${archivedBatches}/$sentBatches пакетов")
+        }
+
+        // Final acknowledgement: a day is complete only AFTER every archive batch
+        // passed the server's write/read-back verification.
+        postHealthPayload(
+            endpoint = endpoint,
+            token = token,
+            syncedAt = syncedAt,
+            rangeDate = date,
+            days = JSONArray().put(JSONObject().put("date", date.toString())),
+            workouts = JSONArray(),
+            sleepSessions = JSONArray(),
+            measurements = JSONArray(),
+            sources = sources,
             dayComplete = dayComplete
-        )
+        ) ?: error("Сервер не подтвердил завершение суточной синхронизации")
         when {
             sleepNeedsRepair -> onProgress(
                 "[$date] ↻ День сохранён, но сон ещё не подтверждён Health Connect; оставляю его на повторное восстановление"
@@ -734,6 +790,19 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             measurements = batcher.totalCount,
             sources = sources
         )
+        } finally {
+            archiveSpool.delete()
+        }
+    }
+
+    private fun requireArchiveReceipt(response: JSONObject, workouts: Int, sleepSessions: Int, measurements: Int) {
+        if (!response.optBoolean("archived", false) ||
+            response.optInt("workouts", -1) != workouts ||
+            response.optInt("sleepSessions", -1) != sleepSessions ||
+            response.optInt("measurements", -1) != measurements
+        ) {
+            error("Сервер подтвердил не все строки подробного архива")
+        }
     }
 
     private fun buildDaySummaryObject(
@@ -1044,11 +1113,12 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         sleepSessions: JSONArray,
         measurements: JSONArray,
         sources: Set<String>,
-        dayComplete: Boolean? = null
+        dayComplete: Boolean? = null,
+        action: String = "healthSyncV3"
     ): JSONObject? {
         val body = JSONObject().apply {
             put("token", token)
-            put("action", "healthSyncV3")
+            put("action", action)
             put("schemaVersion", 3)
             put("syncedAt", syncedAt)
             put("deviceId", android.os.Build.MODEL ?: "Android")
