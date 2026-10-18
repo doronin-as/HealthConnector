@@ -119,6 +119,7 @@ function doGet(e) {
     service: 'Health Dashboard Sync',
     schemaVersion: 4,
     archiveProtocol: 'healthArchiveV4',
+    rawStorage: rawFilesReadyV4_(),
     time: new Date().toISOString(),
     googleHealth: googleHealthStatusV1_(),
     fitbitLegacy: fitbitStatusV1_()
@@ -195,23 +196,12 @@ function doPost(e) {
       return json_(importBodyCompositionV1_(spreadsheet, logSheet, payload));
     }
 
-    // V4 is a dedicated second-stage upload. The complete daily summary must
-    // reach HC_Дни first; this route never modifies daily trend rows.
-    // Archive mode is mandatory: silently falling back to raw Sheets would
-    // violate the storage contract and risk overflowing the workbook.
+    // The V4 raw-file writer is independent of legacy migration and activation.
+    // It never touches the raw measurement/workout/sleep worksheets.
     if (payload.action === 'healthArchiveV4') {
-      if (!driveArchiveEnabledV1_()) {
-        return json_({ ok: false, errorCode: 'ARCHIVE_DISABLED',
-          message: 'Архив Google Drive не активирован; суточная сводка сохранена, подробная выгрузка ожидает повторения.' });
-      }
       validateHealthPayload_(payload);
       if (payload.days.length) throw new Error('healthArchiveV4 не принимает суточные сводки');
-      const result = importHealthPayloadV3_(spreadsheet, logSheet, payload);
-      // archiveRowsToDriveV1_ does a read-back hash verification before returning.
-      // An HTTP acknowledgement therefore means all rows in this batch were stored.
-      result.archived = true;
-      result.archiveSchemaVersion = 4;
-      return json_(result);
+      return json_(importHealthArchiveFilesV4_(spreadsheet, payload));
     }
 
     validateHealthPayload_(payload);
@@ -3045,6 +3035,80 @@ function disconnectFitbitOAuthV1() {
   return { ok: true, message: 'Fitbit OAuth tokens удалены; client credentials сохранены' };
 }
 
+
+// ===== V4 simple, on-demand raw file storage =====
+// This path deliberately does not invoke installDriveArchiveV1, legacy migration,
+// raw-sheet adapters, or the old migration state. Google Drive is only the
+// persistent storage location for independent read-back-verified JSON.gz files.
+const RAW_FILES_V4_FOLDER_PROP = 'RAW_FILES_V4_FOLDER_ID';
+
+function rawFilesFolderV4_() {
+  const props = PropertiesService.getScriptProperties();
+  const configured = props.getProperty(RAW_FILES_V4_FOLDER_PROP);
+  if (configured) return DriveApp.getFolderById(configured);
+  // doPost holds a script-wide lock, so concurrent first uploads cannot create
+  // competing folders. Never create or delete existing spreadsheet sheets.
+  const folder = DriveApp.createFolder('HealthConnector — подробные данные v4');
+  props.setProperty(RAW_FILES_V4_FOLDER_PROP, folder.getId());
+  return folder;
+}
+
+/** Optional one-time manual authorization from Apps Script editor; never migrates data. */
+function installRawFilesV4() {
+  const folder = rawFilesFolderV4_();
+  return { ok: true, folderUrl: folder.getUrl() };
+}
+
+function rawFilesReadyV4_() {
+  try {
+    // Read-only probe; no folder creation or change to existing data.
+    DriveApp.getRootFolder().getId();
+    return { ready: true, mode: 'on-demand-files' };
+  } catch (_) {
+    return { ready: false, mode: 'on-demand-files', reason: 'Google Drive authorization required for Apps Script deployment owner' };
+  }
+}
+
+/** Store full-resolution sessions/samples in private gzip files, never in Sheets. */
+function importHealthArchiveFilesV4_(spreadsheet, payload) {
+  const syncedAt = payload.syncedAt || new Date().toISOString();
+  const workoutRows = (payload.workouts || []).map(w => [
+    w.id, w.start, w.end, w.exerciseType, nullable_(w.title), Number(w.durationMinutes || 0),
+    nullable_(w.sourcePackage), syncedAt, nullable_(w.notes), nullable_(w.distanceKm), nullable_(w.steps),
+    nullable_(w.activeCaloriesKcal), nullable_(w.totalCaloriesKcal), nullable_(w.averageHeartRate),
+    nullable_(w.minimumHeartRate), nullable_(w.maximumHeartRate), nullable_(w.averageSpeedKmh), nullable_(w.maximumSpeedKmh),
+    nullable_(w.averageStepCadence), nullable_(w.maximumStepCadence), nullable_(w.averageCyclingCadence), nullable_(w.maximumCyclingCadence),
+    nullable_(w.averagePowerW), nullable_(w.maximumPowerW), nullable_(w.elevationGainedM), nullable_(w.floorsClimbed),
+    nullable_(w.segmentsJson), nullable_(w.lapsJson), nullable_(w.routeState), nullable_(w.sourceName)
+  ]);
+  const sleepRows = (payload.sleepSessions || []).map(x => [
+    x.id, x.start, x.end, nullable_(x.durationMinutes), nullable_(x.title), nullable_(x.notes),
+    nullable_(x.deepSleepMinutes), nullable_(x.lightSleepMinutes), nullable_(x.remSleepMinutes), nullable_(x.awakeMinutes),
+    nullable_(x.stageCount), nullable_(x.stagesJson), nullable_(x.sourcePackage), nullable_(x.sourceName), syncedAt
+  ]);
+
+  const measurementRows = (payload.measurements || []).map(x => [
+    x.id, nullable_(x.time), nullable_(x.start), nullable_(x.end), nullable_(x.type), nullable_(x.value), nullable_(x.unit),
+    nullable_(x.sourcePackage), nullable_(x.sourceName), syncedAt,
+    nullable_(x.samples), nullable_(x.min), nullable_(x.max)
+  ]);
+  // Resolve the folder only when there is data to write. An empty archive call
+  // is valid and needs no access to Drive.
+  const total = workoutRows.length + sleepRows.length + measurementRows.length;
+  const folder = total ? rawFilesFolderV4_() : null;
+  if (folder) {
+    archiveRowsToDriveV1_(spreadsheet, WORKOUTS_SHEET, WORKOUT_HEADERS, workoutRows, 'upsert', folder);
+    archiveRowsToDriveV1_(spreadsheet, SLEEP_SHEET, SLEEP_HEADERS, sleepRows, 'upsert', folder);
+    archiveRowsToDriveV1_(spreadsheet, MEASUREMENTS_SHEET, MEASUREMENT_HEADERS, measurementRows, 'upsert', folder);
+  }
+  // Each write above verifies persisted bytes before returning successfully.
+  return {
+    ok: true, schemaVersion: 4, archiveSchemaVersion: 4, archived: true,
+    workouts: workoutRows.length, sleepSessions: sleepRows.length, measurements: measurementRows.length,
+    days: 0, message: 'Подробные данные сохранены в отдельных файлах Google Drive'
+  };
+}
+
 // ===== Daily results in Sheets, immutable raw events in Google Drive =====
 const DRIVE_ARCHIVE_SHEETS_V1 = [
   MEASUREMENTS_SHEET, WORKOUTS_SHEET, SLEEP_SHEET, BODY_COMPOSITION_SHEET, LOG_SHEET
@@ -3081,9 +3145,9 @@ function archiveDayKeyV1_(headers, row, tz) {
   return 'undated';
 }
 
-function archiveRowsToDriveV1_(spreadsheet, source, headers, rows, operation) {
+function archiveRowsToDriveV1_(spreadsheet, source, headers, rows, operation, targetFolder) {
   if (!rows.length) return [];
-  const folder = archiveFolderV1_();
+  const folder = targetFolder || archiveFolderV1_();
   const tz = spreadsheet.getSpreadsheetTimeZone();
   const days = new Map();
   rows.forEach(row => {
