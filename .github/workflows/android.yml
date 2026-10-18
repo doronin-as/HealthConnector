@@ -47,6 +47,8 @@ jobs:
           grep -F 'isMinifyEnabled = true' app/build.gradle.kts
           grep -F 'stableRelease' app/build.gradle.kts
           test ! -e .github/signing/healthconnector-dev.keystore.b64
+      - name: Verify Drive raw-file archival protocol
+        run: node --test tests/drive-archive.test.cjs tests/raw-files-v4.test.cjs
       - name: Run unit tests
         run: gradle :app:testReleaseUnitTest --stacktrace
       - name: Build installable TEST APK
