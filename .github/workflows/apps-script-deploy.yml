@@ -106,6 +106,23 @@ jobs:
             --description "${DESCRIPTION}" \
             --json
 
+      - name: Verify published web app protocol
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://script.google.com/macros/s/${APPS_SCRIPT_DEPLOYMENT_ID}/exec"
+          for attempt in 1 2 3 4 5; do
+            if curl --location --silent --show-error --fail --max-time 35 "$URL" > "$RUNNER_TEMP/health-server-check.json"; then
+              if node -e 'const fs=require("fs");const s=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/health-server-check.json","utf8"));if(!s.ok || s.schemaVersion<4 || s.archiveProtocol!=="healthArchiveV4")process.exit(1);console.log("Published server: schema v"+s.schemaVersion+" ("+s.archiveProtocol+")");'; then
+                exit 0
+              fi
+            fi
+            echo "Server v4 not visible yet (attempt $attempt/5); retrying..."
+            sleep 8
+          done
+          echo '::error::Published Apps Script Web App did not confirm protocol v4'
+          exit 1
+
       - name: Deployment summary
         shell: bash
         run: |
