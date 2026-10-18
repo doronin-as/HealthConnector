@@ -85,7 +85,7 @@ class HealthSyncStreamer(
         val fallbackStart = today.minusDays((safeDays - 1).toLong())
 
         onProgress("Проверяю версию Google Sheets…")
-        ServerCompatibility.requireV3(endpoint)
+        ServerCompatibility.requireArchiveV4(endpoint)
         onProgress("Проверяю состояние Dashboard…")
         val plan = runCatching { fetchSyncPlan(endpoint, token, safeDays) }
             .getOrElse { error ->
@@ -838,12 +838,25 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     }
 
     private fun requireArchiveReceipt(response: JSONObject, workouts: Int, sleepSessions: Int, measurements: Int) {
-        if (!response.optBoolean("archived", false) ||
-            response.optInt("workouts", -1) != workouts ||
-            response.optInt("sleepSessions", -1) != sleepSessions ||
-            response.optInt("measurements", -1) != measurements
-        ) {
-            error("Сервер подтвердил не все строки подробного архива")
+        if (!response.optBoolean("archived", false) || response.optInt("archiveSchemaVersion", 0) < 4) {
+            error(
+                "Сервер не поддерживает подтверждения архива v4. " +
+                    "Обнови опубликованную версию Google Apps Script (Развернуть → Управление развертываниями → Новая версия); " +
+                    "сырые данные НЕ считаются сохранёнными. Ответ сервера: " +
+                    "archived=${response.optString("archived", "отсутствует")}, " +
+                    "archiveSchemaVersion=${response.optString("archiveSchemaVersion", "отсутствует")}"
+            )
+        }
+        val actualWorkouts = response.optInt("workouts", -1)
+        val actualSleep = response.optInt("sleepSessions", -1)
+        val actualMeasurements = response.optInt("measurements", -1)
+        if (actualWorkouts != workouts || actualSleep != sleepSessions || actualMeasurements != measurements) {
+            error(
+                "Архив v4 вернул неполное подтверждение: " +
+                    "тренировок $actualWorkouts/$workouts, " +
+                    "сна $actualSleep/$sleepSessions, " +
+                    "измерений $actualMeasurements/$measurements. День будет выгружен повторно."
+            )
         }
     }
 
