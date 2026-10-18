@@ -117,7 +117,8 @@ function doGet(e) {
   return json_({
     ok: true,
     service: 'Health Dashboard Sync',
-    schemaVersion: 3,
+    schemaVersion: 4,
+    archiveProtocol: 'healthArchiveV4',
     time: new Date().toISOString(),
     googleHealth: googleHealthStatusV1_(),
     fitbitLegacy: fitbitStatusV1_()
