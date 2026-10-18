@@ -35,6 +35,19 @@ function setup(enabled = true) {
   return { context, events, send };
 }
 
+test('server GET advertises v4; client requires v4 before any sync', () => {
+  const f = setup(true);
+  f.context.googleHealthIsOAuthCallbackV1_ = () => false;
+  f.context.googleHealthStatusV1_ = () => ({});
+  f.context.fitbitStatusV1_ = () => ({});
+  const info = f.context.doGet({ parameter: {} });
+  assert.equal(info.schemaVersion, 4);
+  assert.equal(info.archiveProtocol, 'healthArchiveV4');
+  const client = fs.readFileSync('app/src/main/java/ru/doronin/healthconnector/ServerCompatibility.kt', 'utf8');
+  assert.match(client, /REQUIRED_SCHEMA = 4/);
+  assert.match(client, /requireArchiveV4/);
+});
+
 test('archive V4 never silently falls back to raw Sheets', () => {
   const f = setup(false);
   const reply = f.send({ measurements: [{ id: 'x' }] });
