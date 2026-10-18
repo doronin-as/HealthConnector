@@ -247,7 +247,7 @@ var sentBatches = 0
 var sentMeasurements = 0
 val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // One JSON array per line; never keep a full day's measurements in memory.
-            archiveSpool.appendText(batch.toString() + "\\n", Charsets.UTF_8)
+            archiveSpool.appendText(batch.toString() + "\n", Charsets.UTF_8)
             sentBatches++
         }
 
