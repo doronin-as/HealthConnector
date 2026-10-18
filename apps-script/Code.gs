@@ -117,7 +117,8 @@ function doGet(e) {
   return json_({
     ok: true,
     service: 'Health Dashboard Sync',
-    schemaVersion: 3,
+    schemaVersion: 4,
+    archiveProtocol: 'healthArchiveV4',
     time: new Date().toISOString(),
     googleHealth: googleHealthStatusV1_(),
     fitbitLegacy: fitbitStatusV1_()
@@ -192,6 +193,25 @@ function doPost(e) {
     }
     if (payload.action === 'bodyCompositionV1') {
       return json_(importBodyCompositionV1_(spreadsheet, logSheet, payload));
+    }
+
+    // V4 is a dedicated second-stage upload. The complete daily summary must
+    // reach HC_Дни first; this route never modifies daily trend rows.
+    // Archive mode is mandatory: silently falling back to raw Sheets would
+    // violate the storage contract and risk overflowing the workbook.
+    if (payload.action === 'healthArchiveV4') {
+      if (!driveArchiveEnabledV1_()) {
+        return json_({ ok: false, errorCode: 'ARCHIVE_DISABLED',
+          message: 'Архив Google Drive не активирован; суточная сводка сохранена, подробная выгрузка ожидает повторения.' });
+      }
+      validateHealthPayload_(payload);
+      if (payload.days.length) throw new Error('healthArchiveV4 не принимает суточные сводки');
+      const result = importHealthPayloadV3_(spreadsheet, logSheet, payload);
+      // archiveRowsToDriveV1_ does a read-back hash verification before returning.
+      // An HTTP acknowledgement therefore means all rows in this batch were stored.
+      result.archived = true;
+      result.archiveSchemaVersion = 4;
+      return json_(result);
     }
 
     validateHealthPayload_(payload);
