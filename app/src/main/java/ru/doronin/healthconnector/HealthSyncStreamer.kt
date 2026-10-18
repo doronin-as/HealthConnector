@@ -240,11 +240,9 @@ val workouts = JSONArray()
         // Bounded memory: stage detailed records in app-private cache while calculating
         // the daily trends. Delete on success, failure or coroutine cancellation.
         // If interrupted, the daily row stays incomplete and the next run re-reads HC.
-        val archiveSpool = File.createTempFile("hc-raw-${date}-", ".jsonl", context.cacheDir)
-        try {
+        val archiveSpool = createRawSpool(date)
 
 var sentBatches = 0
-var sentMeasurements = 0
 val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // One JSON array per line; never keep a full day's measurements in memory.
             archiveSpool.appendText(batch.toString() + "\n", Charsets.UTF_8)
@@ -698,6 +696,67 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 permissionDeniedTypes.isEmpty() &&
                 !sleepNeedsRepair
 
+        uploadDayAndArchive(
+            endpoint = endpoint,
+            token = token,
+            syncedAt = syncedAt,
+            date = date,
+            dayObject = dayObject,
+            workouts = workouts,
+            sleepSessions = sleepSessions,
+            archiveSpool = archiveSpool,
+            sources = sources,
+            dayComplete = dayComplete,
+            totalMeasurements = batcher.totalCount,
+            batchCount = sentBatches,
+            onProgress = onProgress
+        )
+        when {
+            sleepNeedsRepair -> onProgress(
+                "[$date] ↻ День сохранён, но сон ещё не подтверждён Health Connect; оставляю его на повторное восстановление"
+            )
+            dayComplete -> onProgress(
+                "[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен."
+            )
+            else -> onProgress(
+                "[$date] ✓ Данные сохранены · день пока незавершён · ${batcher.totalCount} изм. · ${workoutRecords.size} трен."
+            )
+        }
+
+        return DayResult(
+            workouts = workoutRecords.size,
+            measurements = batcher.totalCount,
+            sources = sources
+        )
+    }
+
+    private fun createRawSpool(date: LocalDate): File {
+        // Remove orphaned private staging files from interrupted earlier runs.
+        val cutoff = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
+        context.cacheDir.listFiles()?.forEach { file ->
+            if (file.name.startsWith("hc-raw-") && file.name.endsWith(".jsonl") &&
+                file.lastModified() < cutoff) file.delete()
+        }
+        return File.createTempFile("hc-raw-${date}-", ".jsonl", context.cacheDir)
+    }
+
+    private suspend fun uploadDayAndArchive(
+        endpoint: String,
+        token: String,
+        syncedAt: String,
+        date: LocalDate,
+        dayObject: JSONObject,
+        workouts: JSONArray,
+        sleepSessions: JSONArray,
+        archiveSpool: File,
+        sources: Set<String>,
+        dayComplete: Boolean,
+        totalMeasurements: Int,
+        batchCount: Int,
+        onProgress: (String) -> Unit
+    ) {
+        var sentMeasurements = 0
+        try {
         // Stage A: small, complete trend snapshot. Do not mark the day complete
         // until the separate raw export has been acknowledged by Drive.
         onProgress("[$date] Этап 8/8 · сохраняю суточную сводку в Dashboard…")
@@ -752,11 +811,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                 requireArchiveReceipt(receipt, 0, 0, rawBatch.length())
                 sentMeasurements += rawBatch.length()
                 archivedBatches++
-                onProgress("[$date] Архив проверен: ${sentMeasurements}/${batcher.totalCount} измерений")
+                onProgress("[$date] Архив проверен: ${sentMeasurements}/${totalMeasurements} измерений")
             }
         }
-        if (sentMeasurements != batcher.totalCount || archivedBatches != sentBatches) {
-            error("Архив неполон: ${sentMeasurements}/${batcher.totalCount} измерений, ${archivedBatches}/$sentBatches пакетов")
+        if (sentMeasurements != totalMeasurements || archivedBatches != batchCount) {
+            error("Архив неполон: ${sentMeasurements}/${totalMeasurements} измерений, ${archivedBatches}/$batchCount пакетов")
         }
 
         // Final acknowledgement: a day is complete only AFTER every archive batch
@@ -773,23 +832,6 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             sources = sources,
             dayComplete = dayComplete
         ) ?: error("Сервер не подтвердил завершение суточной синхронизации")
-        when {
-            sleepNeedsRepair -> onProgress(
-                "[$date] ↻ День сохранён, но сон ещё не подтверждён Health Connect; оставляю его на повторное восстановление"
-            )
-            dayComplete -> onProgress(
-                "[$date] ✓ День полностью синхронизирован · ${batcher.totalCount} изм. · ${workoutRecords.size} трен."
-            )
-            else -> onProgress(
-                "[$date] ✓ Данные сохранены · день пока незавершён · ${batcher.totalCount} изм. · ${workoutRecords.size} трен."
-            )
-        }
-
-        return DayResult(
-            workouts = workoutRecords.size,
-            measurements = batcher.totalCount,
-            sources = sources
-        )
         } finally {
             archiveSpool.delete()
         }
