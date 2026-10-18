@@ -113,7 +113,7 @@ jobs:
           URL="https://script.google.com/macros/s/${APPS_SCRIPT_DEPLOYMENT_ID}/exec"
           for attempt in 1 2 3 4 5; do
             if curl --location --silent --show-error --fail --max-time 35 "$URL" > "$RUNNER_TEMP/health-server-check.json"; then
-              if node -e 'const fs=require("fs");const s=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/health-server-check.json","utf8"));if(!s.ok || s.schemaVersion<4 || s.archiveProtocol!=="healthArchiveV4")process.exit(1);console.log("Published server: schema v"+s.schemaVersion+" ("+s.archiveProtocol+")");'; then
+              if node -e 'const fs=require("fs");const s=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/health-server-check.json","utf8"));if(!s.ok || s.schemaVersion<4 || s.archiveProtocol!=="healthArchiveV4")process.exit(1);console.log("Published server: schema v"+s.schemaVersion+" ("+s.archiveProtocol+")"); console.log("Raw file storage ready: "+Boolean(s.rawStorage&&s.rawStorage.ready)); if(s.rawStorage && !s.rawStorage.ready) console.log("::warning::Drive access not authorized for Web App owner; run installRawFilesV4 in the Apps Script editor and reauthorize the Web App.");'; then
                 exit 0
               fi
             fi
