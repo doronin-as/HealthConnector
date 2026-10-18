@@ -3053,6 +3053,12 @@ function rawFilesFolderV4_() {
   return folder;
 }
 
+/** Optional one-time manual authorization from Apps Script editor; never migrates data. */
+function installRawFilesV4() {
+  const folder = rawFilesFolderV4_();
+  return { ok: true, folderUrl: folder.getUrl() };
+}
+
 function rawFilesReadyV4_() {
   try {
     // Read-only probe; no folder creation or change to existing data.
