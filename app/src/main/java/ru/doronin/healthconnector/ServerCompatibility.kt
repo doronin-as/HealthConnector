@@ -6,11 +6,11 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** Prevents a v3 client from sending partial-day payloads to the legacy v2 Apps Script handler. */
+/** Prevents a v4 client from uploading raw data to a legacy Apps Script endpoint. */
 object ServerCompatibility {
-    private const val REQUIRED_SCHEMA = 3
+    private const val REQUIRED_SCHEMA = 4
 
-    suspend fun requireV3(endpoint: String) = withContext(Dispatchers.IO) {
+    suspend fun requireArchiveV4(endpoint: String) = withContext(Dispatchers.IO) {
         val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
         val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
         try {
@@ -26,7 +26,7 @@ object ServerCompatibility {
                 .getOrElse { error("Apps Script вернул некорректный ответ") }
             val schema = json.optInt("schemaVersion", 0)
             require(schema >= REQUIRED_SCHEMA) {
-                "Apps Script устарел (schema v$schema). Сначала разверни серверную часть schema v$REQUIRED_SCHEMA; данные не отправлены."
+                "Версия Google Apps Script устарела (сервер v$schema, приложение требует v$REQUIRED_SCHEMA). Опубликуй новую версию веб-приложения в Apps Script: Развернуть → Управление развертываниями → Изменить → Новая версия → Развернуть. Синхронизация не начиналась."
             }
         } finally {
             connection.disconnect()
