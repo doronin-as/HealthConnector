@@ -29,6 +29,12 @@ Health Connect (day-by-day)
 
 The Google Drive storage format is **gzip JSON** with schema version, spreadsheet identity, timezone, source name, day, operation, column headers, and rows. Files are **immutable events** and may represent revised uploads of the same record. For ML datasets, deduplicate by `source` + `Id` + latest `SyncedAt`; apply deletion events from `HealthConnectChanges` before building a current-state dataset. Do not blindly sum historical event files. Keep raw source IDs, timestamps, units, source names, and relevant timezone information.
 
+## Storage rollout update (2026-10-19)
+
+The **deployed** V4 server now uses simple standalone raw files, independently of the legacy Drive Archive setting. It stores detailed JSON.gz files in `HealthConnector — подробные данные v4` and automatically creates the folder on first nonempty upload, **provided the Apps Script owner has granted Drive access**. It does not require `installDriveArchiveV1`, and does not migrate or delete legacy raw sheets. See `docs/RAW_FILES_V4.md` in PR #42 for the current server storage contract. The original legacy archival setup below is historical and **must not be used** for the standalone V4 pipeline.
+
+The client continues to transmit verified batches of up to 2,000 samples. v1.6.38 also retries temporary `UnknownHostException` and stops immediately if the server cannot be reached for its synchronization plan, instead of reading seven fallback days pointlessly. A persistent DNS failure still needs a working network or resolver; these changes cannot fix an unreachable domain.
+
 ## Reliability and migration prerequisites
 
 1. Deploy the updated Apps Script Web App. Its new authenticated action `healthArchiveV4` refuses to write to Sheets if Drive archive mode is disabled.
