@@ -48,7 +48,7 @@ jobs:
           grep -F 'stableRelease' app/build.gradle.kts
           test ! -e .github/signing/healthconnector-dev.keystore.b64
       - name: Test Drive archive and summary-first protocol
-        run: node --test tests/drive-archive.test.cjs tests/summary-first-archive.test.cjs
+        run: node --test tests/drive-archive.test.cjs tests/raw-files-v4.test.cjs tests/summary-first-archive.test.cjs
       - name: Run unit tests
         run: gradle :app:testReleaseUnitTest --stacktrace
       - name: Build installable TEST APK
