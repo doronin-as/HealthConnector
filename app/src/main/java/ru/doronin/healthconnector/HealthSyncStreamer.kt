@@ -89,6 +89,10 @@ class HealthSyncStreamer(
         onProgress("Проверяю состояние Dashboard…")
         val plan = runCatching { fetchSyncPlan(endpoint, token, safeDays) }
             .getOrElse { error ->
+                // A missing DNS route is not an outdated Dashboard. Without any
+                // connection the fallback would re-read multiple days only to fail
+                // on the very next POST. Preserve the real network error instead.
+                if (isConnectivityFailure(error)) throw error
                 SyncDiagnostics.server(
                     context,
                     "healthSyncPlanV3 недоступен: ${error.message ?: error.javaClass.simpleName}; использую локальный диапазон",
@@ -1258,9 +1262,15 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
     }
 
+    private fun isConnectivityFailure(error: Throwable): Boolean =
+        error is java.net.UnknownHostException ||
+            error is java.net.ConnectException ||
+            error is java.net.NoRouteToHostException ||
+            error is java.net.SocketTimeoutException
+
     private fun isRetryableRequestError(error: Throwable): Boolean {
         val value = (error.message ?: "").lowercase()
-        return error is java.net.SocketTimeoutException ||
+        return isConnectivityFailure(error) ||
             "lock_busy" in value ||
             "блокиров" in value ||
             "timeout" in value ||
