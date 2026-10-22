@@ -27,6 +27,7 @@ import androidx.health.connect.client.records.metadata.DataOrigin
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -171,20 +172,40 @@ class HealthSyncStreamer(
         var totalMeasurements = 0
         val allSources = linkedSetOf<String>()
 
+        val failedDays = linkedMapOf<LocalDate, String>()
         dates.forEachIndexed { index, date ->
             onProgress("Читаю день ${index + 1}/${dates.size}: $date…")
-            val result = syncDay(
-                endpoint = endpoint,
-                token = token,
-                date = date,
-                zone = zone,
-                wideSleepRecords = wideSleepRecordsByWakeDate[date].orEmpty(),
-                onProgress = onProgress
-            )
-            totalWorkouts += result.workouts
-            totalMeasurements += result.measurements
-            allSources += result.sources
+            // One broken day must not stop the other days from reaching HC_Дни.
+            try {
+                val result = syncDay(
+                    endpoint = endpoint,
+                    token = token,
+                    date = date,
+                    zone = zone,
+                    wideSleepRecords = wideSleepRecordsByWakeDate[date].orEmpty(),
+                    onProgress = onProgress
+                )
+                totalWorkouts += result.workouts
+                totalMeasurements += result.measurements
+                allSources += result.sources
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                val reason = error.message ?: error.javaClass.simpleName
+                failedDays[date] = reason
+                onProgress("[$date] ✗ День не синхронизирован: $reason · продолжаю со следующим днём")
+                SyncDiagnostics.server(context, "[$date] день пропущен: $reason", "ERROR")
+            }
             if (index + 1 < dates.size) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
+        }
+
+        if (failedDays.isNotEmpty()) {
+            // Tokens stay where they were, so the next run re-reads these changes.
+            error(
+                "Не синхронизировано дней: ${failedDays.size} из ${dates.size} (" +
+                    failedDays.entries.joinToString("; ") { "${it.key}: ${it.value}" } +
+                    "). Остальные дни сохранены."
+            )
         }
 
         // Every day implied by the change feed was uploaded; only now advance the tokens.
@@ -236,26 +257,9 @@ class HealthSyncStreamer(
         var sleepSessions = JSONArray()
 val workouts = JSONArray()
 
-var sentBatches = 0
-var sentMeasurements = 0
+val raw = RawUploadState()
 val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
-    val batchSize = batch.length()
-    val batchNumber = sentBatches + 1
-    onProgress("[$date] Google Sheets: отправляю пачку #$batchNumber · $batchSize изм. · уже отправлено $sentMeasurements")
-            postHealthPayload(
-                endpoint = endpoint,
-                token = token,
-                syncedAt = syncedAt,
-                rangeDate = date,
-                days = JSONArray(),
-                workouts = JSONArray(),
-                sleepSessions = JSONArray(),
-                measurements = batch,
-                sources = sources
-            )
-            sentBatches = batchNumber
-            sentMeasurements += batchSize
-            onProgress("[$date] ✓ Пачка #$sentBatches принята · всего отправлено $sentMeasurements измерений")
+            uploadRawBatch(endpoint, token, syncedAt, date, batch, sources, raw, onProgress)
         }
 
         suspend fun emit(
@@ -655,7 +659,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         // Make sure the final partial measurement batch is persisted before the day summary.
         onProgress("[$date] Финализирую очередь измерений · накоплено ${batcher.totalCount}…")
         batcher.flush()
-        onProgress("[$date] ✓ Все измерения отправлены · ${batcher.totalCount} изм. · $sentBatches пачек")
+        onProgress(raw.summary(date, batcher.totalCount))
 
         if (permissionDeniedTypes.isNotEmpty()) {
             onProgress(
@@ -702,7 +706,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         val dayComplete =
             date.isBefore(todayForCompletion) &&
                 permissionDeniedTypes.isEmpty() &&
-                !sleepNeedsRepair
+                !sleepNeedsRepair &&
+                raw.failedBatches == 0
 
         onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
         postHealthPayload(
@@ -734,6 +739,70 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             measurements = batcher.totalCount,
             sources = sources
         )
+    }
+
+    /** Upload state of one day's detailed measurement batches. */
+    private class RawUploadState {
+        var sentBatches = 0
+        var sentMeasurements = 0
+        var failedBatches = 0
+        var failedMeasurements = 0
+        var lastError = ""
+
+        fun summary(date: LocalDate, total: Int): String =
+            if (failedBatches == 0) {
+                "[$date] ✓ Все измерения отправлены · $total изм. · $sentBatches пачек"
+            } else {
+                "[$date] ⚠ Подробные измерения отправлены не полностью: не принято $failedMeasurements " +
+                    "в $failedBatches пачк. ($lastError) · суточная сводка всё равно будет сохранена"
+            }
+    }
+
+    /**
+     * Detailed rows are secondary: the day summary is computed on the phone from every
+     * original sample. A failed batch keeps the day incomplete (so it is retried) but
+     * must never prevent the summary from reaching HC_Дни.
+     */
+    private suspend fun uploadRawBatch(
+        endpoint: String,
+        token: String,
+        syncedAt: String,
+        date: LocalDate,
+        batch: JSONArray,
+        sources: Set<String>,
+        state: RawUploadState,
+        onProgress: (String) -> Unit
+    ) {
+        val batchSize = batch.length()
+        val batchNumber = state.sentBatches + state.failedBatches + 1
+        onProgress("[$date] Google Sheets: отправляю пачку #$batchNumber · $batchSize изм. · уже отправлено ${state.sentMeasurements}")
+        try {
+            val response = postHealthPayload(
+                endpoint = endpoint,
+                token = token,
+                syncedAt = syncedAt,
+                rangeDate = date,
+                days = JSONArray(),
+                workouts = JSONArray(),
+                sleepSessions = JSONArray(),
+                measurements = batch,
+                sources = sources
+            )
+            state.sentBatches++
+            state.sentMeasurements += batchSize
+            val skipped = response?.optInt("measurementsSkipped", 0) ?: 0
+            val note = if (skipped > 0) {
+                " · сервер не хранит подробных строк: $skipped (${response?.optString("warning").orEmpty()})"
+            } else ""
+            onProgress("[$date] ✓ Пачка #$batchNumber принята · всего отправлено ${state.sentMeasurements} измерений$note")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            state.failedBatches++
+            state.failedMeasurements += batchSize
+            state.lastError = error.message ?: error.javaClass.simpleName
+            onProgress("[$date] ⚠ Пачка #$batchNumber подробных измерений не принята: ${state.lastError} · продолжаю")
+        }
     }
 
     private fun buildDaySummaryObject(
