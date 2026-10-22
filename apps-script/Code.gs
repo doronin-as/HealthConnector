@@ -127,23 +127,39 @@ function doGet(e) {
 }
 
 function doPost(e) {
-  const lock = LockService.getScriptLock();
+  // Authentication and control actions happen BEFORE the script lock: status and abort
+  // must answer even while a long request or a trigger holds the lock.
+  let payload;
   try {
-    if (!lock.tryLock(5000)) {
-      return json_({
-        ok: false,
-        errorCode: 'LOCK_BUSY',
-        error: 'Сервер занят другой синхронизацией',
-        message: 'Сервер занят другой синхронизацией. Приложение повторит запрос автоматически.'
-      });
-    }
-    const payload = JSON.parse((e.postData && e.postData.contents) || '{}');
+    payload = JSON.parse((e.postData && e.postData.contents) || '{}');
     if (!payload || typeof payload !== 'object') throw new Error('Пустой JSON');
-
     const expectedToken = PropertiesService.getScriptProperties().getProperty('API_TOKEN');
     if (!expectedToken || !constantTimeTokenEquals_(payload.token, expectedToken)) {
       throw new Error('Неверный API-токен');
     }
+  } catch (error) {
+    const message = String(error && error.message || error);
+    return json_({ ok: false, error: message, message: message });
+  }
+  if (payload.action === 'serverStatusV1') return json_(serverStatusV1_());
+  if (payload.action === 'abortSyncV1') return json_(abortSyncV1_(payload));
+  if (isAbortedRunV1_(payload)) {
+    return json_({ ok: false, errorCode: 'ABORTED', message: 'Синхронизация остановлена пользователем' });
+  }
+
+  const lock = LockService.getScriptLock();
+  try {
+    if (!lock.tryLock(LOCK_WAIT_MS_V1)) {
+      const holder = activeHolderTextV1_();
+      return json_({
+        ok: false,
+        errorCode: 'LOCK_BUSY',
+        holder: holder,
+        error: 'Сервер занят: ' + holder,
+        message: 'Сервер занят: ' + holder + '. Приложение повторит запрос автоматически.'
+      });
+    }
+    markLockHolderV1_(payload.action || 'healthSync', payload.runId, payload.deviceId);
 
     const spreadsheet = getSpreadsheet_();
     const logSheet = ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS);
@@ -1109,7 +1125,8 @@ function json_(object) {
 
 // ===== Health Connector schema v3 integrity layer =====
 const DAY_HEADERS_V3 = DAY_HEADERS.concat([
-  'MainSleepHours', 'NapCount', 'NapMinutes', 'SyncComplete', 'CompletedAt'
+  'MainSleepHours', 'NapCount', 'NapMinutes', 'SyncComplete', 'CompletedAt',
+  'StepsBySource', 'ActivitySource', 'QualityFlags', 'Quality', 'QualityChecks'
 ]);
 
 const DAY_FIELD_TO_HEADER_V3 = Object.freeze({
@@ -1165,7 +1182,10 @@ const DAY_FIELD_TO_HEADER_V3 = Object.freeze({
   maximumPowerW: 'MaxPowerW',
   mainSleepHours: 'MainSleepHours',
   napCount: 'NapCount',
-  napMinutes: 'NapMinutes'
+  napMinutes: 'NapMinutes',
+  stepsBySource: 'StepsBySource',
+  activitySource: 'ActivitySource',
+  qualityFlags: 'QualityFlags'
 });
 
 function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
@@ -1211,6 +1231,13 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   upsertByKey_(sleepSheet, sleepRows, 1);
   const raw = writeRawMeasurementsGuardedV1_(measurementsSheet, measurementRows);
   upsertDayObjectsPartialV3_(daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete);
+  if (payload.dayFinal === true || payload.dayComplete === true) {
+    // Best effort: the day itself is already stored; a quality-cell failure must not fail it.
+    try {
+      refreshDayQualityV1_(daysSheet, (payload.days || []).map(d => String(d.date || '')),
+        spreadsheet.getSpreadsheetTimeZone());
+    } catch (_) {}
+  }
 
   // The data above is already stored. A full journal must not turn a successful
   // write into an error the client would retry until the whole day is abandoned.
@@ -1485,6 +1512,8 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
   }
 
   if (startDate > today) startDate = today;
+  const quality = dayQualityReportV1_(sheet, tz, today);
+  const measurements = spreadsheet.getSheetByName(MEASUREMENTS_SHEET);
   return {
     ok: true,
     schemaVersion: 3,
@@ -1492,8 +1521,123 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
     latestDate,
     today,
     reason,
-    message: `Dashboard: последняя дата ${latestDate}; синхронизация с ${startDate}`
+    // Explicit list: only these dates need re-reading (plus today/yesterday on the client).
+    repairDates: quality.repairDates,
+    incompleteDays: quality.incompleteDays,
+    expectedMetrics: quality.expectedMetrics,
+    storesHighVolumeRaw: !rawHighVolumePolicyV1_(measurements).skip,
+    message: `Dashboard: последняя дата ${latestDate}; синхронизация с ${startDate}` +
+      (quality.repairDates.length ? `; к восстановлению дней: ${quality.repairDates.length}` : '')
   };
+}
+
+// ===== Day completeness / quality (v1) =====
+//
+// A metric is "expected" when it was recorded on most recent days, so the check adapts
+// to what the bracelet really measures. A finished day that lacks an expected metric is
+// re-read up to QUALITY_MAX_CHECKS_V1 times; after that the gap is recorded as
+// confirmed ("в источнике нет данных") instead of being retried forever.
+const QUALITY_METRICS_V1 = [
+  ['Steps', 'шаги'], ['DistanceKm', 'дистанция'], ['ActiveCaloriesKcal', 'активные ккал'],
+  ['TotalCaloriesKcal', 'ккал всего'], ['SleepHours', 'сон'], ['AvgHeartRate', 'пульс'],
+  ['RestingHeartRate', 'пульс покоя'], ['AvgSpO2', 'SpO2'], ['AvgHrvRmssdMs', 'HRV'],
+  ['AvgRespiratoryRate', 'дыхание'], ['AvgSkinTempDeltaC', 'температура кожи']
+];
+const QUALITY_MAX_CHECKS_V1 = 3;
+const QUALITY_EXPECTED_SHARE_V1 = 0.6;
+const QUALITY_MIN_HISTORY_DAYS_V1 = 5;
+const QUALITY_MIN_STEPS_V1 = 300;
+
+function qualityCellPresentV1_(header, value) {
+  if (value === '' || value === null || value === undefined) return false;
+  const n = Number(value);
+  if (header === 'Steps') return Number.isFinite(n) && n >= QUALITY_MIN_STEPS_V1;
+  if (Number.isFinite(n)) return n !== 0 || header === 'AvgSkinTempDeltaC';
+  return String(value).trim() !== '';
+}
+
+function expectedMetricsV1_(rows) {
+  if (rows.length < QUALITY_MIN_HISTORY_DAYS_V1) return [];
+  return QUALITY_METRICS_V1.filter(([header]) => {
+    const present = rows.filter(r => qualityCellPresentV1_(header, r.values[header])).length;
+    return present / rows.length >= QUALITY_EXPECTED_SHARE_V1;
+  }).map(([header]) => header);
+}
+
+/** Pure: evaluates one finished day. */
+function evaluateDayQualityV1_(values, expected) {
+  const labels = new Map(QUALITY_METRICS_V1);
+  const missing = expected.filter(h => !qualityCellPresentV1_(h, values[h])).map(h => labels.get(h));
+  const complete = booleanCellV3_(values.SyncComplete);
+  const checks = Number(values.QualityChecks) || 0;
+  return { missing, complete, checks, ok: complete !== false && !missing.length };
+}
+
+function qualityTextV1_(evaluation) {
+  if (evaluation.ok) return 'OK';
+  const parts = [];
+  if (evaluation.missing.length) parts.push('нет: ' + evaluation.missing.join(', '));
+  if (evaluation.complete === false) parts.push('день не завершён');
+  return evaluation.checks >= QUALITY_MAX_CHECKS_V1
+    ? `${parts.join('; ')} — проверено ${evaluation.checks} раза, в источнике нет данных`
+    : `${parts.join('; ')} (проверка ${evaluation.checks} из ${QUALITY_MAX_CHECKS_V1})`;
+}
+
+function readDayRowsV1_(sheet, tz) {
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const width = Math.min(sheet.getLastColumn(), DAY_HEADERS_V3.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().map((row, index) => {
+    const values = {};
+    headers.forEach((h, i) => { if (h) values[h] = row[i]; });
+    return { rowNumber: index + 2, date: normalizeDateWithTz_(row[0], tz), values, headers };
+  }).filter(r => r.date);
+}
+
+/** Repair plan for the readable window (last 30 days, today excluded from quality). */
+function dayQualityReportV1_(sheet, tz, today) {
+  const oldest = addDaysToDateKeyV3_(today, -29, tz);
+  const yesterday = addDaysToDateKeyV3_(today, -1, tz);
+  const byDate = new Map();
+  readDayRowsV1_(sheet, tz).forEach(r => byDate.set(r.date, r));
+  const finished = Array.from(byDate.values()).filter(r => r.date >= oldest && r.date < today);
+  const expected = expectedMetricsV1_(finished);
+  const firstKnown = Array.from(byDate.keys()).sort()[0] || yesterday;
+
+  const repairDates = [];
+  const incompleteDays = [];
+  for (let date = oldest > firstKnown ? oldest : firstKnown; date <= yesterday; date = addDaysToDateKeyV3_(date, 1, tz)) {
+    const row = byDate.get(date);
+    if (!row) {
+      repairDates.push(date);
+      incompleteDays.push({ date, missing: ['весь день'], checks: 0 });
+      continue;
+    }
+    const evaluation = evaluateDayQualityV1_(row.values, expected);
+    if (evaluation.ok) continue;
+    incompleteDays.push({ date, missing: evaluation.missing, notComplete: evaluation.complete === false, checks: evaluation.checks });
+    if (evaluation.checks < QUALITY_MAX_CHECKS_V1) repairDates.push(date);
+  }
+  return { repairDates, incompleteDays, expectedMetrics: expected };
+}
+
+/**
+ * Called after a day's final summary: stores Quality/QualityChecks for these dates.
+ * Every final sync of a day that is still not OK consumes one check.
+ */
+function refreshDayQualityV1_(sheet, dates, tz) {
+  if (!sheet || !dates.length) return;
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const oldest = addDaysToDateKeyV3_(today, -29, tz);
+  const rows = readDayRowsV1_(sheet, tz);
+  const expected = expectedMetricsV1_(rows.filter(r => r.date >= oldest && r.date < today));
+  const qualityIndex = DAY_HEADERS_V3.indexOf('Quality');
+  rows.filter(r => dates.includes(r.date) && r.date < today).forEach(r => {
+    const before = evaluateDayQualityV1_(r.values, expected);
+    const checks = before.ok ? 0 : Math.min(QUALITY_MAX_CHECKS_V1, before.checks + 1);
+    const text = qualityTextV1_(Object.assign({}, before, { checks }));
+    sheet.getRange(r.rowNumber, qualityIndex + 1, 1, 2).setValues([[text, checks]]);
+  });
 }
 
 function booleanCellV3_(value) {
@@ -1840,12 +1984,17 @@ function scheduleMeasurementMigrationContinuation_() {
  * Resumes itself via a one-off time trigger until finished. Safe to run again.
  */
 function migrateMeasurementsTo5mV1() {
+  // Copyback blocks all writes, so it is finished even when jobs are paused.
+  if (serverJobsPausedV1_() && PropertiesService.getScriptProperties().getProperty(MEASUREMENT_MIGRATION_PROP.PHASE) !== 'copyback') {
+    return { ok: true, status: 'paused' };
+  }
   if (driveArchiveEnabledV1_()) return { ok: true, status: 'drive-archive-enabled' };
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) {
     scheduleMeasurementMigrationContinuation_();
     return { ok: true, status: 'lock-busy-rescheduled' };
   }
+  markLockHolderV1_('фоновая задача: migrateMeasurementsTo5mV1', '', 'сервер');
   try {
     const props = PropertiesService.getScriptProperties();
     if (props.getProperty(MEASUREMENT_MIGRATION_PROP.DONE) === '1' &&
@@ -1950,9 +2099,11 @@ function migrateMeasurementsTo5mV1() {
  * deleted, so an interrupted run can only inflate Samples, never lose data.
  */
 function compactOldMeasurementsV1() {
+  if (serverJobsPausedV1_()) return { ok: true, status: 'paused' };
   if (driveArchiveEnabledV1_()) return archiveDashboardHistoryV1();
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) return { ok: true, status: 'lock-busy' };
+  markLockHolderV1_('фоновая задача: compactOldMeasurementsV1', '', 'сервер');
   try {
     const props = PropertiesService.getScriptProperties();
     if (props.getProperty(MEASUREMENT_MIGRATION_PROP.PHASE)) {
@@ -2815,9 +2966,11 @@ function fitbitScheduledSyncV1() {
  * Fitbit did not return a metric.
  */
 function fitbitSyncRecentV1(days) {
+  if (serverJobsPausedV1_()) return { ok: true, status: 'paused' };
   const safeDays = Math.max(1, Math.min(FITBIT_V1.MAX_MANUAL_DAYS, Number(days || 3)));
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) throw new Error('Fitbit sync: сервер занят другой синхронизацией');
+  markLockHolderV1_('фоновая задача: fitbitSyncRecentV1', '', 'сервер');
 
   try {
     // Force token validation/refresh before mutating Sheets.
@@ -3310,9 +3463,11 @@ function archiveDependentSheetsV1_(spreadsheet, source) {
  * New uploads go directly to Drive while this trigger drains legacy sheets.
  */
 function archiveDashboardHistoryV1() {
+  if (serverJobsPausedV1_()) return { ok: true, status: 'paused' };
   if (!driveArchiveEnabledV1_()) return { ok: false, status: 'not-enabled' };
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return { ok: true, status: 'busy' };
+  markLockHolderV1_('фоновая задача: archiveDashboardHistoryV1', '', 'сервер');
   try {
     const started = Date.now();
     const spreadsheet = getSpreadsheet_();
@@ -3479,5 +3634,111 @@ function writeDiaryValueV1_(spreadsheet, date, aliases, value) {
   if (cell.getFormula()) return 'formula';
   cell.setValue(value);
   return 'written';
+}
+
+
+// ===== Sync control: who holds the lock, abort, pause server jobs (v1) =====
+const LOCK_WAIT_MS_V1 = 20000;
+const LOCK_HOLDER_PROP_V1 = 'LOCK_HOLDER_V1';
+const ABORT_BEFORE_PROP_V1 = 'SYNC_ABORT_BEFORE_MS_V1';
+const SERVER_JOBS_PAUSED_PROP_V1 = 'SERVER_JOBS_PAUSED_V1';
+const SERVER_JOB_HANDLERS_V1 = [
+  'migrateMeasurementsTo5mV1', 'compactOldMeasurementsV1', 'archiveDashboardHistoryV1', 'fitbitSyncRecentV1'
+];
+
+/** Records who acquired the script lock. Overwritten by the next holder. */
+function markLockHolderV1_(action, runId, deviceId) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(LOCK_HOLDER_PROP_V1, JSON.stringify({
+      action: String(action || '').slice(0, 80), runId: String(runId || '').slice(0, 80),
+      deviceId: String(deviceId || '').slice(0, 80), since: Date.now()
+    }));
+  } catch (_) {}
+}
+
+function lastLockHolderV1_() {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(LOCK_HOLDER_PROP_V1) || 'null'); }
+  catch (_) { return null; }
+}
+
+function activeHolderTextV1_() {
+  const holder = lastLockHolderV1_();
+  if (!holder) return 'неизвестный процесс';
+  const seconds = Math.round((Date.now() - Number(holder.since || 0)) / 1000);
+  return `${holder.action || 'запрос'}${holder.deviceId ? ' с ' + holder.deviceId : ''}, ${seconds} с`;
+}
+
+/** Requests of a run started before the last abort are rejected without waiting for the lock. */
+function isAbortedRunV1_(payload) {
+  const startedAt = Number(payload && payload.runStartedAt);
+  if (!Number.isFinite(startedAt) || startedAt <= 0) return false;
+  const abortBefore = Number(PropertiesService.getScriptProperties().getProperty(ABORT_BEFORE_PROP_V1) || 0);
+  return abortBefore > 0 && startedAt < abortBefore;
+}
+
+function serverJobsPausedV1_() {
+  return PropertiesService.getScriptProperties().getProperty(SERVER_JOBS_PAUSED_PROP_V1) === '1';
+}
+
+function abortSyncV1_(payload) {
+  const props = PropertiesService.getScriptProperties();
+  const now = Date.now();
+  // abortRuns:false only toggles the job pause and leaves running syncs alone.
+  if (payload.abortRuns !== false) props.setProperty(ABORT_BEFORE_PROP_V1, String(now));
+  if (payload.pauseServerJobs === true) props.setProperty(SERVER_JOBS_PAUSED_PROP_V1, '1');
+  if (payload.pauseServerJobs === false) props.deleteProperty(SERVER_JOBS_PAUSED_PROP_V1);
+  return {
+    ok: true, abortedBefore: new Date(now).toISOString(), serverJobsPaused: serverJobsPausedV1_(),
+    message: 'Все запущенные синхронизации будут остановлены на следующем запросе. ' +
+      'Запрос, который уже выполняется на сервере, завершится сам (до 6 минут).'
+  };
+}
+
+/** Lock-free diagnostics: is the lock busy, by whom, which background jobs exist. */
+function serverStatusV1_() {
+  const props = PropertiesService.getScriptProperties();
+  let lockFree = false;
+  try {
+    const lock = LockService.getScriptLock();
+    lockFree = lock.tryLock(0);
+    if (lockFree) lock.releaseLock();
+  } catch (_) {}
+  const holder = lastLockHolderV1_();
+  const ageSec = holder ? Math.round((Date.now() - Number(holder.since || 0)) / 1000) : null;
+  let triggers = [];
+  try {
+    triggers = ScriptApp.getProjectTriggers().map(t => ({
+      handler: t.getHandlerFunction(), source: String(t.getEventType())
+    }));
+  } catch (error) { triggers = [{ handler: 'нет доступа: ' + error.message }]; }
+  let measurementRows = null;
+  try {
+    const sheet = getSpreadsheet_().getSheetByName(MEASUREMENTS_SHEET);
+    measurementRows = sheet ? Math.max(0, sheet.getLastRow() - 1) : 0;
+  } catch (_) {}
+  const migrationPhase = props.getProperty(MEASUREMENT_MIGRATION_PROP.PHASE) || '';
+  const abortBefore = Number(props.getProperty(ABORT_BEFORE_PROP_V1) || 0);
+  return {
+    ok: true,
+    schemaVersion: 1,
+    time: new Date().toISOString(),
+    lock: {
+      busy: !lockFree,
+      holder: holder ? Object.assign({}, holder, { ageSec, stale: !lockFree && ageSec > 360 }) : null,
+      text: lockFree ? 'свободен' + (holder ? ` (последним был ${holder.action}, ${ageSec} с назад)` : '')
+        : 'занят: ' + activeHolderTextV1_()
+    },
+    serverJobsPaused: serverJobsPausedV1_(),
+    triggers,
+    measurementMigration: {
+      phase: migrationPhase,
+      blocksWrites: migrationPhase === 'copyback',
+      done: props.getProperty(MEASUREMENT_MIGRATION_PROP.DONE) === '1'
+    },
+    measurementRows,
+    rawHighVolumeStored: measurementRows === null ? null : measurementRows < RAW_HIGH_VOLUME_ROW_LIMIT_V1,
+    driveArchiveEnabled: driveArchiveEnabledV1_(),
+    abortBefore: abortBefore ? new Date(abortBefore).toISOString() : ''
+  };
 }
 

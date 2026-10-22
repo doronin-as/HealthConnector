@@ -65,7 +65,7 @@ class OutboxWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     }
 
     companion object {
-        private const val UNIQUE = "local_outbox_upload"
+        const val UNIQUE = "local_outbox_upload"
         private const val BATCH_SIZE = 50
         private const val MAX_ROUNDS = 10
         private val ACTIONS = mapOf(

@@ -18,6 +18,24 @@ object BackgroundSyncScheduler {
 
     private const val UNIQUE_WORK_NAME = "health_connector_background_sync"
 
+    /** After "stop everything": drop the running generation, next run only after a full interval. */
+    fun restartAfterAbort(context: Context) {
+        val appContext = context.applicationContext
+        val manager = WorkManager.getInstance(appContext)
+        manager.cancelUniqueWork(UNIQUE_WORK_NAME)
+        val enabled = appContext.getSharedPreferences("settings", Context.MODE_PRIVATE).getBoolean(PREF_ENABLED, true)
+        if (!enabled) return
+        manager.enqueueUniquePeriodicWork(
+            UNIQUE_WORK_NAME,
+            ExistingPeriodicWorkPolicy.UPDATE,
+            request().setInitialDelay(INTERVAL_HOURS, TimeUnit.HOURS).build()
+        )
+    }
+
+    private fun request() = PeriodicWorkRequestBuilder<BackgroundSyncWorker>(INTERVAL_HOURS, TimeUnit.HOURS)
+        .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+        .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.MINUTES)
+
     fun apply(context: Context) {
         val appContext = context.applicationContext
         val prefs = appContext.getSharedPreferences("settings", Context.MODE_PRIVATE)

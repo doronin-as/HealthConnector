@@ -48,7 +48,7 @@ class ManualSyncWorker(appContext: Context, workerParams: WorkerParameters) : Co
         val startedAt=SystemClock.elapsedRealtime()
         return try {
             val result=SyncRunGate.runManual(onWaiting={ running -> val m="Ожидаю завершения ${running ?: "другой"} синхронизации…"; publish(m); SyncDiagnostics.progress(applicationContext,runId,"manual",m) }) {
-                HealthSyncStreamer(applicationContext,client).sync(endpoint=safeEndpoint,token=token,days=days,includeHistoricalChanges=true,onProgress={ message -> val elapsed=(SystemClock.elapsedRealtime()-startedAt)/1000L; publish("$message · ${elapsed} с"); SyncDiagnostics.progress(applicationContext,runId,"manual",message) })
+                SyncControl.tracked("ручная синхронизация (фон)") { HealthSyncStreamer(applicationContext,client).sync(endpoint=safeEndpoint,token=token,days=days,includeHistoricalChanges=true,onProgress={ message -> val elapsed=(SystemClock.elapsedRealtime()-startedAt)/1000L; publish("$message · ${elapsed} с"); SyncDiagnostics.progress(applicationContext,runId,"manual",message) }) }
             }
             if (result==null) { SyncDiagnostics.skipped(applicationContext,"manual","Повторный ручной запуск не создан"); Result.success() }
             else {

@@ -1142,7 +1142,7 @@ class StreamingMainActivity : AppCompatActivity() {
                 }
                 try {
                     val streamer = HealthSyncStreamer(this, client)
-                    val result = streamer.sync(
+                    val result = SyncControl.tracked("ручная синхронизация") { streamer.sync(
                         safeEndpoint,
                         settings.token,
                         settings.days,
@@ -1155,7 +1155,7 @@ class StreamingMainActivity : AppCompatActivity() {
                             val elapsedSec = (SystemClock.elapsedRealtime() - syncStartedAt) / 1000L
                             binding.status.text = "$message\n● Процесс идёт · ${elapsedSec} с"
                         }
-                    }
+                    } }
                     SyncDiagnostics.finish(
                         this,
                         runId,
@@ -1164,7 +1164,11 @@ class StreamingMainActivity : AppCompatActivity() {
                     )
                     result
                 } catch (cancelled: CancellationException) {
-                    SyncDiagnostics.skipped(this, "manual", "Ручная синхронизация отменена системой или закрытием экрана")
+                    SyncDiagnostics.skipped(
+                        this, "manual",
+                        if (cancelled is SyncAbortedException) "Ручная синхронизация остановлена пользователем; принятые данные сохранены"
+                        else "Ручная синхронизация отменена системой или закрытием экрана"
+                    )
                     throw cancelled
                 } catch (error: Throwable) {
                     SyncDiagnostics.failure(this, runId, "manual", error)
@@ -1182,6 +1186,7 @@ class StreamingMainActivity : AppCompatActivity() {
                     "измерений ${result.measurements}, источников ${result.sources}"
         }.onFailure { error ->
             binding.status.text = when (error) {
+                is SyncAbortedException -> "Синхронизация остановлена. Принятые сервером данные сохранены, незавершённые дни будут дочитаны при следующем запуске"
                 is OutOfMemoryError -> "Ошибка памяти: данных слишком много даже для дневного пакета. Уменьши диапазон до 1 дня и сообщи мне."
                 else -> "Ошибка: ${error.message ?: error.javaClass.simpleName}"
             }
