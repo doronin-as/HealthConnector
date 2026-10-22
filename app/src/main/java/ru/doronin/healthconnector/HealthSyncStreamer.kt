@@ -257,45 +257,10 @@ class HealthSyncStreamer(
         var sleepSessions = JSONArray()
 val workouts = JSONArray()
 
-var sentBatches = 0
-var sentMeasurements = 0
-var failedRawBatches = 0
-var failedRawMeasurements = 0
-var lastRawError = ""
+val raw = RawUploadState()
 val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
-    val batchSize = batch.length()
-    val batchNumber = sentBatches + failedRawBatches + 1
-    onProgress("[$date] Google Sheets: отправляю пачку #$batchNumber · $batchSize изм. · уже отправлено $sentMeasurements")
-            // Detailed rows are secondary: the day summary is computed here from every
-            // original sample. A failed batch keeps the day incomplete (so it is retried)
-            // but must never prevent the summary from reaching HC_Дни.
-            try {
-                val response = postHealthPayload(
-                    endpoint = endpoint,
-                    token = token,
-                    syncedAt = syncedAt,
-                    rangeDate = date,
-                    days = JSONArray(),
-                    workouts = JSONArray(),
-                    sleepSessions = JSONArray(),
-                    measurements = batch,
-                    sources = sources
-                )
-                sentBatches++
-                sentMeasurements += batchSize
-                val skipped = response?.optInt("measurementsSkipped", 0) ?: 0
-                onProgress(
-                    "[$date] ✓ Пачка #$batchNumber принята · всего отправлено $sentMeasurements измерений" +
-                        if (skipped > 0) " · сервер не хранит подробных строк: $skipped (${response?.optString("warning").orEmpty()})" else ""
-                )
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                failedRawBatches++
-                failedRawMeasurements += batchSize
-                lastRawError = error.message ?: error.javaClass.simpleName
-                onProgress("[$date] ⚠ Пачка #$batchNumber подробных измерений не принята: $lastRawError · продолжаю")
-            }
+            uploadRawBatch(endpoint, token, syncedAt, date, batch, sources, raw, onProgress)
+        }
         }
 
         suspend fun emit(
@@ -695,14 +660,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         // Make sure the final partial measurement batch is persisted before the day summary.
         onProgress("[$date] Финализирую очередь измерений · накоплено ${batcher.totalCount}…")
         batcher.flush()
-        if (failedRawBatches == 0) {
-            onProgress("[$date] ✓ Все измерения отправлены · ${batcher.totalCount} изм. · $sentBatches пачек")
-        } else {
-            onProgress(
-                "[$date] ⚠ Подробные измерения отправлены не полностью: не принято $failedRawMeasurements " +
-                    "в $failedRawBatches пачк. ($lastRawError) · суточная сводка всё равно будет сохранена"
-            )
-        }
+        onProgress(raw.summary(date, batcher.totalCount))
 
         if (permissionDeniedTypes.isNotEmpty()) {
             onProgress(
@@ -750,7 +708,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             date.isBefore(todayForCompletion) &&
                 permissionDeniedTypes.isEmpty() &&
                 !sleepNeedsRepair &&
-                failedRawBatches == 0
+                raw.failedBatches == 0
 
         onProgress("[$date] Этап 8/8 · отправляю итоговую сводку · тренировок ${workoutRecords.size}…")
         postHealthPayload(
@@ -782,6 +740,70 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             measurements = batcher.totalCount,
             sources = sources
         )
+    }
+
+    /** Upload state of one day's detailed measurement batches. */
+    private class RawUploadState {
+        var sentBatches = 0
+        var sentMeasurements = 0
+        var failedBatches = 0
+        var failedMeasurements = 0
+        var lastError = ""
+
+        fun summary(date: LocalDate, total: Int): String =
+            if (failedBatches == 0) {
+                "[$date] ✓ Все измерения отправлены · $total изм. · $sentBatches пачек"
+            } else {
+                "[$date] ⚠ Подробные измерения отправлены не полностью: не принято $failedMeasurements " +
+                    "в $failedBatches пачк. ($lastError) · суточная сводка всё равно будет сохранена"
+            }
+    }
+
+    /**
+     * Detailed rows are secondary: the day summary is computed on the phone from every
+     * original sample. A failed batch keeps the day incomplete (so it is retried) but
+     * must never prevent the summary from reaching HC_Дни.
+     */
+    private suspend fun uploadRawBatch(
+        endpoint: String,
+        token: String,
+        syncedAt: String,
+        date: LocalDate,
+        batch: JSONArray,
+        sources: Set<String>,
+        state: RawUploadState,
+        onProgress: (String) -> Unit
+    ) {
+        val batchSize = batch.length()
+        val batchNumber = state.sentBatches + state.failedBatches + 1
+        onProgress("[$date] Google Sheets: отправляю пачку #$batchNumber · $batchSize изм. · уже отправлено ${state.sentMeasurements}")
+        try {
+            val response = postHealthPayload(
+                endpoint = endpoint,
+                token = token,
+                syncedAt = syncedAt,
+                rangeDate = date,
+                days = JSONArray(),
+                workouts = JSONArray(),
+                sleepSessions = JSONArray(),
+                measurements = batch,
+                sources = sources
+            )
+            state.sentBatches++
+            state.sentMeasurements += batchSize
+            val skipped = response?.optInt("measurementsSkipped", 0) ?: 0
+            val note = if (skipped > 0) {
+                " · сервер не хранит подробных строк: $skipped (${response?.optString("warning").orEmpty()})"
+            } else ""
+            onProgress("[$date] ✓ Пачка #$batchNumber принята · всего отправлено ${state.sentMeasurements} измерений$note")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            state.failedBatches++
+            state.failedMeasurements += batchSize
+            state.lastError = error.message ?: error.javaClass.simpleName
+            onProgress("[$date] ⚠ Пачка #$batchNumber подробных измерений не принята: ${state.lastError} · продолжаю")
+        }
     }
 
     private fun buildDaySummaryObject(
