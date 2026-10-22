@@ -261,7 +261,6 @@ val raw = RawUploadState()
 val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             uploadRawBatch(endpoint, token, syncedAt, date, batch, sources, raw, onProgress)
         }
-        }
 
         suspend fun emit(
             type: String,
