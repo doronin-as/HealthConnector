@@ -1203,15 +1203,20 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
 
   upsertByKey_(workoutsSheet, workoutRows, 1);
   upsertByKey_(sleepSheet, sleepRows, 1);
-  upsertByKey_(measurementsSheet, measurementRows, 1);
+  const raw = writeRawMeasurementsGuardedV1_(measurementsSheet, measurementRows);
   upsertDayObjectsPartialV3_(daysSheet, payload.days || [], syncedAt, spreadsheet.getSpreadsheetTimeZone(), payload.dayComplete);
 
-  logSheet.appendRow([
-    new Date(), payload.deviceId || '', payload.rangeStart || '', payload.rangeEnd || '',
-    (payload.days || []).length, workoutRows.length, 'OK',
-    `V3 partial sync: сон ${sleepRows.length}; измерения ${measurementRows.length}` +
-      (droppedRawSamples ? `; отброшено посэмпловых строк старого клиента ${droppedRawSamples}` : '')
-  ]);
+  // The data above is already stored. A full journal must not turn a successful
+  // write into an error the client would retry until the whole day is abandoned.
+  try {
+    logSheet.appendRow([
+      new Date(), payload.deviceId || '', payload.rangeStart || '', payload.rangeEnd || '',
+      (payload.days || []).length, workoutRows.length, raw.skipped ? 'WARNING' : 'OK',
+      `V3 partial sync: сон ${sleepRows.length}; измерения ${raw.stored}` +
+        (droppedRawSamples ? `; отброшено посэмпловых строк старого клиента ${droppedRawSamples}` : '') +
+        (raw.skipped ? `; не записано в HC_Измерения ${raw.skipped} (${raw.reason})` : '')
+    ]);
+  } catch (_) {}
 
   return {
     ok: true,
@@ -1220,8 +1225,66 @@ function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
     workouts: workoutRows.length,
     sleepSessions: sleepRows.length,
     measurements: measurementRows.length,
-    message: `V3: дней ${(payload.days || []).length}; тренировок ${workoutRows.length}; сна ${sleepRows.length}; измерений ${measurementRows.length}`
+    measurementsStored: raw.stored,
+    measurementsSkipped: raw.skipped,
+    warning: raw.skipped ? raw.reason : '',
+    message: `V3: дней ${(payload.days || []).length}; тренировок ${workoutRows.length}; сна ${sleepRows.length}; измерений ${raw.stored}` +
+      (raw.skipped ? `; пропущено подробных ${raw.skipped}` : '')
   };
+}
+
+// ===== Raw measurement capacity guard (v1) =====
+//
+// Daily values (HC_Дни) are computed on the phone from every original sample, so they
+// do not depend on HC_Измерения. Per-minute rows (steps, distance, calories) and the
+// high-frequency buckets are the bulk of that sheet; once it is large, every upsert
+// reads hundreds of thousands of keys, requests time out and the client used to abandon
+// the whole day before sending its summary. When the sheet is overloaded, high-volume
+// rows are no longer written to Sheets; low-volume measurements (weight, SpO2, HRV,
+// resting HR, VO2 max…) still are. Script Property SHEETS_RAW_HIGH_VOLUME_V1:
+//   'keep' — always write, 'skip' — never write, unset — automatic by row count.
+const RAW_HIGH_VOLUME_TYPES_V1 = new Set([
+  'Steps', 'Distance', 'ActiveCalories', 'TotalCalories',
+  'HeartRate', 'Speed', 'StepCadence', 'CyclingCadence', 'Power', 'SkinTemperatureDelta'
+]);
+const RAW_HIGH_VOLUME_ROW_LIMIT_V1 = 250000;
+const RAW_HIGH_VOLUME_PROP_V1 = 'SHEETS_RAW_HIGH_VOLUME_V1';
+
+function rawHighVolumePolicyV1_(sheet) {
+  if (!sheet || sheet.archiveOnly) return { skip: false, reason: '' };
+  const mode = PropertiesService.getScriptProperties().getProperty(RAW_HIGH_VOLUME_PROP_V1) || '';
+  if (mode === 'keep') return { skip: false, reason: '' };
+  if (mode === 'skip') return { skip: true, reason: 'подробные поминутные данные отключены' };
+  const rows = typeof sheet.getLastRow === 'function' ? sheet.getLastRow() : 0;
+  return rows >= RAW_HIGH_VOLUME_ROW_LIMIT_V1
+    ? { skip: true, reason: `HC_Измерения переполнен (${rows} строк)` }
+    : { skip: false, reason: '' };
+}
+
+function isWorkbookCellLimitError_(error) {
+  const text = String(error && error.message || error);
+  return /10[ ,.]?000[ ,.]?000|limit of .*cells|cells in the workbook|ячеек/i.test(text);
+}
+
+/** Writes measurement rows; returns {stored, skipped, reason}. Never blocks day summaries on capacity. */
+function writeRawMeasurementsGuardedV1_(sheet, rows) {
+  if (!rows.length) return { stored: 0, skipped: 0, reason: '' };
+  const policy = rawHighVolumePolicyV1_(sheet);
+  const kept = policy.skip
+    ? rows.filter(row => !RAW_HIGH_VOLUME_TYPES_V1.has(String(row[MEASUREMENT_COL.TYPE] || '')))
+    : rows;
+  let skipped = rows.length - kept.length;
+  let reason = skipped ? policy.reason : '';
+  try {
+    upsertByKey_(sheet, kept, 1);
+  } catch (error) {
+    // Only a full workbook is tolerated; any other failure must still fail the request.
+    if (sheet.archiveOnly || !isWorkbookCellLimitError_(error)) throw error;
+    skipped += kept.length;
+    reason = 'в таблице закончилось место (лимит ячеек Google Sheets)';
+    return { stored: 0, skipped, reason };
+  }
+  return { stored: kept.length, skipped, reason };
 }
 
 function upsertDayObjectsPartialV3_(sheet, days, syncedAt, tz, dayComplete) {
