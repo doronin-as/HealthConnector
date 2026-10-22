@@ -29,8 +29,18 @@ import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import kotlin.math.roundToLong
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -57,6 +67,14 @@ class HealthSyncStreamer(
     private var sleepOriginProbeDiagnostic: String = "origin probe: не выполнялся"
     private val sourceNameCache = HashMap<String, String>()
 
+    // Run identity: lets the server reject an aborted run's requests without waiting for its lock.
+    private val runId: String = java.util.UUID.randomUUID().toString()
+    @Volatile private var runStartedAtServerMs: Long = 0L
+    // One upload at a time: parallel days overlap Health Connect reading, not server writes.
+    private val uploadMutex = Mutex()
+    // False when the server no longer stores per-minute rows; they are then not uploaded at all.
+    @Volatile private var sendHighVolumeRaw: Boolean = true
+
     /**
      * Runs on [Dispatchers.Default] whatever the caller's dispatcher is: JSON building,
      * sleep aggregation and per-sample statistics must never run on the main thread.
@@ -68,7 +86,9 @@ class HealthSyncStreamer(
         days: Int,
         includeHistoricalChanges: Boolean = true,
         onProgress: (String) -> Unit
-    ): SyncResult = withContext(Dispatchers.Default) {
+    ): SyncResult = withContext(SYNC_DISPATCHER) {
+        // One thread for all of this run's coroutines: parallel days share counters and
+        // caches without locks. Network and Health Connect calls suspend off this thread.
         syncInternal(endpoint, token, days, includeHistoricalChanges, onProgress)
     }
 
@@ -85,10 +105,13 @@ class HealthSyncStreamer(
         val fallbackStart = today.minusDays((safeDays - 1).toLong())
 
         onProgress("Проверяю версию Google Sheets…")
-        ServerCompatibility.requireV3(endpoint)
+        val serverOffsetMs = ServerCompatibility.requireV3(endpoint)
+        runStartedAtServerMs = System.currentTimeMillis() + serverOffsetMs
+        permissionDeniedTypes.clear()
         onProgress("Проверяю состояние Dashboard…")
         val plan = runCatching { fetchSyncPlan(endpoint, token, safeDays) }
             .getOrElse { error ->
+                if (error is CancellationException) throw error
                 SyncDiagnostics.server(
                     context,
                     "healthSyncPlanV3 недоступен: ${error.message ?: error.javaClass.simpleName}; использую локальный диапазон",
@@ -96,18 +119,18 @@ class HealthSyncStreamer(
                 )
                 SyncPlan(fallbackStart, "fallback", "План Dashboard недоступен")
             }
+        sendHighVolumeRaw = plan.storesHighVolumeRaw
         val oldestReadable = today.minusDays(29)
-        val tableStart = plan.startDate.coerceAtLeast(oldestReadable).coerceAtMost(today)
-        // Background remains bounded; manual sync can repair an older incomplete day.
-        val requestedStart = if (includeHistoricalChanges) tableStart else tableStart.coerceAtLeast(fallbackStart)
-        val requestedDates = buildList {
-            var cursor = requestedStart
-            while (!cursor.isAfter(today)) {
-                add(cursor)
-                cursor = cursor.plusDays(1)
-            }
-        }
-        onProgress("${plan.message} · к обработке ${requestedDates.size} дн.")
+        val requestedDates = SyncDatePlanner.select(
+            today = today,
+            repairDates = plan.repairDates,
+            legacyStart = plan.startDate,
+            manual = includeHistoricalChanges,
+            fallbackDays = safeDays,
+            changedDates = emptySet()
+        )
+        onProgress("${plan.message} · к обработке ${requestedDates.size} дн." +
+            if (!sendHighVolumeRaw) " · поминутные данные в таблицу не отправляются" else "")
         onProgress("Проверяю изменения Health Connect…")
         val changes = changesTracker.collect(zone)
         val deletionDates = if (changes.deletedRecordIds.isNotEmpty()) {
@@ -173,7 +196,11 @@ class HealthSyncStreamer(
         val allSources = linkedSetOf<String>()
 
         val failedDays = linkedMapOf<LocalDate, String>()
-        dates.forEachIndexed { index, date ->
+        val parallelDays = if (includeHistoricalChanges) MANUAL_PARALLEL_DAYS else 1
+        val permits = Semaphore(parallelDays)
+        if (parallelDays > 1 && dates.size > 1) onProgress("Обрабатываю по $parallelDays дня одновременно")
+        var aborted: SyncAbortedException? = null
+        coroutineScope { val dayScope = this; dates.forEachIndexed { index, date -> launch { permits.withPermit {
             onProgress("Читаю день ${index + 1}/${dates.size}: $date…")
             // One broken day must not stop the other days from reaching HC_Дни.
             try {
@@ -188,6 +215,11 @@ class HealthSyncStreamer(
                 totalWorkouts += result.workouts
                 totalMeasurements += result.measurements
                 allSources += result.sources
+            } catch (stop: SyncAbortedException) {
+                // The server refused: the user stopped all syncs. Stop the sibling days too.
+                aborted = stop
+                dayScope.cancel(stop)
+                throw stop
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
@@ -197,7 +229,9 @@ class HealthSyncStreamer(
                 SyncDiagnostics.server(context, "[$date] день пропущен: $reason", "ERROR")
             }
             if (index + 1 < dates.size) delay(HEALTH_CONNECT_DAY_PAUSE_MS)
-        }
+        } } } }
+        // Never commit change tokens after an abort: the next run must re-read these changes.
+        aborted?.let { throw it }
 
         if (failedDays.isNotEmpty()) {
             // Tokens stay where they were, so the next run re-reads these changes.
@@ -227,7 +261,6 @@ class HealthSyncStreamer(
         wideSleepRecords: List<SleepSessionRecord>,
         onProgress: (String) -> Unit
     ): DayResult {
-        permissionDeniedTypes.clear()
         val dayStart = date.atStartOfDay(zone).toInstant()
         val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant()
         val syncedAt = Instant.now().toString()
@@ -321,9 +354,9 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         // are deduplicated according to the user's Health Connect data priority.
         onProgress("[$date] Этап 1/8 · читаю дневные агрегаты Health Connect…")
         val aggregates = aggregateReader.readDay(dayStart, dayEnd)
-        val stepsTotal = metricValue(aggregates.steps, sources)
-        val distanceKm = metricValue(aggregates.distance, sources)?.inKilometers
-        val activeCaloriesKcal = metricValue(aggregates.activeCalories, sources)?.inKilocalories
+        var stepsTotal = metricValue(aggregates.steps, sources)
+        var distanceKm = metricValue(aggregates.distance, sources)?.inKilometers
+        var activeCaloriesKcal = metricValue(aggregates.activeCalories, sources)?.inKilocalories
         val totalCaloriesKcal = metricValue(aggregates.totalCalories, sources)?.inKilocalories
         val elevationGainedM = metricValue(aggregates.elevation, sources)?.inMeters
         val floorsClimbed = metricValue(aggregates.floors, sources)
@@ -366,6 +399,13 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             addSources(records, sources)
             for (r in records) emit("TotalCalories", null, r.startTime, r.endTime, r.energy.inKilocalories, "kcal", r)
         }
+
+        // Cross-check aggregate totals against every source: overlapping apps must not double steps.
+        val cumulative = resolveCumulative(dayStart, dayEnd, stepsTotal, distanceKm, activeCaloriesKcal, workoutDayRecords)
+        stepsTotal = cumulative.steps
+        distanceKm = cumulative.distanceKm
+        activeCaloriesKcal = cumulative.activeKcal
+        onProgress("[$date] ${cumulative.report}")
 
         run {
             val sleepRead = readSleepForDay(
@@ -422,6 +462,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             }
 
             checkpointField("sourcePackages", jsonStringArray(sources))
+            cumulative.putQuality(checkpointDay, checkpointFields)
             checkpointDay.put("availableFields", JSONArray(checkpointFields.toList()))
 
             onProgress("[$date] Этап 4/8 · сохраняю раннюю сводку и сон…")
@@ -693,7 +734,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             powerStats = powerStats,
             weightKg = weightKg,
             workoutRecords = workoutRecords,
-            sources = sources
+            sources = sources,
+            cumulative = cumulative
         )
 
         val todayForCompletion = LocalDate.now(zone)
@@ -720,7 +762,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             sleepSessions = sleepSessions,
             measurements = JSONArray(),
             sources = sources,
-            dayComplete = dayComplete
+            dayComplete = dayComplete,
+            dayFinal = true
         )
         when {
             sleepNeedsRepair -> onProgress(
@@ -773,6 +816,26 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         state: RawUploadState,
         onProgress: (String) -> Unit
     ) {
+        val toSend = if (sendHighVolumeRaw) batch else JSONArray().also { kept ->
+            for (i in 0 until batch.length()) {
+                val item = batch.optJSONObject(i) ?: continue
+                if (item.optString("type") !in HIGH_VOLUME_TYPES) kept.put(item)
+            }
+        }
+        if (toSend.length() == 0) return
+        uploadRawBatchNow(endpoint, token, syncedAt, date, toSend, sources, state, onProgress)
+    }
+
+    private suspend fun uploadRawBatchNow(
+        endpoint: String,
+        token: String,
+        syncedAt: String,
+        date: LocalDate,
+        batch: JSONArray,
+        sources: Set<String>,
+        state: RawUploadState,
+        onProgress: (String) -> Unit
+    ) {
         val batchSize = batch.length()
         val batchNumber = state.sentBatches + state.failedBatches + 1
         onProgress("[$date] Google Sheets: отправляю пачку #$batchNumber · $batchSize изм. · уже отправлено ${state.sentMeasurements}")
@@ -805,6 +868,88 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
     }
 
+    /** Resolved activity totals of one day plus what the sheet should know about them. */
+    private class CumulativeDay(
+        val steps: Long?,
+        val distanceKm: Double?,
+        val activeKcal: Double?,
+        val stepsBySource: String,
+        val activitySource: String,
+        val flags: List<String>,
+        val report: String
+    ) {
+        fun putQuality(target: JSONObject, fields: MutableSet<String>) {
+            target.put("stepsBySource", stepsBySource)
+            target.put("activitySource", activitySource)
+            target.put("qualityFlags", flags.joinToString("; "))
+            fields += listOf("stepsBySource", "activitySource", "qualityFlags")
+            // Empty flags must clear a stale warning from an earlier sync of this day.
+            if (flags.isEmpty()) target.put("clearFields", JSONArray().put("qualityFlags"))
+        }
+    }
+
+    private fun resolveCumulative(
+        dayStart: Instant,
+        dayEnd: Instant,
+        aggregateSteps: Long?,
+        aggregateDistanceKm: Double?,
+        aggregateActiveKcal: Double?,
+        records: WorkoutDayRecords
+    ): CumulativeDay {
+        val startMs = dayStart.toEpochMilli()
+        val endMs = dayEnd.toEpochMilli()
+        val override = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+            .getString(PREF_ACTIVITY_SOURCE_OVERRIDE, "").orEmpty().ifBlank { null }
+        fun <T : Record> intervals(list: List<T>, start: (T) -> Instant, end: (T) -> Instant, value: (T) -> Double) =
+            list.map { CumulativeResolver.Interval(it.sourcePackage(), start(it).toEpochMilli(), end(it).toEpochMilli(), value(it)) }
+
+        val stepsBy = CumulativeResolver.perSource(
+            intervals(records.steps, { it.startTime }, { it.endTime }, { it.count.toDouble() }), startMs, endMs)
+        val distanceBy = CumulativeResolver.perSource(
+            intervals(records.distance, { it.startTime }, { it.endTime }, { it.distance.inKilometers }), startMs, endMs)
+        val activeBy = CumulativeResolver.perSource(
+            intervals(records.activeCalories, { it.startTime }, { it.endTime }, { it.energy.inKilocalories }), startMs, endMs)
+
+        val steps = CumulativeResolver.resolve(aggregateSteps?.toDouble(), stepsBy, ::sourcePriority, CumulativeResolver.STEPS_TOLERANCE, override)
+        val distance = CumulativeResolver.resolve(aggregateDistanceKm, distanceBy, ::sourcePriority, CumulativeResolver.DISTANCE_TOLERANCE, override)
+        val active = CumulativeResolver.resolve(aggregateActiveKcal, activeBy, ::sourcePriority, CumulativeResolver.CALORIES_TOLERANCE, override)
+
+        val flags = mutableListOf<String>()
+        fun note(label: String, resolution: CumulativeResolver.Resolution, aggregate: Double?) {
+            if (resolution.overcount && aggregate != null) {
+                flags += "$label: сводка Health Connect завышена (${aggregate.roundToLong()}), взято ${sourceName(resolution.chosenSource.orEmpty())}"
+            }
+        }
+        note("шаги", steps, aggregateSteps?.toDouble())
+        note("дистанция", distance, aggregateDistanceKm)
+        note("активные ккал", active, aggregateActiveKcal)
+        stepsBy.filterValues { it.selfOverlap }.keys.forEach { flags += "${sourceName(it)}: повторяющиеся записи шагов" }
+        if (CumulativeResolver.strideLooksWrong(steps.value, distance.value)) {
+            flags += "шаги и дистанция не согласуются (шаг ${"%.2f".format((distance.value ?: 0.0) * 1000 / (steps.value ?: 1.0))} м)"
+        }
+
+        val activitySource = when (steps.method) {
+            CumulativeResolver.METHOD_OVERRIDE -> "вручную: ${sourceName(steps.chosenSource.orEmpty())}"
+            CumulativeResolver.METHOD_SOURCE -> sourceName(steps.chosenSource.orEmpty())
+            CumulativeResolver.METHOD_AGGREGATE -> "Health Connect (сводка)"
+            else -> ""
+        }
+        val bySourceText = CumulativeResolver.describe(stepsBy, ::sourceName)
+        return CumulativeDay(
+            steps = steps.value?.roundToLong(),
+            distanceKm = distance.value,
+            activeKcal = active.value,
+            stepsBySource = bySourceText,
+            activitySource = activitySource,
+            flags = flags,
+            report = buildString {
+                append("Шаги ${steps.value?.roundToLong() ?: "—"} · источник: ${activitySource.ifBlank { "—" }}")
+                if (bySourceText.isNotBlank()) append(" · по источникам: ").append(bySourceText)
+                if (flags.isNotEmpty()) append(" · ⚠ ").append(flags.joinToString("; "))
+            }
+        )
+    }
+
     private fun buildDaySummaryObject(
         date: LocalDate,
         aggregates: HealthAggregateReader.DayAggregates,
@@ -829,7 +974,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         powerStats: Stats,
         weightKg: Double?,
         workoutRecords: List<ExerciseSessionRecord>,
-        sources: Set<String>
+        sources: Set<String>,
+        cumulative: CumulativeDay
     ): JSONObject {
         val dayObject = JSONObject().apply { put("date", date.toString()) }
         val availableFields = linkedSetOf<String>()
@@ -916,6 +1062,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         }
 
         putField("sourcePackages", jsonStringArray(sources))
+        cumulative.putQuality(dayObject, availableFields)
         dayObject.put("availableFields", JSONArray(availableFields.toList()))
         return dayObject
     }
@@ -1067,10 +1214,15 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             ?: error("Dashboard не вернул план синхронизации")
         val startDate = runCatching { LocalDate.parse(response.optString("startDate")) }
             .getOrElse { error("Dashboard вернул некорректную дату старта") }
+        val repairDates = response.optJSONArray("repairDates")?.let { array ->
+            (0 until array.length()).mapNotNull { runCatching { LocalDate.parse(array.getString(it)) }.getOrNull() }
+        }
         return SyncPlan(
             startDate = startDate,
             reason = response.optString("reason", "table"),
-            message = response.optString("message", "Dashboard: синхронизация с $startDate")
+            message = response.optString("message", "Dashboard: синхронизация с $startDate"),
+            repairDates = repairDates,
+            storesHighVolumeRaw = response.optBoolean("storesHighVolumeRaw", true)
         )
     }
 
@@ -1113,7 +1265,8 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         sleepSessions: JSONArray,
         measurements: JSONArray,
         sources: Set<String>,
-        dayComplete: Boolean? = null
+        dayComplete: Boolean? = null,
+        dayFinal: Boolean = false
     ): JSONObject? {
         val body = JSONObject().apply {
             put("token", token)
@@ -1128,6 +1281,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             put("sleepSessions", sleepSessions)
             put("measurements", measurements)
             if (dayComplete != null) put("dayComplete", dayComplete)
+            if (dayFinal) put("dayFinal", true)
             put("sources", JSONArray().apply {
                 sources.sortedBy { sourcePriority(it) }.forEach { pkg ->
                     put(JSONObject().apply {
@@ -1143,14 +1297,16 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
 
     private suspend fun postBody(endpoint: String, body: JSONObject): JSONObject? {
         val action = body.optString("action", "healthSync")
+        body.put("runId", runId)
+        if (runStartedAtServerMs > 0) body.put("runStartedAt", runStartedAtServerMs)
+        val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
         var attempt = 0
         while (true) {
+            currentCoroutineContext().ensureActive()
             attempt++
             try {
-                SyncDiagnostics.server(context, "Запрос $action, попытка $attempt/4")
-                val result = withContext(Dispatchers.IO) {
-                    val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
-                    val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
+                SyncDiagnostics.server(context, "Запрос $action, попытка $attempt/$MAX_REQUEST_ATTEMPTS")
+                val result = uploadMutex.withLock { CancellableHttp.withConnection(safeEndpoint) { connection ->
                     try {
                         connection.instanceFollowRedirects = true
                         connection.requestMethod = "POST"
@@ -1167,10 +1323,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                         val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
                             ?.bufferedReader()?.use { it.readText() }.orEmpty()
                         if (code !in 200..299) error("HTTP $code")
-                        if (response.isBlank()) return@withContext null
+                        if (response.isBlank()) return@withConnection null
                         val json = runCatching { JSONObject(response) }.getOrNull()
                         if (json?.optBoolean("ok", true) == false) {
                             val errorCode = json.optString("errorCode")
+                            if (errorCode == "ABORTED") throw SyncAbortedException(json.optString("message", "Синхронизация остановлена"))
                             val message = json.optString("message", response)
                             error(if (errorCode.isBlank()) message else "$errorCode: $message")
                         }
@@ -1178,12 +1335,14 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                     } finally {
                         connection.disconnect()
                     }
-                }
+                } }
                 SyncDiagnostics.server(context, "Ответ $action получен", "OK")
                 return result
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Throwable) {
                 val retryable = isRetryableRequestError(error)
-                if (!retryable || attempt >= 4) {
+                if (!retryable || attempt >= MAX_REQUEST_ATTEMPTS) {
                     SyncDiagnostics.server(
                         context,
                         "$action: ${error.message ?: error.javaClass.simpleName}",
@@ -1191,10 +1350,11 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
                     )
                     throw error
                 }
-                val pauseMs = 1_500L * attempt
+                val busy = "lock_busy" in (error.message ?: "").lowercase()
+                val pauseMs = (if (busy) 3_000L else 1_500L) * attempt
                 SyncDiagnostics.server(
                     context,
-                    "$action: сервер занят или сеть не ответила; повтор через ${pauseMs / 1000.0} с",
+                    "$action: ${if (busy) error.message else "сеть не ответила"}; повтор через ${pauseMs / 1000.0} с",
                     "WARNING"
                 )
                 delay(pauseMs)
@@ -1690,7 +1850,10 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
     private data class SyncPlan(
         val startDate: LocalDate,
         val reason: String,
-        val message: String
+        val message: String,
+        /** null: server without completeness checks (legacy contiguous range). */
+        val repairDates: List<LocalDate>? = null,
+        val storesHighVolumeRaw: Boolean = true
     )
 
     private class DayReadDiagnostics {
@@ -1862,5 +2025,15 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         private const val HEALTH_CONNECT_READ_RETRIES = 3
         private const val HEALTH_CONNECT_RETRY_BASE_MS = 750L
         private const val HEALTH_CONNECT_DAY_PAUSE_MS = 1000L
+        const val PREF_ACTIVITY_SOURCE_OVERRIDE = "activity_source_override"
+        private const val MAX_REQUEST_ATTEMPTS = 6
+        private const val MANUAL_PARALLEL_DAYS = 2
+        // Must match RAW_HIGH_VOLUME_TYPES_V1 in apps-script/Code.gs.
+        private val HIGH_VOLUME_TYPES = setOf(
+            "Steps", "Distance", "ActiveCalories", "TotalCalories",
+            "HeartRate", "Speed", "StepCadence", "CyclingCadence", "Power", "SkinTemperatureDelta"
+        )
+        @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+        private val SYNC_DISPATCHER = Dispatchers.Default.limitedParallelism(1)
     }
 }

@@ -70,7 +70,7 @@ class BackgroundSyncWorker(
             val syncResult = SyncRunGate.tryRunBackground {
                 val runId = SyncDiagnostics.begin(applicationContext, "background")
                 try {
-                    val result = HealthSyncStreamer(applicationContext, client).sync(
+                    val result = SyncControl.tracked("фоновая синхронизация") { HealthSyncStreamer(applicationContext, client).sync(
                         endpoint = safeEndpoint,
                         token = token,
                         days = BackgroundSyncScheduler.BACKGROUND_DAYS,
@@ -79,7 +79,7 @@ class BackgroundSyncWorker(
                             SyncDiagnostics.progress(applicationContext, runId, "background", message)
                             SyncForeground.update(applicationContext, SyncForeground.BACKGROUND_NOTIFICATION_ID, "HealthConnector · фоновая синхронизация", message)
                         }
-                    )
+                    ) }
                     SyncDiagnostics.finish(
                         applicationContext,
                         runId,

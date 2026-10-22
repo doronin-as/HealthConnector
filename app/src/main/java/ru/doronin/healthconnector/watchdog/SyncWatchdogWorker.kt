@@ -51,7 +51,18 @@ class SyncWatchdogWorker(appContext: Context, params: WorkerParameters) : Corout
                 JSONObject().put("schemaVersion", 3).put("fallbackDays", 2)
             )
             val latest = runCatching { LocalDate.parse(plan.optString("latestDate")) }.getOrNull()
-            WatchdogPolicy.staleDays(LocalDate.now(ZoneId.systemDefault()), latest)?.let(alerts::add)
+            val today = LocalDate.now(ZoneId.systemDefault())
+            WatchdogPolicy.staleDays(today, latest)?.let(alerts::add)
+            val incomplete = plan.optJSONArray("incompleteDays")?.let { array ->
+                (0 until array.length()).mapNotNull { i ->
+                    val item = array.optJSONObject(i) ?: return@mapNotNull null
+                    val date = runCatching { LocalDate.parse(item.optString("date")) }.getOrNull() ?: return@mapNotNull null
+                    val missing = item.optJSONArray("missing")?.let { m -> (0 until m.length()).map { m.optString(it) } }.orEmpty()
+                        .ifEmpty { if (item.optBoolean("notComplete")) listOf("день не завершён") else emptyList() }
+                    Triple(date, missing, item.optInt("checks"))
+                }
+            }.orEmpty()
+            WatchdogPolicy.incompleteDays(today, incomplete)?.let(alerts::add)
             clear(context, "server_unreachable")
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -64,7 +75,7 @@ class SyncWatchdogWorker(appContext: Context, params: WorkerParameters) : Corout
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val active = alerts.map { it.key }.toSet()
         // Problems that went away may alert again immediately if they come back later.
-        listOf("stale_days", "outbox_stuck", "server_unreachable").filter { it !in active }.forEach { clear(context, it) }
+        listOf("stale_days", "outbox_stuck", "server_unreachable", "incomplete_days").filter { it !in active }.forEach { clear(context, it) }
         for (alert in alerts) {
             val key = "watchdog_last_${alert.key}"
             val last = prefs.getLong(key, 0L).takeIf { it > 0 }

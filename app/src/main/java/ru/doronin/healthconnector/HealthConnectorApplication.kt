@@ -31,6 +31,7 @@ class HealthConnectorApplication : Application(), Application.ActivityLifecycleC
         injectFloorDashboardCard(activity)
         injectPhoneSensorCard(activity)
         runCatching { FeatureCards.inject(activity) }
+        runCatching { SyncControlCard.inject(activity) }
         runCatching { ru.doronin.healthconnector.water.WaterWidgetProvider.refreshAll(activity) }
     }
 

@@ -10,7 +10,8 @@ import java.net.URL
 object ServerCompatibility {
     private const val REQUIRED_SCHEMA = 3
 
-    suspend fun requireV3(endpoint: String) = withContext(Dispatchers.IO) {
+    /** Returns the server clock offset (server − phone, ms); 0 when the server does not report time. */
+    suspend fun requireV3(endpoint: String): Long = withContext(Dispatchers.IO) {
         val safeEndpoint = EndpointSecurity.requireHttps(endpoint)
         val connection = URL(safeEndpoint).openConnection() as HttpURLConnection
         try {
@@ -28,6 +29,8 @@ object ServerCompatibility {
             require(schema >= REQUIRED_SCHEMA) {
                 "Apps Script устарел (schema v$schema). Сначала разверни серверную часть schema v$REQUIRED_SCHEMA; данные не отправлены."
             }
+            runCatching { java.time.Instant.parse(json.optString("time")).toEpochMilli() - System.currentTimeMillis() }
+                .getOrDefault(0L)
         } finally {
             connection.disconnect()
         }

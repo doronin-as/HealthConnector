@@ -12,6 +12,8 @@ object WatchdogPolicy {
         data class StaleDays(val latestDate: LocalDate?) : Alert("stale_days")
         /** Water/wellbeing entries not delivered for too long. */
         data class OutboxStuck(val count: Int, val hours: Long, val lastError: String) : Alert("outbox_stuck")
+        /** Finished days that still miss a metric the bracelet normally records. */
+        data class IncompleteDays(val days: List<Pair<LocalDate, List<String>>>) : Alert("incomplete_days")
         /** The server itself could not be asked. */
         data class ServerUnreachable(val message: String) : Alert("server_unreachable")
     }
@@ -29,6 +31,18 @@ object WatchdogPolicy {
         return if (hours >= OUTBOX_STUCK_HOURS) Alert.OutboxStuck(count, hours, lastError) else null
     }
 
+    /**
+     * Last 7 finished days that were already re-checked at least once (or are missing
+     * entirely for more than a day) and are still incomplete.
+     */
+    fun incompleteDays(today: LocalDate, items: List<Triple<LocalDate, List<String>, Int>>): Alert? {
+        val recent = items.filter { (date, missing, checks) ->
+            date.isBefore(today) && !date.isBefore(today.minusDays(7)) && missing.isNotEmpty() &&
+                (checks >= 1 || (missing == listOf("весь день") && date.isBefore(today.minusDays(1))))
+        }.sortedBy { it.first }
+        return if (recent.isEmpty()) null else Alert.IncompleteDays(recent.map { it.first to it.second })
+    }
+
     /** Repeat the same alert at most once per [REPEAT_HOURS]. */
     fun shouldNotify(nowMs: Long, lastNotifiedMs: Long?): Boolean =
         lastNotifiedMs == null || nowMs - lastNotifiedMs >= REPEAT_HOURS * 3_600_000L
@@ -40,6 +54,9 @@ object WatchdogPolicy {
         is Alert.OutboxStuck -> "Не отправлено записей: ${alert.count}" to
             "Вода и самочувствие ждут отправки ${alert.hours} ч." +
             (if (alert.lastError.isNotBlank()) " Причина: ${alert.lastError}" else "")
+        is Alert.IncompleteDays -> "Неполные дни: ${alert.days.size}" to
+            alert.days.joinToString("; ") { (date, missing) -> "$date — нет: ${missing.joinToString()}" } +
+            ". Приложение дочитает их само; если данных нет и в приложении браслета, значит браслет их не записал."
         is Alert.ServerUnreachable -> "Google Sheets недоступен" to
             "Сторож синхронизации не смог связаться с таблицей: ${alert.message}"
     }
