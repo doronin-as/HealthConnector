@@ -1,3 +1,13 @@
+## 1.6.39 — дневные данные не зависят от подробных измерений
+
+- Сервер: при переполненном `HC_Измерения` (≥ 250 000 строк) поминутные шаги/дистанция/калории и
+  высокочастотные корзины больше не пишутся в Sheets; веса, SpO₂, HRV, пульс покоя и т. п. — пишутся.
+  Режим задаётся Script Property `SHEETS_RAW_HIGH_VOLUME_V1` = `keep` / `skip` (по умолчанию — авто).
+  Лимит ячеек Google Sheets при записи подробных строк и переполненный `HC_Журнал` больше не валят запрос.
+- Приложение: неудачная пачка подробных измерений больше не обрывает день — суточная сводка всё равно
+  уходит в `HC_Дни`, а день остаётся незавершённым для повторной попытки. Ошибка одного дня не
+  останавливает синхронизацию остальных; change tokens сдвигаются только после полного успеха.
+
 ## 1.6.35
 
 - Apps Script: `upsertByKey_` пишет обновления блоками смежных строк вместо `setValues` на каждую строку (2000 обновлений: 2000 вызовов → 1–несколько); повтор ключа в одной пачке больше не создаёт дубль строки.
@@ -280,13 +290,3 @@
 - Recovery must not store API tokens or other secrets in plaintext and must account for Android Keystore material being removed when an app package is uninstalled.
 - Prefer a user-controlled encrypted backup/recovery flow for endpoint + API token/configuration, with clear rotation/revocation behavior.
 - Continue improving scale integration after real XMTZC05HM measurements are compared with Mi Fit/Zepp Life results; calibrate formulas if systematic differences are found.
-
-## 1.6.39 — дневные данные не зависят от подробных измерений
-
-- Сервер: при переполненном `HC_Измерения` (≥ 250 000 строк) поминутные шаги/дистанция/калории и
-  высокочастотные корзины больше не пишутся в Sheets; веса, SpO₂, HRV, пульс покоя и т. п. — пишутся.
-  Режим задаётся Script Property `SHEETS_RAW_HIGH_VOLUME_V1` = `keep` / `skip` (по умолчанию — авто).
-  Лимит ячеек Google Sheets при записи подробных строк и переполненный `HC_Журнал` больше не валят запрос.
-- Приложение: неудачная пачка подробных измерений больше не обрывает день — суточная сводка всё равно
-  уходит в `HC_Дни`, а день остаётся незавершённым для повторной попытки. Ошибка одного дня не
-  останавливает синхронизацию остальных; change tokens сдвигаются только после полного успеха.
