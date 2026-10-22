@@ -4,4 +4,14 @@
         <item name="android:statusBarColor">#0B6E4F</item>
         <item name="android:navigationBarColor">#FFFFFF</item>
     </style>
+    <style name="Theme.HealthConnector.Translucent" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+    <style name="Theme.HealthConnector.Dialog" parent="Theme.Material3.DayNight.Dialog">
+        <item name="android:windowMinWidthMajor">90%</item>
+        <item name="android:windowMinWidthMinor">90%</item>
+    </style>
 </resources>

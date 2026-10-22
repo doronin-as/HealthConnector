@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Health Connector</string>
+    <string name="water_widget_description">Отметить выпитую воду одним нажатием</string>
 </resources>

@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widgetRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_background"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/waterTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="💧 Вода"
+            android:textColor="@color/widget_text_muted"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/waterUndo"
+            android:layout_width="wrap_content"
+            android:layout_height="32dp"
+            android:contentDescription="Отменить последнюю запись"
+            android:gravity="center"
+            android:paddingStart="8dp"
+            android:paddingEnd="4dp"
+            android:text="↶"
+            android:textColor="@color/widget_text_muted"
+            android:textSize="18sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/waterAmount"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="0 / 2 л"
+        android:textColor="@color/widget_text"
+        android:textSize="22sp"
+        android:textStyle="bold" />
+
+    <ProgressBar
+        android:id="@+id/waterProgress"
+        style="@android:style/Widget.ProgressBar.Horizontal"
+        android:layout_width="match_parent"
+        android:layout_height="8dp"
+        android:layout_marginTop="6dp"
+        android:layout_marginBottom="10dp"
+        android:max="100"
+        android:progress="0"
+        android:progressDrawable="@drawable/widget_progress" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/waterAdd250"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1"
+            android:background="@drawable/widget_button_background"
+            android:gravity="center"
+            android:text="+250"
+            android:textColor="@color/widget_button_text"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/waterAdd500"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:background="@drawable/widget_button_background"
+            android:gravity="center"
+            android:text="+500"
+            android:textColor="@color/widget_button_text"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+</LinearLayout>

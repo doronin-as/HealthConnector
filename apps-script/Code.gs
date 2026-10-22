@@ -192,6 +192,12 @@ function doPost(e) {
     if (payload.action === 'fitbitRepairSleepV1') {
       return json_(fitbitRepairSleepV1_(spreadsheet, logSheet, payload));
     }
+    if (payload.action === 'hydrationV1') {
+      return json_(importHydrationV1_(spreadsheet, payload));
+    }
+    if (payload.action === 'wellbeingV1') {
+      return json_(importWellbeingV1_(spreadsheet, payload));
+    }
     if (payload.action === 'bodyCompositionV1') {
       return json_(importBodyCompositionV1_(spreadsheet, logSheet, payload));
     }
@@ -3362,3 +3368,116 @@ function driveArchiveStatusV1() {
   const props = PropertiesService.getScriptProperties();
   return { enabled: driveArchiveEnabledV1_(), migration: JSON.parse(props.getProperty('DRIVE_ARCHIVE_STATUS_V1') || '{}') };
 }
+
+
+// ===== Water and wellbeing entered in the app (v1) =====
+//
+// The phone keeps every entry in a local database and uploads idempotent snapshots:
+// the same id may arrive again (retry, undo), so rows are upserted by id. Day totals
+// are then copied into Дневник ("Вода, л", "Самочувствие 1-5") only where that cell
+// holds no formula, so hand-built reports are never overwritten.
+const HYDRATION_SHEET = 'HC_Вода';
+const HYDRATION_HEADERS = ['Id', 'Time', 'Date', 'Ml', 'Deleted', 'SyncedAt'];
+const WELLBEING_SHEET = 'HC_Самочувствие';
+const WELLBEING_HEADERS = ['Id', 'Time', 'Date', 'Slot', 'Energy', 'Mood', 'Soreness', 'Stress', 'Tags', 'Note', 'SyncedAt'];
+const WELLBEING_TAG_TITLES = Object.freeze({
+  late_caffeine: 'Кофе поздно', alcohol: 'Алкоголь', sick: 'Болею',
+  poor_sleep: 'Плохо спал', heavy_dinner: 'Тяжёлый ужин', workout_sore: 'Крепатура'
+});
+
+function appEntriesV1_(payload, limit) {
+  const entries = Array.isArray(payload.entries) ? payload.entries : [];
+  if (entries.length > limit) throw new Error('Слишком много записей в одном запросе');
+  return entries.filter(x => x && /^[A-Za-z0-9_-]{1,80}$/.test(String(x.id || '')) &&
+    /^\d{4}-\d{2}-\d{2}$/.test(String(x.date || '')));
+}
+
+function score15V1_(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 && n <= 5 ? n : '';
+}
+
+function importHydrationV1_(spreadsheet, payload) {
+  const entries = appEntriesV1_(payload, 500);
+  const syncedAt = new Date().toISOString();
+  const rows = entries.map(x => {
+    const ml = Math.round(Number(x.ml));
+    if (!(ml > 0 && ml <= 3000)) throw new Error('Некорректный объём воды: ' + x.ml);
+    return [String(x.id), String(x.time || ''), String(x.date), ml, x.deleted === true, syncedAt];
+  });
+  const sheet = ensureSheet_(spreadsheet, HYDRATION_SHEET, HYDRATION_HEADERS);
+  upsertByKey_(sheet, rows, 1);
+
+  const dates = new Set(rows.map(r => r[2]));
+  const totals = new Map(Array.from(dates).map(d => [d, 0]));
+  if (sheet.getLastRow && sheet.getLastRow() >= 2) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, HYDRATION_HEADERS.length).getValues().forEach(r => {
+      const date = normalizeDateWithTz_(r[2], spreadsheet.getSpreadsheetTimeZone());
+      const deleted = r[4] === true || String(r[4]).toUpperCase() === 'TRUE';
+      if (totals.has(date) && !deleted) totals.set(date, totals.get(date) + Number(r[3] || 0));
+    });
+  }
+  const diary = {};
+  totals.forEach((ml, date) => {
+    diary[date] = writeDiaryValueV1_(spreadsheet, date, ['Вода, л', 'Вода л', 'Вода'],
+      ml ? Math.round(ml / 10) / 100 : '');
+  });
+  return { ok: true, schemaVersion: 1, accepted: rows.map(r => r[0]), totalsMl: Object.fromEntries(totals), diary };
+}
+
+function importWellbeingV1_(spreadsheet, payload) {
+  const entries = appEntriesV1_(payload, 200);
+  const syncedAt = new Date().toISOString();
+  const rows = entries.map(x => {
+    const slot = x.slot === 'evening' ? 'evening' : 'morning';
+    const tags = (Array.isArray(x.tags) ? x.tags : [])
+      .map(t => WELLBEING_TAG_TITLES[String(t)]).filter(Boolean).join(', ');
+    return [String(x.id), String(x.time || ''), String(x.date), slot,
+      score15V1_(x.energy), score15V1_(x.mood), score15V1_(x.soreness), score15V1_(x.stress),
+      tags, sheetSafeExternalText_(String(x.note || '').slice(0, 500)), syncedAt];
+  });
+  const sheet = ensureSheet_(spreadsheet, WELLBEING_SHEET, WELLBEING_HEADERS);
+  upsertByKey_(sheet, rows, 1);
+
+  const dates = new Set(rows.map(r => r[2]));
+  const scores = new Map();
+  if (sheet.getLastRow && sheet.getLastRow() >= 2) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, WELLBEING_HEADERS.length).getValues().forEach(r => {
+      const date = normalizeDateWithTz_(r[2], spreadsheet.getSpreadsheetTimeZone());
+      if (!dates.has(date)) return;
+      const parts = [r[4], r[5]].map(Number).filter(n => n >= 1 && n <= 5);
+      if (!parts.length) return;
+      if (!scores.has(date)) scores.set(date, []);
+      scores.get(date).push(parts.reduce((a, b) => a + b, 0) / parts.length);
+    });
+  }
+  const diary = {};
+  dates.forEach(date => {
+    const list = scores.get(date) || [];
+    const value = list.length ? Math.round(list.reduce((a, b) => a + b, 0) / list.length * 10) / 10 : '';
+    diary[date] = writeDiaryValueV1_(spreadsheet, date, ['Самочувствие 1-5', 'Самочувствие'], value);
+  });
+  return { ok: true, schemaVersion: 1, accepted: rows.map(r => r[0]), diary };
+}
+
+/** Returns 'written' | 'formula' | 'no-row' | 'no-column' | 'no-sheet'. Never inserts rows. */
+function writeDiaryValueV1_(spreadsheet, date, aliases, value) {
+  const sheet = spreadsheet.getSheetByName(DIARY_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return 'no-sheet';
+  const header = findHeader_(sheet);
+  if (!header) return 'no-column';
+  const column = findAlias_(header.map, aliases);
+  const dateColumn = header.map.get('дата');
+  if (!column || !dateColumn) return 'no-column';
+  const first = header.row + 1;
+  if (sheet.getLastRow() < first) return 'no-row';
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  const dates = sheet.getRange(first, dateColumn, sheet.getLastRow() - first + 1, 1).getValues();
+  const index = dates.findIndex(r => normalizeDateWithTz_(r[0], tz) === date);
+  if (index < 0) return 'no-row';
+  const cell = sheet.getRange(first + index, column);
+  if (cell.getFormula()) return 'formula';
+  cell.setValue(value);
+  return 'written';
+}
+
