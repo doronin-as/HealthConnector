@@ -20,6 +20,7 @@ class HealthConnectorApplication : Application(), Application.ActivityLifecycleC
     override fun onCreate() {
         super.onCreate()
         registerActivityLifecycleCallbacks(this)
+        runCatching { FeatureScheduler.apply(this) }
     }
 
     override fun onActivityResumed(activity: Activity) {
@@ -29,6 +30,8 @@ class HealthConnectorApplication : Application(), Application.ActivityLifecycleC
         }
         injectFloorDashboardCard(activity)
         injectPhoneSensorCard(activity)
+        runCatching { FeatureCards.inject(activity) }
+        runCatching { ru.doronin.healthconnector.water.WaterWidgetProvider.refreshAll(activity) }
     }
 
     private fun injectFloorDashboardCard(activity: StreamingMainActivity) {
