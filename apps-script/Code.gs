@@ -228,7 +228,10 @@ function doPost(e) {
 
     validateHealthPayload_(payload);
     if (payload.action === 'healthSyncV3') {
-      return json_(importHealthPayloadV3_(spreadsheet, logSheet, payload));
+      // Backward compatibility: currently installed Android clients still upload
+      // detailed records with V3. Never route those records into the full Sheets
+      // grid; put them in the same verified private files as healthArchiveV4.
+      return json_(importHealthPayloadV3WithFiles_(spreadsheet, logSheet, payload));
     }
     return json_(importHealthPayload_(spreadsheet, logSheet, payload));
   } catch (error) {
@@ -1188,6 +1191,61 @@ const DAY_FIELD_TO_HEADER_V3 = Object.freeze({
   qualityFlags: 'QualityFlags'
 });
 
+/**
+ * V3 client compatibility for V4 file storage.
+ *
+ * Summary-only V3 calls still use the original fast Google Sheets path.
+ * Detailed measurement batches get an archive receipt with V3-shaped count
+ * fields, so Android can acknowledge them without upgrading the APK.
+ * Combined summaries/sessions still preserve legacy session sheets while also
+ * archiving every detailed record.
+ *
+ * The archive must finish before reporting any measurements as stored. If Drive
+ * fails, the client gets ok:false and leaves the day incomplete for retry.
+ */
+function importHealthPayloadV3WithFiles_(spreadsheet, logSheet, payload) {
+  const days = payload.days || [];
+  const workouts = payload.workouts || [];
+  const sleep = payload.sleepSessions || [];
+  const measurements = payload.measurements || [];
+  const details = workouts.length + sleep.length + measurements.length;
+  if (!details) return importHealthPayloadV3_(spreadsheet, logSheet, payload);
+
+  // This is a V3 request; the V4 writer rejects nonempty days. Give it only
+  // the detailed fields without touching the summary rows.
+  const archived = importHealthArchiveFilesV4_(spreadsheet, Object.assign({}, payload, {days: []}));
+
+  if (!days.length && !workouts.length && !sleep.length) {
+    // This is the common 2,000-row V3 raw batch: no expensive sheet lookups.
+    try {
+      logSheet.appendRow([new Date(), payload.deviceId || '', payload.rangeStart || '',
+        payload.rangeEnd || '', 0, 0, 'ARCHIVED',
+        'V3 → Drive: подробных измерений ' + archived.measurements]);
+    } catch (_) {
+      // A full journal must not turn an already verified Drive write into a retry.
+    }
+    return {
+      ok: true, schemaVersion: 3, archiveSchemaVersion: 4, archived: true,
+      days: 0, workouts: 0, sleepSessions: 0,
+      measurements: archived.measurements,
+      measurementsStored: archived.measurements,
+      measurementsSkipped: 0,
+      message: 'Подробные измерения сохранены в Google Drive'
+    };
+  }
+
+  // Keep existing low-volume workout/sleep dashboard dependencies unchanged.
+  // Do not send detailed measurements to HC_Измерения under any circumstances.
+  const summaryResult = importHealthPayloadV3_(spreadsheet, logSheet,
+    Object.assign({}, payload, {measurements: []}));
+  summaryResult.measurements = archived.measurements;
+  summaryResult.measurementsStored = archived.measurements;
+  summaryResult.measurementsSkipped = 0;
+  summaryResult.archived = true;
+  summaryResult.archiveSchemaVersion = 4;
+  return summaryResult;
+}
+
 function importHealthPayloadV3_(spreadsheet, logSheet, payload) {
   const daysSheet = ensureSheet_(spreadsheet, DAYS_SHEET, DAY_HEADERS_V3);
   const workoutsSheet = ensureSheet_(spreadsheet, WORKOUTS_SHEET, WORKOUT_HEADERS);
@@ -1525,7 +1583,11 @@ function getHealthSyncPlanV3_(spreadsheet, payload) {
     repairDates: quality.repairDates,
     incompleteDays: quality.incompleteDays,
     expectedMetrics: quality.expectedMetrics,
-    storesHighVolumeRaw: !rawHighVolumePolicyV1_(measurements).skip,
+    // Every source sample now goes to bounded, verified Drive files, not the
+    // overloaded HC_Измерения grid. Expose full-resolution upload availability
+    // to existing V3 Android clients without requiring an APK upgrade.
+    storesHighVolumeRaw: rawFilesReadyV4_().ready,
+    rawArchiveMode: 'files-v4',
     message: `Dashboard: последняя дата ${latestDate}; синхронизация с ${startDate}` +
       (quality.repairDates.length ? `; к восстановлению дней: ${quality.repairDates.length}` : '')
   };
