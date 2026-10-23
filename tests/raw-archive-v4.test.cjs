@@ -149,3 +149,24 @@ test('paused server jobs also pause the archive', () => {
   assert.equal(f.context.archiveRawMeasurementsV4().status, 'paused');
   assert.equal(f.data.length, 21);
 });
+
+test('deletions do not scan a huge HC_Измерения; events go to Drive; dates reported unknown', () => {
+  const f = fixture({rows: 60001});
+  let scanned = [];
+  f.context.deleteChangedRowsV3_ = (sheet, ids, kind) => { scanned.push(kind); return 0; };
+  f.context.assertMeasurementsWritableV1_ = () => {};
+  const journal = {appendRow() { throw Error('limit of 10000000 cells'); }};
+  const r = f.context.handleHealthChangesV3_(f.spreadsheet, journal, {deletedRecordIds: ['a', 'b', 'a']});
+  assert.equal(r.ok, true);
+  assert.equal(r.affectedDatesUnknown, true);
+  assert.equal(r.archivedDeletionIds, 2);
+  assert.ok(!scanned.includes('measurement'));
+  assert.ok(f.files.some(file => file.name.includes('HealthConnectChanges')));
+  const small = fixture({rows: 10});
+  scanned = [];
+  small.context.deleteChangedRowsV3_ = (sheet, ids, kind) => { scanned.push(kind); return 0; };
+  small.context.assertMeasurementsWritableV1_ = () => {};
+  const r2 = small.context.handleHealthChangesV3_(small.spreadsheet, {appendRow() {}}, {deletedRecordIds: ['x']});
+  assert.equal(r2.affectedDatesUnknown, false);
+  assert.ok(scanned.includes('measurement'));
+});

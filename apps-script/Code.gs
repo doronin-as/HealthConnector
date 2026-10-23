@@ -1777,22 +1777,48 @@ function handleHealthChangesV3_(spreadsheet, logSheet, payload) {
     }
     return { ok: true, schemaVersion: 3, deleted: 0, archivedDeletionIds: ids.length, affectedDates: Array.from(affected).sort() };
   }
-  let deleted = 0;
-  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(MEASUREMENTS_SHEET), ids, 'measurement', affected, spreadsheet.getSpreadsheetTimeZone());
-  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(SLEEP_SHEET), ids, 'sleep', affected, spreadsheet.getSpreadsheetTimeZone());
-  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(WORKOUTS_SHEET), ids, 'workout', affected, spreadsheet.getSpreadsheetTimeZone());
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  // Deletion events always go to the Drive archive too: archived raw files are an event
+  // history, and a replay must be able to drop deleted records. Best effort.
+  let recordedInDrive = false;
+  try {
+    archiveRowsToDriveV1_(spreadsheet, 'HealthConnectChanges', ['Id'], ids.map(id => [id]), 'delete', rawFilesFolderV4_());
+    recordedInDrive = true;
+  } catch (_) {}
 
-  logSheet.appendRow([
-    new Date(), 'HealthConnectChanges', '', '', affected.size, 0, 'OK',
-    `Удалено строк: ${deleted}; record ids: ${ids.length}`
-  ]);
+  let deleted = 0;
+  // Scanning a huge HC_Измерения (≈960k rows → ~4M cells) took minutes, outlived the
+  // client's timeout and held the server lock. Large raw sheets are not scanned: they are
+  // being moved to Drive, where the deletion events above apply. The client re-reads its
+  // recent days instead (affectedDatesUnknown).
+  const measurements = spreadsheet.getSheetByName(MEASUREMENTS_SHEET);
+  const measurementRows = measurements ? Math.max(0, measurements.getLastRow() - 1) : 0;
+  const scanMeasurements = measurementRows <= DELETION_SCAN_MAX_ROWS_V1;
+  if (scanMeasurements) deleted += deleteChangedRowsV3_(measurements, ids, 'measurement', affected, tz);
+  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(SLEEP_SHEET), ids, 'sleep', affected, tz);
+  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(WORKOUTS_SHEET), ids, 'workout', affected, tz);
+
+  try {
+    logSheet.appendRow([
+      new Date(), 'HealthConnectChanges', '', '', affected.size, 0, 'OK',
+      `Удалено строк: ${deleted}; record ids: ${ids.length}` +
+        (scanMeasurements ? '' : `; HC_Измерения (${measurementRows} строк) не просматривался`) +
+        (recordedInDrive ? '; события записаны в Drive' : '')
+    ]);
+  } catch (_) {
+    // Rows are already deleted; a full journal must not turn this into a retry.
+  }
   return {
     ok: true,
     schemaVersion: 3,
     deleted,
-    affectedDates: Array.from(affected).sort()
+    affectedDates: Array.from(affected).sort(),
+    affectedDatesUnknown: !scanMeasurements,
+    archivedDeletionIds: recordedInDrive ? ids.length : 0
   };
 }
+
+const DELETION_SCAN_MAX_ROWS_V1 = 50000;
 
 function deleteChangedRowsV3_(sheet, ids, kind, affected, tz) {
   if (!sheet || sheet.getLastRow() < 2) return 0;
