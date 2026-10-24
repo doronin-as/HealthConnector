@@ -215,6 +215,9 @@ function doPost(e) {
     if (payload.action === 'fitbitRepairSleepV1') {
       return json_(fitbitRepairSleepV1_(spreadsheet, logSheet, payload));
     }
+    if (payload.action === 'energyBalanceV1') {
+      return json_(energyBalanceV1_(spreadsheet, payload));
+    }
     if (payload.action === 'hydrationV1') {
       return json_(importHydrationV1_(spreadsheet, payload));
     }
@@ -4040,5 +4043,274 @@ function updateArchiveNoteV4_(spreadsheet, status) {
 function startRawArchiveV4() {
   ensureRawArchiveScheduledV4_(getSpreadsheet_(), 'manual');
   return archiveRawMeasurementsV4();
+}
+
+
+// ===== Adaptive energy balance (v1) =====
+//
+// Real daily energy expenditure is estimated from what was eaten (FatSecret →
+// Трекер_питания) and how body weight actually changed, instead of a formula:
+//   expenditure ≈ average intake − (weight slope, kg/day × 7700 kcal/kg).
+// Weigh-ins are sparse (every 1–2 weeks), so the trend is a Theil–Sen line (median of
+// pairwise slopes), which one odd weigh-in cannot tilt. Days with an obviously
+// incomplete food log are left out of the average and reported.
+const ENERGY_SHEET_V1 = 'HC_Энергобаланс';
+const ENERGY_HEADERS_V1 = [
+  'WeekStart', 'CalculatedAt', 'TrendWeightKg', 'ActualRateKgWeek', 'AvgIntakeKcal', 'LoggedDays',
+  'WindowDays', 'WeighIns', 'ExpenditureKcal', 'TargetRateKgWeek', 'TargetIntakeKcal',
+  'GoalWeightKg', 'GoalDateAtTarget', 'GoalDateAtActual', 'Confidence', 'Notes'
+];
+const ENERGY_KCAL_PER_KG_V1 = 7700;
+const ENERGY_MIN_LOGGED_KCAL_V1 = 900;
+const ENERGY_WINDOWS_V1 = [56, 84, 120];
+
+function energyDayIndexV1_(dateKey) {
+  return Math.round(Date.UTC(+dateKey.slice(0, 4), +dateKey.slice(5, 7) - 1, +dateKey.slice(8, 10)) / 86400000);
+}
+
+function energyDateFromIndexV1_(index) {
+  return new Date(index * 86400000).toISOString().slice(0, 10);
+}
+
+function median_(values) {
+  const sorted = values.slice().sort((a, b) => a - b);
+  if (!sorted.length) return NaN;
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Pure. weights: [{date:'yyyy-MM-dd', kg}], intakes: [{date, kcal}] (one per day),
+ * opts: {today, goalWeightKg, targetRateKgWeek, currentPlanKcal}.
+ */
+function computeEnergyBalanceV1_(weights, intakes, opts) {
+  const today = opts.today;
+  const todayIndex = energyDayIndexV1_(today);
+  const byDay = new Map();
+  weights.forEach(w => {
+    const kg = Number(w.kg);
+    if (!w.date || !(kg >= 30 && kg <= 300) || w.date > today) return;
+    if (!byDay.has(w.date)) byDay.set(w.date, []);
+    byDay.get(w.date).push(kg);
+  });
+  const points = Array.from(byDay.entries())
+    .map(([date, list]) => ({ x: energyDayIndexV1_(date), y: median_(list), date }))
+    .sort((a, b) => a.x - b.x);
+
+  // Smallest window with enough weigh-ins spread over enough time.
+  let windowDays = 0;
+  let used = [];
+  for (const days of ENERGY_WINDOWS_V1) {
+    const inWindow = points.filter(p => p.x > todayIndex - days);
+    if (inWindow.length >= 3 && inWindow[inWindow.length - 1].x - inWindow[0].x >= 14) {
+      windowDays = days; used = inWindow; break;
+    }
+  }
+  const notes = [];
+  if (!used.length) {
+    return { ok: true, status: 'insufficient', confidence: 'none', weighIns: points.length,
+      message: 'Мало взвешиваний: нужно минимум 3 за последние 4 месяца с разбросом от 2 недель.' };
+  }
+
+  // Theil–Sen slope (kg/day) and intercept.
+  const slopes = [];
+  for (let i = 0; i < used.length; i++) {
+    for (let j = i + 1; j < used.length; j++) {
+      if (used[j].x !== used[i].x) slopes.push((used[j].y - used[i].y) / (used[j].x - used[i].x));
+    }
+  }
+  const slope = median_(slopes);
+  const intercept = median_(used.map(p => p.y - slope * p.x));
+  const trendWeight = intercept + slope * todayIndex;
+
+  // Intake over the same span, today excluded (not finished).
+  const startIndex = todayIndex - windowDays + 1;
+  const spanStart = Math.max(startIndex, used[0].x);
+  const inSpan = intakes.filter(r => {
+    const x = energyDayIndexV1_(r.date);
+    return x >= spanStart && x < todayIndex;
+  });
+  const logged = inSpan.filter(r => Number(r.kcal) >= ENERGY_MIN_LOGGED_KCAL_V1);
+  const partial = inSpan.length - logged.length;
+  const spanDays = Math.max(1, todayIndex - spanStart);
+  const coverage = logged.length / spanDays;
+  if (logged.length < 7) {
+    return { ok: true, status: 'insufficient', confidence: 'none', weighIns: used.length,
+      trendWeightKg: round1_(trendWeight), actualRateKgWeek: round2_(slope * 7),
+      message: `Мало дней с записью питания: ${logged.length} за ${spanDays} дн. (нужно от 7).` };
+  }
+  const avgIntake = logged.reduce((sum, r) => sum + Number(r.kcal), 0) / logged.length;
+  const expenditure = avgIntake - slope * ENERGY_KCAL_PER_KG_V1;
+  if (partial) notes.push(`дней с неполной записью питания (< ${ENERGY_MIN_LOGGED_KCAL_V1} ккал) не учтено: ${partial}`);
+  if (coverage < 0.8) notes.push(`питание записано в ${Math.round(coverage * 100)}% дней — оценка грубее`);
+
+  const confidence = used.length >= 5 && (used[used.length - 1].x - used[0].x) >= 28 && coverage >= 0.8 ? 'high'
+    : used.length >= 3 && coverage >= 0.6 ? 'medium' : 'low';
+
+  // Target: requested pace, capped at 1% of body weight per week; never below
+  // max(1500, expenditure − 1000) kcal/day.
+  const goal = Number(opts.goalWeightKg) || null;
+  const requested = Math.abs(Number(opts.targetRateKgWeek) || 0.5);
+  const maxRate = trendWeight * 0.01;
+  let targetRate = Math.min(requested, maxRate);
+  if (targetRate < requested) notes.push(`темп ограничен 1% веса в неделю (${round2_(maxRate)} кг)`);
+  const losing = goal == null || goal < trendWeight;
+  let targetIntake = expenditure + (losing ? -1 : 1) * targetRate * ENERGY_KCAL_PER_KG_V1 / 7;
+  const floor = Math.max(1500, expenditure - 1000);
+  if (losing && targetIntake < floor) {
+    targetIntake = floor;
+    targetRate = (expenditure - floor) * 7 / ENERGY_KCAL_PER_KG_V1;
+    notes.push('норма ограничена снизу: не меньше 1500 ккал и не больше 1000 ккал ниже расхода');
+  }
+  if (goal != null && Math.abs(goal - trendWeight) < 0.5) {
+    targetIntake = expenditure;
+    targetRate = 0;
+    notes.push('цель достигнута — норма на поддержание');
+  }
+
+  const goalDate = rate => {
+    if (goal == null || !(rate > 0.01)) return '';
+    const weeks = Math.abs(trendWeight - goal) / rate;
+    return weeks > 260 ? '' : energyDateFromIndexV1_(todayIndex + Math.round(weeks * 7));
+  };
+  const actualRate = slope * 7;
+  const movingTowardGoal = goal != null && (goal - trendWeight) * actualRate > 0;
+
+  const plan = Number(opts.currentPlanKcal) || null;
+  return {
+    ok: true,
+    status: 'ok',
+    confidence,
+    windowDays,
+    weighIns: used.length,
+    firstWeighIn: used[0].date,
+    lastWeighIn: used[used.length - 1].date,
+    trendWeightKg: round1_(trendWeight),
+    actualRateKgWeek: round2_(actualRate),
+    avgIntakeKcal: Math.round(avgIntake),
+    loggedDays: logged.length,
+    spanDays,
+    expenditureKcal: Math.round(expenditure / 10) * 10,
+    targetRateKgWeek: round2_(targetRate),
+    targetIntakeKcal: Math.round(targetIntake / 10) * 10,
+    goalWeightKg: goal,
+    goalDateAtTarget: goalDate(targetRate),
+    goalDateAtActual: movingTowardGoal ? goalDate(Math.abs(actualRate)) : '',
+    currentPlanKcal: plan,
+    planDifferenceKcal: plan ? Math.round(targetIntake / 10) * 10 - plan : null,
+    notes
+  };
+}
+
+function round1_(v) { return Math.round(v * 10) / 10; }
+function round2_(v) { return Math.round(v * 100) / 100; }
+
+/** All weigh-ins the workbook knows: scale, HC_Дни, Дневник «Вес утро», Замеры «Вес, кг». */
+function collectWeightsV1_(spreadsheet, tz) {
+  const out = [];
+  const add = (date, kg) => { const n = Number(kg); if (date && n > 0) out.push({ date, kg: n }); };
+  const byHeaders = (name, dateAliases, valueAliases) => {
+    const sheet = spreadsheet.getSheetByName(name);
+    if (!sheet || sheet.getLastRow() < 2) return;
+    const header = findHeader_(sheet);
+    if (!header) return;
+    const dateCol = findAlias_(header.map, dateAliases);
+    const valueCol = findAlias_(header.map, valueAliases);
+    if (!dateCol || !valueCol) return;
+    const first = header.row + 1;
+    if (sheet.getLastRow() < first) return;
+    const n = sheet.getLastRow() - first + 1;
+    const dates = sheet.getRange(first, dateCol, n, 1).getValues();
+    const values = sheet.getRange(first, valueCol, n, 1).getValues();
+    dates.forEach((r, i) => add(normalizeDateWithTz_(r[0], tz), values[i][0]));
+  };
+  byHeaders('Дневник', ['Дата'], ['Вес утро', 'Вес']);
+  byHeaders('Замеры', ['Дата'], ['Вес, кг', 'Вес']);
+  const days = spreadsheet.getSheetByName(DAYS_SHEET);
+  if (days && days.getLastRow() >= 2) {
+    const headers = days.getRange(1, 1, 1, days.getLastColumn()).getValues()[0];
+    const w = headers.indexOf('WeightKg');
+    if (w >= 0) {
+      const rows = days.getRange(2, 1, days.getLastRow() - 1, w + 1).getValues();
+      rows.forEach(r => add(normalizeDateWithTz_(r[0], tz), r[w]));
+    }
+  }
+  const scale = spreadsheet.getSheetByName(BODY_COMPOSITION_SHEET);
+  if (scale && scale.getLastRow() >= 2) {
+    const headers = scale.getRange(1, 1, 1, scale.getLastColumn()).getValues()[0];
+    const d = headers.indexOf('Date'), w = headers.indexOf('WeightKg');
+    if (d >= 0 && w >= 0) {
+      scale.getRange(2, 1, scale.getLastRow() - 1, Math.max(d, w) + 1).getValues()
+        .forEach(r => add(normalizeDateWithTz_(r[d], tz), r[w]));
+    }
+  }
+  return out;
+}
+
+/** Daily calories from the FatSecret import (sum of meals per date). */
+function collectIntakesV1_(spreadsheet, tz) {
+  const sheet = spreadsheet.getSheetByName(FOOD_TRACKER_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const header = findHeader_(sheet);
+  if (!header) return [];
+  const dateCol = header.map.get('дата');
+  const kcalCol = findAlias_(header.map, ['Калории', 'Ккал', 'kcal']);
+  if (!dateCol || !kcalCol) return [];
+  const first = header.row + 1;
+  if (sheet.getLastRow() < first) return [];
+  const n = sheet.getLastRow() - first + 1;
+  const dates = sheet.getRange(first, dateCol, n, 1).getValues();
+  const kcal = sheet.getRange(first, kcalCol, n, 1).getValues();
+  const totals = new Map();
+  dates.forEach((r, i) => {
+    const date = normalizeDateWithTz_(r[0], tz);
+    const value = Number(kcal[i][0]);
+    if (date && Number.isFinite(value)) totals.set(date, (totals.get(date) || 0) + value);
+  });
+  return Array.from(totals.entries()).map(([date, total]) => ({ date, kcal: total }));
+}
+
+function profileValueV1_(spreadsheet, labels) {
+  const sheet = spreadsheet.getSheetByName('Профиль');
+  if (!sheet || sheet.getLastRow() < 1) return null;
+  const rows = sheet.getRange(1, 1, Math.min(sheet.getLastRow(), 200), 2).getValues();
+  const wanted = labels.map(l => normalizeHeader_(l));
+  const row = rows.find(r => wanted.includes(normalizeHeader_(r[0])));
+  const value = row ? Number(row[1]) : NaN;
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * Action energyBalanceV1 {goalWeightKg?, targetRateKgWeek?}. Goal and current plan
+ * default to Профиль. Stores one row per week (upsert by Monday) in HC_Энергобаланс.
+ */
+function energyBalanceV1_(spreadsheet, payload) {
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const goal = Number(payload.goalWeightKg) > 0 ? Number(payload.goalWeightKg)
+    : profileValueV1_(spreadsheet, ['Целевой вес для расчётов, кг', 'Целевой вес, кг', 'Целевой вес']);
+  const plan = profileValueV1_(spreadsheet, ['Калории, ккал/день', 'Калории']);
+  const result = computeEnergyBalanceV1_(collectWeightsV1_(spreadsheet, tz), collectIntakesV1_(spreadsheet, tz), {
+    today, goalWeightKg: goal, targetRateKgWeek: Number(payload.targetRateKgWeek) || 0.5, currentPlanKcal: plan
+  });
+  result.today = today;
+  if (result.status === 'ok' && payload.write !== false) {
+    try {
+      const sheet = ensureSheet_(spreadsheet, ENERGY_SHEET_V1, ENERGY_HEADERS_V1);
+      const weekStart = energyDateFromIndexV1_(energyDayIndexV1_(today) - ((new Date(today + 'T12:00:00Z').getUTCDay() + 6) % 7));
+      // Leading apostrophe keeps the key as text, so Sheets does not turn it into a date
+      // and the next upsert of the same week finds it.
+      upsertByKey_(sheet, [[
+        "'" + weekStart, new Date().toISOString(), result.trendWeightKg, result.actualRateKgWeek, result.avgIntakeKcal,
+        result.loggedDays, result.spanDays, result.weighIns, result.expenditureKcal, result.targetRateKgWeek,
+        result.targetIntakeKcal, result.goalWeightKg || '', result.goalDateAtTarget, result.goalDateAtActual,
+        result.confidence, result.notes.join('; ')
+      ]], 1);
+      result.storedWeek = weekStart;
+    } catch (error) {
+      result.notes.push('не удалось записать в ' + ENERGY_SHEET_V1 + ': ' + String(error && error.message || error));
+    }
+  }
+  return result;
 }
 
