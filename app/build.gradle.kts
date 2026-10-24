@@ -29,8 +29,8 @@ android {
         applicationId = "ru.doronin.healthconnector.stable"
         minSdk = 26
         targetSdk = 35
-        versionCode = 56
-        versionName = "1.8.1"
+        versionCode = 57
+        versionName = "1.9.0"
         manifestPlaceholders["appLabel"] = "Health Connector"
     }
 
@@ -38,7 +38,7 @@ android {
         getByName("debug") {
             applicationIdSuffix = ".test"
             versionNameSuffix = "-test"
-            manifestPlaceholders["appLabel"] = "HC 1.8.1 TEST"
+            manifestPlaceholders["appLabel"] = "HC 1.9.0 TEST"
         }
         getByName("release") {
             isDebuggable = false
@@ -70,4 +70,6 @@ dependencies {
     implementation("com.google.guava:guava:33.3.1-android")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     testImplementation("junit:junit:4.13.2")
+    // Real org.json for JVM unit tests (android.jar only ships throwing stubs).
+    testImplementation("org.json:json:20240303")
 }

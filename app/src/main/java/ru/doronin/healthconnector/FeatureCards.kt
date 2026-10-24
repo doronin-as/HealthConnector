@@ -37,6 +37,7 @@ object FeatureScheduler {
         OutboxWorker.schedule(context)
         WellbeingReminderWorker.schedule(context)
         SyncWatchdogWorker.schedule(context)
+        ru.doronin.healthconnector.energy.EnergyReportWorker.schedule(context)
     }
 }
 
