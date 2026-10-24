@@ -89,6 +89,20 @@ object SyncControl {
             append("\nСтрок в HC_Измерения: ").append(status.optInt("measurementRows"))
             if (status.optBoolean("rawHighVolumeStored", true).not()) append(" (поминутные данные больше не пишутся)")
         }
+        status.optJSONObject("rawArchive")?.let { archive ->
+            val state = archive.optString("state")
+            val moved = archive.optLong("archivedRows")
+            val left = archive.optLong("remaining", -1)
+            when (state) {
+                "done" -> append("\nАвтоархивация HC_Измерения: завершена, перенесено $moved строк")
+                "running", "scheduled" -> append("\nАвтоархивация HC_Измерения: идёт · перенесено $moved" + if (left >= 0) " · осталось $left" else "")
+                "blocked" -> append("\n⚠ Автоархивация остановлена: ${archive.optString("message")}")
+                "error" -> append("\n⚠ Автоархивация: ошибка «${archive.optString("lastError")}», повторится через 5 мин")
+            }
+            archive.optJSONObject("lastWrite")?.let { last ->
+                if (!last.optBoolean("ok", true)) append("\n⚠ Последняя запись в Drive не удалась: ${last.optString("error")}")
+            }
+        }
         status.optString("abortBefore").takeIf { it.isNotBlank() }?.let { append("\nПоследняя остановка: ").append(it) }
     }
 }

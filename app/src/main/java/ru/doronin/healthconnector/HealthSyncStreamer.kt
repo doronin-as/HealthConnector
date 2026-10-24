@@ -133,9 +133,21 @@ class HealthSyncStreamer(
             if (!sendHighVolumeRaw) " · поминутные данные в таблицу не отправляются" else "")
         onProgress("Проверяю изменения Health Connect…")
         val changes = changesTracker.collect(zone)
-        val deletionDates = if (changes.deletedRecordIds.isNotEmpty()) {
-            postDeletedRecordIds(endpoint, token, changes.deletedRecordIds)
-        } else {
+        // Deletions must not block the days: if they cannot be delivered now, the days are
+        // still synced and the change tokens are simply not advanced (retried next run).
+        var deletionError: String? = null
+        val deletionDates: Set<LocalDate> = if (changes.deletedRecordIds.isEmpty()) emptySet() else try {
+            val delivered = postDeletedRecordIds(endpoint, token, changes.deletedRecordIds)
+            if (delivered.datesUnknown) {
+                // The server could not map deleted raw records to days: re-read recent days.
+                onProgress("Удалено записей: ${changes.deletedRecordIds.size}; перечитываю последние $DELETION_REREAD_DAYS дн.")
+                delivered.dates + (0 until DELETION_REREAD_DAYS).map { today.minusDays(it.toLong()) }
+            } else delivered.dates
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            deletionError = error.message ?: error.javaClass.simpleName
+            onProgress("⚠ Удаления Health Connect не отправлены ($deletionError); дни синхронизирую, удаления повторю в следующий раз")
             emptySet()
         }
         // Keep periodic work bounded. One deletion must not expand a two-day background run
@@ -233,6 +245,10 @@ class HealthSyncStreamer(
         // Never commit change tokens after an abort: the next run must re-read these changes.
         aborted?.let { throw it }
 
+        if (deletionError != null && failedDays.isEmpty()) {
+            // Days are stored; tokens stay put so the deletions are delivered next time.
+            error("Дни сохранены, но удаления Health Connect не отправлены: $deletionError. Повторю при следующей синхронизации.")
+        }
         if (failedDays.isNotEmpty()) {
             // Tokens stay where they were, so the next run re-reads these changes.
             error(
@@ -1230,8 +1246,9 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         endpoint: String,
         token: String,
         recordIds: Set<String>
-    ): Set<LocalDate> {
-        if (recordIds.isEmpty()) return emptySet()
+    ): DeletionResult {
+        if (recordIds.isEmpty()) return DeletionResult(emptySet(), false)
+        var datesUnknown = false
 
         // Apps Script caps one deletion request at 10k IDs. Use smaller chunks so
         // a large Health Connect change log cannot abort the whole synchronization.
@@ -1247,13 +1264,16 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
             // committed and these deletions would never be retried.
             val response = postBody(endpoint, body)
                 ?: error("Apps Script не подтвердил удаление записей Health Connect")
+            if (response.optBoolean("affectedDatesUnknown", false)) datesUnknown = true
             val dates = response.optJSONArray("affectedDates") ?: continue
             for (i in 0 until dates.length()) {
                 runCatching { LocalDate.parse(dates.getString(i)) }.getOrNull()?.let(result::add)
             }
         }
-        return result
+        return DeletionResult(result, datesUnknown)
     }
+
+    private data class DeletionResult(val dates: Set<LocalDate>, val datesUnknown: Boolean)
 
     private suspend fun postHealthPayload(
         endpoint: String,
@@ -1364,7 +1384,13 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
 
     private fun isRetryableRequestError(error: Throwable): Boolean {
         val value = (error.message ?: "").lowercase()
+        // SocketException covers "Software caused connection abort" / "Connection reset":
+        // the network changed under the request (call, Wi-Fi ↔ mobile), not a server verdict.
         return error is java.net.SocketTimeoutException ||
+            error is java.net.SocketException ||
+            error is java.net.UnknownHostException ||
+            error is java.io.EOFException ||
+            error is javax.net.ssl.SSLException ||
             "lock_busy" in value ||
             "блокиров" in value ||
             "timeout" in value ||
@@ -2027,6 +2053,7 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
         private const val HEALTH_CONNECT_DAY_PAUSE_MS = 1000L
         const val PREF_ACTIVITY_SOURCE_OVERRIDE = "activity_source_override"
         private const val MAX_REQUEST_ATTEMPTS = 6
+        private const val DELETION_REREAD_DAYS = 7
         private const val MANUAL_PARALLEL_DAYS = 2
         // Must match RAW_HIGH_VOLUME_TYPES_V1 in apps-script/Code.gs.
         private val HIGH_VOLUME_TYPES = setOf(

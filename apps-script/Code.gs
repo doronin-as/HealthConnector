@@ -120,6 +120,11 @@ function doGet(e) {
     schemaVersion: 4,
     archiveProtocol: 'healthArchiveV4',
     rawStorage: rawFilesReadyV4_(),
+    rawArchive: (() => {
+      // Progress only (no health data): lets the deploy check report the automatic archive.
+      try { const s = rawArchiveStatusV4_(); return { state: s.state || '', remaining: s.remaining, archivedRows: s.archivedRows || 0, lastError: s.lastError || '' }; }
+      catch (_) { return null; }
+    })(),
     time: new Date().toISOString(),
     googleHealth: googleHealthStatusV1_(),
     fitbitLegacy: fitbitStatusV1_()
@@ -162,6 +167,8 @@ function doPost(e) {
     markLockHolderV1_(payload.action || 'healthSync', payload.runId, payload.deviceId);
 
     const spreadsheet = getSpreadsheet_();
+    // Cheap, throttled: starts the automatic archive when HC_Измерения is large.
+    try { ensureRawArchiveScheduledV4_(spreadsheet, ''); } catch (_) {}
     const logSheet = ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS);
 
     if (payload.action === 'fatsecretCsv') {
@@ -235,13 +242,17 @@ function doPost(e) {
     }
     return json_(importHealthPayload_(spreadsheet, logSheet, payload));
   } catch (error) {
+    const workbookFull = isWorkbookCellLimitError_(error);
     try {
       const spreadsheet = getSpreadsheet_();
+      if (workbookFull) ensureRawArchiveScheduledV4_(spreadsheet, 'workbook-full');
       const logSheet = ensureSheet_(spreadsheet, LOG_SHEET, LOG_HEADERS);
       logSheet.appendRow([new Date(), '', '', '', 0, 0, 'ERROR', String(error)]);
     } catch (_) {}
-    const message = String(error && error.message || error);
-    return json_({ ok: false, error: message, message: message });
+    const message = workbookFull
+      ? 'В таблице закончилось место (лимит 10 млн ячеек Google Sheets). Запущена автоархивация HC_Измерения на Google Drive; приложение повторит запрос.'
+      : String(error && error.message || error);
+    return json_({ ok: false, errorCode: workbookFull ? 'WORKBOOK_FULL' : '', error: message, message: message });
   } finally {
     try { lock.releaseLock(); } catch (_) {}
   }
@@ -987,7 +998,14 @@ function ensureSheet_(spreadsheet, name, headers) {
     };
   }
   let sheet = spreadsheet.getSheetByName(name);
-  if (!sheet) sheet = spreadsheet.insertSheet(name);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(name);
+    // A new sheet is 1000×26 cells; keep only what the headers need (the workbook has a 10M-cell cap).
+    try {
+      if (sheet.getMaxColumns() > headers.length) sheet.deleteColumns(headers.length + 1, sheet.getMaxColumns() - headers.length);
+      if (sheet.getMaxRows() > 100) sheet.deleteRows(101, sheet.getMaxRows() - 100);
+    } catch (_) {}
+  }
   if (sheet.getMaxColumns() < headers.length) {
     sheet.insertColumnsAfter(sheet.getMaxColumns(), headers.length - sheet.getMaxColumns());
   }
@@ -1211,11 +1229,16 @@ function importHealthPayloadV3WithFiles_(spreadsheet, logSheet, payload) {
   const details = workouts.length + sleep.length + measurements.length;
   if (!details) return importHealthPayloadV3_(spreadsheet, logSheet, payload);
 
-  // This is a V3 request; the V4 writer rejects nonempty days. Give it only
-  // the detailed fields without touching the summary rows.
-  const archived = importHealthArchiveFilesV4_(spreadsheet, Object.assign({}, payload, {days: []}));
-
   if (!days.length && !workouts.length && !sleep.length) {
+    // The V4 writer rejects nonempty days. Give it only the detailed fields.
+    let archived;
+    try {
+      archived = importHealthArchiveFilesV4_(spreadsheet, Object.assign({}, payload, {days: []}));
+      noteRawArchiveWriteV4_(null);
+    } catch (error) {
+      noteRawArchiveWriteV4_(error);
+      throw error;
+    }
     // This is the common 2,000-row V3 raw batch: no expensive sheet lookups.
     try {
       logSheet.appendRow([new Date(), payload.deviceId || '', payload.rangeStart || '',
@@ -1234,15 +1257,26 @@ function importHealthPayloadV3WithFiles_(spreadsheet, logSheet, payload) {
     };
   }
 
-  // Keep existing low-volume workout/sleep dashboard dependencies unchanged.
-  // Do not send detailed measurements to HC_Измерения under any circumstances.
+  // Combined packet (day summary, workouts, sleep): the day and the low-volume session
+  // sheets are written FIRST, so a Drive problem can never lose the daily summary.
+  // Detailed measurements never go to HC_Измерения.
   const summaryResult = importHealthPayloadV3_(spreadsheet, logSheet,
     Object.assign({}, payload, {measurements: []}));
-  summaryResult.measurements = archived.measurements;
-  summaryResult.measurementsStored = archived.measurements;
-  summaryResult.measurementsSkipped = 0;
-  summaryResult.archived = true;
-  summaryResult.archiveSchemaVersion = 4;
+  try {
+    const archived = importHealthArchiveFilesV4_(spreadsheet, Object.assign({}, payload, {days: []}));
+    summaryResult.measurements = archived.measurements;
+    summaryResult.measurementsStored = archived.measurements;
+    summaryResult.measurementsSkipped = 0;
+    summaryResult.archived = true;
+    summaryResult.archiveSchemaVersion = 4;
+    noteRawArchiveWriteV4_(null);
+  } catch (error) {
+    noteRawArchiveWriteV4_(error);
+    summaryResult.archived = false;
+    summaryResult.measurementsStored = 0;
+    summaryResult.measurementsSkipped = measurements.length;
+    summaryResult.warning = 'Сводка сохранена, подробные данные не записаны в Google Drive: ' + String(error && error.message || error);
+  }
   return summaryResult;
 }
 
@@ -1743,22 +1777,48 @@ function handleHealthChangesV3_(spreadsheet, logSheet, payload) {
     }
     return { ok: true, schemaVersion: 3, deleted: 0, archivedDeletionIds: ids.length, affectedDates: Array.from(affected).sort() };
   }
-  let deleted = 0;
-  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(MEASUREMENTS_SHEET), ids, 'measurement', affected, spreadsheet.getSpreadsheetTimeZone());
-  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(SLEEP_SHEET), ids, 'sleep', affected, spreadsheet.getSpreadsheetTimeZone());
-  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(WORKOUTS_SHEET), ids, 'workout', affected, spreadsheet.getSpreadsheetTimeZone());
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  // Deletion events always go to the Drive archive too: archived raw files are an event
+  // history, and a replay must be able to drop deleted records. Best effort.
+  let recordedInDrive = false;
+  try {
+    archiveRowsToDriveV1_(spreadsheet, 'HealthConnectChanges', ['Id'], ids.map(id => [id]), 'delete', rawFilesFolderV4_());
+    recordedInDrive = true;
+  } catch (_) {}
 
-  logSheet.appendRow([
-    new Date(), 'HealthConnectChanges', '', '', affected.size, 0, 'OK',
-    `Удалено строк: ${deleted}; record ids: ${ids.length}`
-  ]);
+  let deleted = 0;
+  // Scanning a huge HC_Измерения (≈960k rows → ~4M cells) took minutes, outlived the
+  // client's timeout and held the server lock. Large raw sheets are not scanned: they are
+  // being moved to Drive, where the deletion events above apply. The client re-reads its
+  // recent days instead (affectedDatesUnknown).
+  const measurements = spreadsheet.getSheetByName(MEASUREMENTS_SHEET);
+  const measurementRows = measurements ? Math.max(0, measurements.getLastRow() - 1) : 0;
+  const scanMeasurements = measurementRows <= DELETION_SCAN_MAX_ROWS_V1;
+  if (scanMeasurements) deleted += deleteChangedRowsV3_(measurements, ids, 'measurement', affected, tz);
+  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(SLEEP_SHEET), ids, 'sleep', affected, tz);
+  deleted += deleteChangedRowsV3_(spreadsheet.getSheetByName(WORKOUTS_SHEET), ids, 'workout', affected, tz);
+
+  try {
+    logSheet.appendRow([
+      new Date(), 'HealthConnectChanges', '', '', affected.size, 0, 'OK',
+      `Удалено строк: ${deleted}; record ids: ${ids.length}` +
+        (scanMeasurements ? '' : `; HC_Измерения (${measurementRows} строк) не просматривался`) +
+        (recordedInDrive ? '; события записаны в Drive' : '')
+    ]);
+  } catch (_) {
+    // Rows are already deleted; a full journal must not turn this into a retry.
+  }
   return {
     ok: true,
     schemaVersion: 3,
     deleted,
-    affectedDates: Array.from(affected).sort()
+    affectedDates: Array.from(affected).sort(),
+    affectedDatesUnknown: !scanMeasurements,
+    archivedDeletionIds: recordedInDrive ? ids.length : 0
   };
 }
+
+const DELETION_SCAN_MAX_ROWS_V1 = 50000;
 
 function deleteChangedRowsV3_(sheet, ids, kind, affected, tz) {
   if (!sheet || sheet.getLastRow() < 2) return 0;
@@ -3705,7 +3765,8 @@ const LOCK_HOLDER_PROP_V1 = 'LOCK_HOLDER_V1';
 const ABORT_BEFORE_PROP_V1 = 'SYNC_ABORT_BEFORE_MS_V1';
 const SERVER_JOBS_PAUSED_PROP_V1 = 'SERVER_JOBS_PAUSED_V1';
 const SERVER_JOB_HANDLERS_V1 = [
-  'migrateMeasurementsTo5mV1', 'compactOldMeasurementsV1', 'archiveDashboardHistoryV1', 'fitbitSyncRecentV1'
+  'migrateMeasurementsTo5mV1', 'compactOldMeasurementsV1', 'archiveDashboardHistoryV1', 'fitbitSyncRecentV1',
+  'archiveRawMeasurementsV4'
 ];
 
 /** Records who acquired the script lock. Overwritten by the next holder. */
@@ -3800,7 +3861,184 @@ function serverStatusV1_() {
     measurementRows,
     rawHighVolumeStored: measurementRows === null ? null : measurementRows < RAW_HIGH_VOLUME_ROW_LIMIT_V1,
     driveArchiveEnabled: driveArchiveEnabledV1_(),
+    rawArchive: rawArchiveStatusV4_(),
     abortBefore: abortBefore ? new Date(abortBefore).toISOString() : ''
   };
+}
+
+
+// ===== Automatic archive of HC_Измерения into Google Drive (v4) =====
+//
+// The workbook has a hard cap of 10M cells. HC_Измерения grew to ~960k rows, after which
+// Google Sheets refused to add rows anywhere (new days in HC_Дни included). New detailed
+// data already goes to Drive files; this job moves the old rows out of the sheet.
+//
+// Safety: a block is read, written to a gzip JSON file, read back and hash-verified
+// (archiveRowsToDriveV1_) and only then deleted from the sheet. A crash between the two
+// steps leaves the rows in the sheet; the retry produces the same content-addressed file
+// and reuses it. Blocks are taken from the END of the sheet (no row shifting, fast) and
+// the script lock is held only for one block, so syncs keep working meanwhile.
+const RAW_ARCHIVE_HANDLER_V4 = 'archiveRawMeasurementsV4';
+const RAW_ARCHIVE_STATUS_PROP_V4 = 'RAW_ARCHIVE_STATUS_V4';
+const RAW_ARCHIVE_CHECKED_PROP_V4 = 'RAW_ARCHIVE_CHECKED_AT_V4';
+const RAW_ARCHIVE_WRITE_PROP_V4 = 'RAW_ARCHIVE_LAST_WRITE_V4';
+const RAW_ARCHIVE_START_ROWS_V4 = 50000;
+const RAW_ARCHIVE_BLOCK_ROWS_V4 = 4000;
+const RAW_ARCHIVE_BUDGET_MS_V4 = 4 * 60 * 1000;
+
+function rawArchiveStatusV4_() {
+  const props = PropertiesService.getScriptProperties();
+  let status = {};
+  try { status = JSON.parse(props.getProperty(RAW_ARCHIVE_STATUS_PROP_V4) || '{}'); } catch (_) {}
+  try { status.lastWrite = JSON.parse(props.getProperty(RAW_ARCHIVE_WRITE_PROP_V4) || 'null'); } catch (_) {}
+  return status;
+}
+
+function saveRawArchiveStatusV4_(patch) {
+  const props = PropertiesService.getScriptProperties();
+  let status = {};
+  try { status = JSON.parse(props.getProperty(RAW_ARCHIVE_STATUS_PROP_V4) || '{}'); } catch (_) {}
+  Object.assign(status, patch, { updatedAt: new Date().toISOString() });
+  props.setProperty(RAW_ARCHIVE_STATUS_PROP_V4, JSON.stringify(status));
+  return status;
+}
+
+/** Remembers the outcome of the last live write of detailed data into Drive. */
+function noteRawArchiveWriteV4_(error) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(RAW_ARCHIVE_WRITE_PROP_V4, JSON.stringify(error
+      ? { ok: false, at: new Date().toISOString(), error: String(error && error.message || error).slice(0, 300) }
+      : { ok: true, at: new Date().toISOString() }));
+  } catch (_) {}
+}
+
+/**
+ * Starts the 5-minute archive trigger when HC_Измерения is large or the workbook is full.
+ * Throttled to one check per 10 minutes unless [reason] forces it.
+ */
+function ensureRawArchiveScheduledV4_(spreadsheet, reason) {
+  const props = PropertiesService.getScriptProperties();
+  const now = Date.now();
+  if (!reason && now - Number(props.getProperty(RAW_ARCHIVE_CHECKED_PROP_V4) || 0) < 10 * 60 * 1000) return false;
+  props.setProperty(RAW_ARCHIVE_CHECKED_PROP_V4, String(now));
+  const sheet = spreadsheet.getSheetByName(MEASUREMENTS_SHEET);
+  const rows = sheet ? Math.max(0, sheet.getLastRow() - 1) : 0;
+  if (!reason && rows < RAW_ARCHIVE_START_ROWS_V4) return false;
+  if (!rows) return false;
+  const exists = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === RAW_ARCHIVE_HANDLER_V4);
+  if (!exists) ScriptApp.newTrigger(RAW_ARCHIVE_HANDLER_V4).timeBased().everyMinutes(5).create();
+  const status = rawArchiveStatusV4_();
+  if (!exists || status.state !== 'running') {
+    saveRawArchiveStatusV4_({ state: 'scheduled', reason: reason || 'rows', remaining: rows,
+      scheduledAt: status.scheduledAt || new Date().toISOString() });
+  }
+  return true;
+}
+
+/** Time-trigger handler. Safe to run repeatedly and concurrently with syncs. */
+function archiveRawMeasurementsV4() {
+  if (serverJobsPausedV1_()) return { ok: true, status: 'paused' };
+  const started = Date.now();
+  const spreadsheet = getSpreadsheet_();
+  const sheet = spreadsheet.getSheetByName(MEASUREMENTS_SHEET);
+  let status = rawArchiveStatusV4_();
+  if (!sheet) return finishRawArchiveV4_(spreadsheet, 0);
+
+  if (!status.dependenciesChecked) {
+    // Reports built on HC_Измерения would go blank; never delete rows they read.
+    const dependents = archiveDependentSheetsV1_(spreadsheet, MEASUREMENTS_SHEET);
+    if (dependents.length) {
+      saveRawArchiveStatusV4_({ state: 'blocked', blockedBy: dependents,
+        message: 'HC_Измерения используют листы: ' + dependents.join(', ') });
+      return { ok: false, status: 'blocked', dependents };
+    }
+    status = saveRawArchiveStatusV4_({ dependenciesChecked: true });
+  }
+
+  const folder = rawFilesFolderV4_();
+  let archivedNow = 0;
+  let lastError = '';
+  while (Date.now() - started < RAW_ARCHIVE_BUDGET_MS_V4) {
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(5000)) break;
+    try {
+      markLockHolderV1_('фоновая задача: автоархивация HC_Измерения', '', 'сервер');
+      archivedNow += archiveRawMeasurementsBlockV4_(spreadsheet, sheet, folder);
+      if (sheet.getLastRow() <= 1) break;
+    } catch (error) {
+      lastError = String(error && error.message || error).slice(0, 300);
+      break;
+    } finally {
+      lock.releaseLock();
+    }
+  }
+
+  const remaining = Math.max(0, sheet.getLastRow() - 1);
+  const total = Number(status.archivedRows || 0) + archivedNow;
+  if (!remaining) return finishRawArchiveV4_(spreadsheet, total);
+  saveRawArchiveStatusV4_({ state: lastError ? 'error' : 'running', archivedRows: total, remaining,
+    lastRunAt: new Date().toISOString(), lastError, folderUrl: folder.getUrl() });
+  return { ok: !lastError, status: lastError ? 'error' : 'running', archivedNow, archivedRows: total, remaining, lastError };
+}
+
+/** Moves one trailing block; returns the number of rows removed from the sheet. */
+function archiveRawMeasurementsBlockV4_(spreadsheet, sheet, folder) {
+  const frozen = Math.max(1, sheet.getFrozenRows());
+  // Empty rows below the data cost cells too: release them first (instant, no shifting).
+  const lastRow = sheet.getLastRow();
+  if (sheet.getMaxRows() > Math.max(lastRow, frozen + 1)) {
+    sheet.deleteRows(Math.max(lastRow, frozen + 1) + 1, sheet.getMaxRows() - Math.max(lastRow, frozen + 1));
+  }
+  const dataRows = lastRow - frozen;
+  if (dataRows <= 0) return 0;
+  const count = Math.min(RAW_ARCHIVE_BLOCK_ROWS_V4, dataRows);
+  const start = lastRow - count + 1;
+  const width = Math.max(1, Math.min(sheet.getLastColumn(), MEASUREMENT_HEADERS.length));
+  const range = sheet.getRange(start, 1, count, width);
+  const rows = range.getValues();
+  const headers = MEASUREMENT_HEADERS.slice(0, width);
+  // Throws if the stored file cannot be read back with the same SHA-256: rows stay.
+  archiveRowsToDriveV1_(spreadsheet, MEASUREMENTS_SHEET, headers, rows, 'sheet-archive', folder);
+  if (start <= frozen + 1) {
+    // Sheets keeps at least one non-frozen row: clear the last one instead of deleting it.
+    if (count > 1) sheet.deleteRows(frozen + 2, count - 1);
+    sheet.getRange(frozen + 1, 1, 1, width).clearContent();
+  } else {
+    sheet.deleteRows(start, count);
+  }
+  return count;
+}
+
+function finishRawArchiveV4_(spreadsheet, total) {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === RAW_ARCHIVE_HANDLER_V4)
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  let folderUrl = '';
+  try { folderUrl = rawFilesFolderV4_().getUrl(); } catch (_) {}
+  const status = saveRawArchiveStatusV4_({ state: 'done', archivedRows: total, remaining: 0,
+    finishedAt: new Date().toISOString(), lastError: '', folderUrl });
+  try { updateArchiveNoteV4_(spreadsheet, status); } catch (_) {}
+  return { ok: true, status: 'done', archivedRows: total };
+}
+
+/** Updates the existing human-readable "Архив" sheet, if it has the expected labels. */
+function updateArchiveNoteV4_(spreadsheet, status) {
+  const sheet = spreadsheet.getSheetByName('Архив');
+  if (!sheet || sheet.getLastRow() < 1) return;
+  const values = sheet.getRange(1, 1, sheet.getLastRow(), 2).getValues();
+  const tz = spreadsheet.getSpreadsheetTimeZone();
+  const set = (label, text) => {
+    const index = values.findIndex(r => String(r[0]).trim() === label);
+    if (index >= 0 && !sheet.getRange(index + 1, 2).getFormula()) sheet.getRange(index + 1, 2).setValue(text);
+  };
+  set('HC_Измерения', 'Сырые измерения перенесены в Google Drive (папка «HealthConnector — подробные данные v4»); новые подробные данные пишутся туда же.');
+  set('Способ хранения', `Google Drive, файлы JSON.gz с проверкой. Перенесено строк: ${status.archivedRows}.`);
+  set('Обновлено', Utilities.formatDate(new Date(), tz, 'dd.MM.yyyy'));
+}
+
+/** Manual entry point (Apps Script editor): starts the archive immediately. */
+function startRawArchiveV4() {
+  ensureRawArchiveScheduledV4_(getSpreadsheet_(), 'manual');
+  return archiveRawMeasurementsV4();
 }
 
