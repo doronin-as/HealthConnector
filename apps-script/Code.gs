@@ -152,6 +152,29 @@ function doPost(e) {
     return json_({ ok: false, errorCode: 'ABORTED', message: 'Синхронизация остановлена пользователем' });
   }
 
+  // Do not treat an unknown RPC action (for example a client feature whose server
+  // deployment is still pending) as a malformed healthSync payload. In particular,
+  // do not append thousands of identical "Поле days должно быть массивом" errors.
+  // Authentication above still applies. Old sync payloads without an action work.
+  const actionsWithoutHealthDays = new Set([
+    'serverStatusV1', 'abortSyncV1', 'fatsecretCsv', 'healthChangesV3',
+    'healthSyncPlanV3', 'dashboardSnapshotV1', 'googleHealthStatusV1',
+    'googleHealthConfigureV1', 'googleHealthAuthorizationUrlV1',
+    'googleHealthRepairSleepV1', 'fitbitCloudStatusV1',
+    'fitbitCloudConfigureV1', 'fitbitCloudAuthorizationUrlV1',
+    'fitbitRepairSleepV1', 'hydrationV1', 'wellbeingV1', 'bodyCompositionV1'
+  ]);
+  if (!actionsWithoutHealthDays.has(payload.action) && !Array.isArray(payload.days)) {
+    const action = String(payload.action || '');
+    const isSync = !action || action === 'healthSync' || /^healthSyncV[123]$/.test(action) ||
+      action === 'healthArchiveV4';
+    const errorCode = isSync ? 'INVALID_PAYLOAD' : 'UNSUPPORTED_ACTION';
+    const message = isSync
+      ? 'Поле days должно быть массивом'
+      : 'Сервер не поддерживает действие ' + action + '. Обновите Apps Script.';
+    return json_({ ok: false, errorCode: errorCode, message: message, error: message });
+  }
+
   const lock = LockService.getScriptLock();
   try {
     if (!lock.tryLock(LOCK_WAIT_MS_V1)) {
