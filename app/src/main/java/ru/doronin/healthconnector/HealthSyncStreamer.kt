@@ -699,14 +699,36 @@ val batcher = MeasurementBatcher(MAX_MEASUREMENTS_PER_REQUEST) { batch ->
 
         onProgress("[$date] Этап 7/8 · собираю тренировки…")
         val rawWorkoutRecords = safeReadAll<ExerciseSessionRecord>(dayStart, dayEnd)
-        val workoutRecords = preferBestSource(rawWorkoutRecords)
-            .filter { it.startTime >= dayStart && it.startTime < dayEnd }
-            .distinctBy { "${it.startTime}|${it.endTime}|${it.exerciseType}" }
+        // A day's workouts may come from different apps. Choosing the single highest-priority
+        // origin discards unrelated sessions from other sources (e.g. Fitbit + Mi Fitness).
+        // Filter by start date BEFORE deduplication: a session started yesterday must not
+        // suppress a different workout that started today.
+        val dayWorkoutRecords = rawWorkoutRecords.filter {
+            it.startTime >= dayStart && it.startTime < dayEnd && it.endTime > it.startTime
+        }
+        val workoutCandidates = dayWorkoutRecords.map { record ->
+            WorkoutSessionSelector.Candidate(
+                id = record.metadata.id,
+                startMs = record.startTime.toEpochMilli(),
+                endMs = record.endTime.toEpochMilli(),
+                exerciseType = record.exerciseType,
+                source = record.sourcePackage(),
+                priority = sourcePriority(record.sourcePackage())
+            )
+        }
+        val workoutRecords = WorkoutSessionSelector
+            .selectIndices(workoutCandidates)
+            .map(dayWorkoutRecords::get)
         readDiagnostics.add(
             "Тренировки",
             rawWorkoutRecords,
-            workoutRecords
+            workoutRecords,
+            "источников: ${dayWorkoutRecords.map { it.sourcePackage() }.distinct().size}; " +
+                "убрано дублей: ${dayWorkoutRecords.size - workoutRecords.size}"
         )
+        onProgress("[$date] Тренировки · Health Connect: ${rawWorkoutRecords.size} · " +
+            "за день: ${dayWorkoutRecords.size} · после дедупликации: ${workoutRecords.size}")
+
         addSources(workoutRecords, sources)
 
         for (record in workoutRecords) {
